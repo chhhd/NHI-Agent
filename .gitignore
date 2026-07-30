@@ -1,0 +1,20 @@
+# 환경/시크릿
+.env
+.env.*
+!.env.example
+
+# 저장소 DB
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+venv/
+.venv/
+*.egg-info/
+
+.env

@@ -1,0 +1,23 @@
+# NHI Risk Analysis Agent — 의존성
+#
+#   pip install -r requirements.txt
+#
+# 표준 라이브러리만으로 동작하는 모듈(scanner / policy / graph / agents)은 여기 없다.
+# 아래는 API 서버·입력 검증·외부 연동·테스트에 필요하다.
+
+# --- API 서버 ---
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0     # [standard] 는 --reload 에 필요한 watchfiles 포함
+# 입력 검증 (api/app.py 요청 모델, core/inventory_models.py, agent_runtime/models.py)
+pydantic>=2.7,<3.0
+
+# --- 외부 서비스 연동 (connectors / rescan) ---
+httpx>=0.27,<1.0
+
+# --- 환경 설정 (.env) ---
+# 선택 의존성. 없으면 core/config.py 가 OS 환경변수만 읽는다.
+python-dotenv>=1.0,<2.0
+
+# --- 테스트 ---
+# fastapi.testclient 는 httpx 를 사용하므로 위 httpx 로 충족된다.
+pytest>=8.0
