@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, TYPE_CHECKING
 
 from connectors import CONNECTOR_REGISTRY, ConnectorError, get_connector
 from core.models import CredentialStatus, SecretFinding
@@ -23,13 +23,22 @@ from scanner.pattern_registry import PATTERN_REGISTRY
 
 logger = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from security.secret_store import SecretMaterialStore
+
 
 class CredentialVerifier:
     """provider 별 Connector 를 이용한 자격 증명 검증기."""
 
-    def __init__(self, *, enabled_providers: Optional[Iterable[str]] = None) -> None:
+    def __init__(
+        self,
+        *,
+        enabled_providers: Optional[Iterable[str]] = None,
+        material_store: Optional["SecretMaterialStore"] = None,
+    ) -> None:
         #: 실제 외부 호출을 허용할 provider (기본: Connector 가 구현된 전체)
         self.enabled_providers = set(enabled_providers or CONNECTOR_REGISTRY.keys())
+        self.material_store = material_store
         self._cache: Dict[str, CredentialStatus] = {}
 
     # ------------------------------------------------------------------
@@ -66,16 +75,24 @@ class CredentialVerifier:
             logger.debug("검증 대상이 아닌 유형: %s", finding.secret_type)
             return None
 
-        if not finding.raw_value:
-            # 재스캔이 아닌 DB 재조회 결과에는 원문이 없다 → 검증 불가
-            logger.debug("원문 없음 — 검증 생략 (%s)", finding.fingerprint[:24])
-            return None
-
         cached = self._cache.get(finding.fingerprint)
         if cached is not None:
             return cached
 
-        status = self._call_connector(provider, finding.raw_value)
+        if finding.raw_value:
+            status = self._call_connector(provider, finding.raw_value)
+        elif finding.secret_ref and self.material_store is not None:
+            with self.material_store.lease(
+                finding.secret_ref,
+                purpose="VERIFY",
+                actor="credential_verifier",
+            ) as lease:
+                status = self._call_connector(provider, lease.text)
+        else:
+            # 재스캔이 아닌 DB 재조회 결과에는 원문 또는 암호화 참조가 필요하다.
+            logger.debug("검증 가능한 Secret material 없음 (%s)", finding.fingerprint[:24])
+            return None
+
         self._cache[finding.fingerprint] = status
         return status
 

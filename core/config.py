@@ -69,10 +69,31 @@ class ScannerSettings:
 
 
 @dataclass
+class SecretStorageSettings:
+    #: URL-safe base64 로 인코딩된 32-byte 로컬 개발 키.
+    #: 운영에서는 KMS/Vault 어댑터로 교체하고 이 값을 사용하지 않는다.
+    master_key: str = field(default_factory=lambda: _env("NHI_MASTER_KEY", ""))
+    key_id: str = field(default_factory=lambda: _env("NHI_MASTER_KEY_ID", "local-v1"))
+    ttl_seconds: int = field(
+        default_factory=lambda: _env_int("NHI_SECRET_TTL_SECONDS", 3600)
+    )
+    #: Secret 복호화·조치 승인 API 보호용 키. 미설정 시 해당 API 는 비활성화된다.
+    admin_api_key: str = field(default_factory=lambda: _env("NHI_ADMIN_API_KEY", ""))
+
+
+@dataclass
+class DatabaseSettings:
+    #: PostgreSQL 운영 저장소 연결 문자열. 비어 있으면 기존 SQLite 를 사용한다.
+    database_url: str = field(default_factory=lambda: _env("DATABASE_URL", ""))
+
+
+@dataclass
 class Settings:
     github: GitHubSettings = field(default_factory=GitHubSettings)
     slack: SlackSettings = field(default_factory=SlackSettings)
     scanner: ScannerSettings = field(default_factory=ScannerSettings)
+    secret_storage: SecretStorageSettings = field(default_factory=SecretStorageSettings)
+    database: DatabaseSettings = field(default_factory=DatabaseSettings)
     http_timeout: float = field(default_factory=lambda: _env_float("HTTP_TIMEOUT", 15.0))
     max_retries: int = field(default_factory=lambda: _env_int("HTTP_MAX_RETRIES", 3))
 

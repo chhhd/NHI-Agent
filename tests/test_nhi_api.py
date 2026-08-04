@@ -189,3 +189,97 @@ def test_agent_run_endpoint(client):
 
     # 토큰이 없으므로 스캔은 실행되지 않았음을 명시한다.
     assert body["secret_scan"]["scan_executed"] is False
+
+
+# ---------------------------------------------------------------------------
+# 운영 Backend / Dashboard
+# ---------------------------------------------------------------------------
+def test_project_and_dashboard_endpoints(client):
+    response = client.post(
+        "/projects",
+        json={
+            "name": "API dashboard project",
+            "repository": "acme/dashboard-api",
+            "description": "Backend API coverage",
+        },
+    )
+    assert response.status_code == 201
+    project = response.json()
+    assert project["repository"] == "acme/dashboard-api"
+
+    listing = client.get("/projects")
+    assert listing.status_code == 200
+    assert any(
+        item["project_id"] == project["project_id"]
+        for item in listing.json()["projects"]
+    )
+
+    summary = client.get("/dashboard/summary")
+    assert summary.status_code == 200
+    assert summary.json()["project_count"] >= 1
+
+
+def test_connector_and_dashboard_static_assets(client):
+    response = client.post(
+        "/connectors/github",
+        json={"name": "GitHub dashboard connector"},
+    )
+    assert response.status_code == 201
+    assert response.json()["status"] == "PENDING"
+    assert "secret_ref" not in response.json()
+
+    page = client.get("/dashboard/")
+    assert page.status_code == 200
+    assert "NHI Sentinel" in page.text
+
+    script = client.get("/dashboard/app.js")
+    assert script.status_code == 200
+    assert "/dashboard/summary" in script.text
+
+
+def test_demo_workspace_api_and_keyless_demo_review(client):
+    created = client.post("/demo/workspace")
+    assert created.status_code == 201
+    assert created.json()["contains_real_secrets"] is False
+
+    projects = client.get("/projects").json()["projects"]
+    assert sum(
+        item.get("metadata", {}).get("demo_workspace") == "nhi-sentinel-demo-v1"
+        for item in projects
+    ) == 3
+
+    demo_actions = [
+        item
+        for item in client.get("/actions").json()["actions"]
+        if item["demo_workspace"]
+    ]
+    assert len(demo_actions) == 5
+    approved = client.post(
+        f"/demo/reviews/{demo_actions[0]['action_id']}/approve",
+        json={"actor": "test-reviewer", "reason": "합성 데이터 승인 테스트"},
+    )
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "APPROVED"
+
+    cleared = client.delete("/demo/workspace")
+    assert cleared.status_code == 200
+    assert cleared.json()["deleted"]["projects"] == 3
+    assert not any(
+        item.get("metadata", {}).get("demo_workspace") == "nhi-sentinel-demo-v1"
+        for item in client.get("/projects").json()["projects"]
+    )
+
+
+def test_global_relationship_graph_endpoint(client):
+    analyzed = client.post(
+        "/nhi/inventory/analyze",
+        json={"nhi": _inventory_nhi(nhi_id="graph-dashboard-nhi")},
+    )
+    assert analyzed.status_code == 200
+
+    graph = client.get("/graph")
+    assert graph.status_code == 200
+    body = graph.json()
+    assert body["stats"]["NHI"] >= 1
+    assert any(node["type"] == "CREDENTIAL" for node in body["nodes"])
+    assert any(edge["type"] == "AUTHENTICATES_WITH" for edge in body["edges"])
