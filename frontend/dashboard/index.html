@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NHI Sentinel · Security Operations</title>
+  <link rel="stylesheet" href="/dashboard/styles.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <a class="brand" href="/dashboard/">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 40 40"><path d="M20 3 34 10v10c0 8.8-5.8 14.4-14 17-8.2-2.6-14-8.2-14-17V10L20 3Z"/><path d="m13 20 4 4 10-10"/></svg>
+        </span>
+        <span><strong>NHI</strong><small>SENTINEL</small></span>
+      </a>
+
+      <nav aria-label="주요 메뉴">
+        <button class="nav-item active" data-view-target="overview">
+          <span class="nav-icon">⌂</span><span>Overview</span>
+        </button>
+        <button class="nav-item" data-view-target="projects">
+          <span class="nav-icon">▦</span><span>Projects</span>
+        </button>
+        <button class="nav-item" data-view-target="findings">
+          <span class="nav-icon">◇</span><span>Findings</span><b id="nav-finding-count">0</b>
+        </button>
+        <button class="nav-item" data-view-target="nhi">
+          <span class="nav-icon">◎</span><span>NHI Inventory</span>
+        </button>
+        <button class="nav-item" data-view-target="graph">
+          <span class="nav-icon">⌘</span><span>Relationships</span>
+        </button>
+        <button class="nav-item" data-view-target="reviews">
+          <span class="nav-icon">✓</span><span>Review Queue</span><b id="nav-review-count">0</b>
+        </button>
+        <button class="nav-item" data-view-target="audit">
+          <span class="nav-icon">≡</span><span>Audit Log</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-foot">
+        <div class="system-state">
+          <span class="pulse"></span>
+          <div><strong>System operational</strong><small>API v0.5.0</small></div>
+        </div>
+        <button id="admin-key-button" class="ghost-button">Admin key 설정</button>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">SECURITY OPERATIONS</p>
+          <h1 id="page-title">Executive overview</h1>
+        </div>
+        <div class="top-actions">
+          <button id="demo-workspace-button" class="secondary-button">데모 데이터 생성</button>
+          <label class="search">
+            <span>⌕</span>
+            <input id="global-search" type="search" placeholder="Finding, NHI, project 검색">
+          </label>
+          <button id="refresh-button" class="icon-button" title="새로고침">↻</button>
+          <span class="avatar" title="Security administrator">SA</span>
+        </div>
+      </header>
+
+      <div id="error-banner" class="error-banner" hidden></div>
+
+      <section class="view active" data-view="overview">
+        <div class="section-heading">
+          <div><h2>Security posture</h2><p>Non-human identity exposure와 조치 상태를 한눈에 확인합니다.</p></div>
+          <span id="last-updated" class="updated">—</span>
+        </div>
+
+        <article id="demo-notice" class="demo-notice" hidden>
+          <div><span class="chip">SYNTHETIC DATA</span><strong>안전한 데모 workspace가 활성화되어 있습니다.</strong><small>표시된 Credential은 모두 합성 값이며 실제 Secret을 포함하지 않습니다.</small></div>
+          <button id="demo-reset-button" class="danger-button">데모 데이터 초기화</button>
+        </article>
+
+        <div class="kpi-grid">
+          <article class="kpi critical">
+            <div class="kpi-top"><span>Critical + High</span><i>!</i></div>
+            <strong id="kpi-critical">0</strong>
+            <small>즉시 검토가 필요한 Finding</small>
+          </article>
+          <article class="kpi">
+            <div class="kpi-top"><span>Protected projects</span><i>▦</i></div>
+            <strong id="kpi-projects">0</strong>
+            <small>등록된 Repository 범위</small>
+          </article>
+          <article class="kpi">
+            <div class="kpi-top"><span>Non-human identities</span><i>◎</i></div>
+            <strong id="kpi-nhi">0</strong>
+            <small><em id="kpi-ownerless">0</em> owner 미지정</small>
+          </article>
+          <article class="kpi warning">
+            <div class="kpi-top"><span>Credential inventory</span><i>⌁</i></div>
+            <strong id="kpi-credentials">0</strong>
+            <small><em id="kpi-unrotated">0</em> rotation 정책 위반</small>
+          </article>
+        </div>
+
+        <div class="analytics-grid">
+          <article class="panel risk-panel">
+            <div class="panel-head"><div><h3>Risk distribution</h3><p>현재 Finding 위험 등급</p></div><span class="chip">LIVE</span></div>
+            <div class="risk-content">
+              <div id="risk-donut" class="donut"><div><strong id="risk-total">0</strong><span>TOTAL</span></div></div>
+              <div id="risk-legend" class="legend"></div>
+            </div>
+          </article>
+          <article class="panel trend-panel">
+            <div class="panel-head"><div><h3>Finding velocity</h3><p>최근 탐지 변화</p></div><span class="muted">14 DAYS</span></div>
+            <div id="trend-chart" class="trend-chart"></div>
+          </article>
+        </div>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div><h3>Project coverage</h3><p>연동 상태와 최근 검사 범위</p></div>
+            <button class="text-button" data-view-link="projects">전체 보기 →</button>
+          </div>
+          <div class="table-wrap"><table>
+            <thead><tr><th>Project</th><th>Connector</th><th>Last scan</th><th>Policy</th><th>Findings</th><th></th></tr></thead>
+            <tbody id="overview-projects"></tbody>
+          </table></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div><h3>Priority findings</h3><p>위험 점수가 높은 순서</p></div>
+            <button class="text-button" data-view-link="findings">전체 보기 →</button>
+          </div>
+          <div class="table-wrap"><table>
+            <thead><tr><th>Risk</th><th>Finding</th><th>Project</th><th>NHI / Owner</th><th>Status</th><th>SLA</th></tr></thead>
+            <tbody id="overview-findings"></tbody>
+          </table></div>
+        </article>
+      </section>
+
+      <section class="view" data-view="projects">
+        <div class="section-heading"><div><h2>Project coverage</h2><p>등록 프로젝트와 Connector, 검사 상태를 관리합니다.</p></div><button id="new-project-button" class="primary-button">+ Project</button></div>
+        <div id="project-cards" class="card-grid"></div>
+      </section>
+
+      <section class="view" data-view="findings">
+        <div class="section-heading"><div><h2>Findings</h2><p>탐지부터 해결까지 전체 lifecycle을 추적합니다.</p></div><div class="filter-row"><select id="finding-risk-filter"><option value="">All risk</option><option>CRITICAL</option><option>HIGH</option><option>MEDIUM</option><option>LOW</option></select><select id="finding-status-filter"><option value="">All status</option></select></div></div>
+        <article class="panel"><div class="table-wrap"><table>
+          <thead><tr><th>Risk</th><th>Secret / Provider</th><th>Location</th><th>NHI / Owner</th><th>Score</th><th>Status</th><th>SLA</th></tr></thead>
+          <tbody id="all-findings"></tbody>
+        </table></div></article>
+      </section>
+
+      <section class="view" data-view="nhi">
+        <div class="section-heading"><div><h2>NHI inventory</h2><p>Credential과 연결된 자동화 계정의 권한과 소유자를 확인합니다.</p></div></div>
+        <div id="nhi-cards" class="card-grid"></div>
+      </section>
+
+      <section class="view" data-view="graph">
+        <div class="section-heading"><div><h2>Relationship graph</h2><p>AI Agent에서 Resource까지의 Attack Path와 Blast Radius입니다.</p></div><div id="graph-stats" class="filter-row"></div></div>
+        <article class="panel graph-panel">
+          <div class="graph-key"><span><i class="agent"></i>AI Agent</span><span><i class="nhi"></i>NHI</span><span><i class="credential"></i>Credential</span><span><i class="permission"></i>Permission</span><span><i class="service"></i>Service</span><span><i class="resource"></i>Resource</span></div>
+          <div id="relationship-graph" class="relationship-graph"></div>
+        </article>
+      </section>
+
+      <section class="view" data-view="reviews">
+        <div class="section-heading"><div><h2>Review queue</h2><p>고위험 조치의 근거를 검토하고 승인 또는 거부합니다.</p></div></div>
+        <div id="review-list" class="review-list"></div>
+      </section>
+
+      <section class="view" data-view="audit">
+        <div class="section-heading"><div><h2>Audit log</h2><p>수집, 분석, 승인과 상태 변경 이력을 추적합니다.</p></div><a class="secondary-button" href="/reports/summary?format=markdown" target="_blank">Markdown report</a></div>
+        <article class="panel"><div id="audit-list" class="audit-list"></div></article>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="project-dialog">
+    <form id="project-form" method="dialog">
+      <div class="dialog-head"><div><p class="eyebrow">PROJECT COVERAGE</p><h2>Project 등록</h2></div><button value="cancel" class="dialog-close">×</button></div>
+      <label>표시 이름<input name="name" required placeholder="Payment backend"></label>
+      <label>GitHub Repository<input name="repository" required placeholder="acme/backend"></label>
+      <label>설명<textarea name="description" rows="3" placeholder="Production payment service"></textarea></label>
+      <div class="check-row"><label><input type="checkbox" name="policy_enabled" checked> 정책 적용</label><label><input type="checkbox" name="schedule_enabled"> 정기 검사</label></div>
+      <div class="dialog-actions"><button value="cancel" class="secondary-button">취소</button><button type="submit" value="default" class="primary-button">등록</button></div>
+    </form>
+  </dialog>
+
+  <script src="/dashboard/app.js" defer></script>
+</body>
+</html>

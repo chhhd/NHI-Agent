@@ -99,6 +99,8 @@ class SecretFinding:
     duplicate_locations: List[Dict[str, Any]] = field(default_factory=list)
     status: ResolutionStatus = ResolutionStatus.NEW
     detected_at: str = field(default_factory=_utcnow)
+    # 암호문 자체가 아니라 분리된 SecretMaterialStore 의 불투명 참조만 보관한다.
+    secret_ref: Optional[str] = None
 
     # 원문은 메모리 내부 재검증 용도로만 보유하며 직렬화하지 않는다.
     _raw_value: str = field(default="", repr=False)

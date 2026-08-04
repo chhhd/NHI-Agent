@@ -93,6 +93,7 @@ def finding_from_dict(data: Dict[str, Any]) -> SecretFinding:
         duplicate_locations=list(data.get("duplicate_locations", [])),
         status=ResolutionStatus(data.get("status", "new")),
         detected_at=data.get("detected_at", ""),
+        secret_ref=data.get("secret_ref"),
     )
 
 

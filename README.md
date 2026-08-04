@@ -117,7 +117,7 @@ storage/
 └─ sqlite_store.py       SQLite 구현 (기본)
 
 api/app.py               FastAPI 단일 진입점 (Webhook 수신 포함)
-tests/                   단위·통합 테스트 146개 (네트워크·DB 파일 없음)
+tests/                   단위·통합 테스트 159개 (네트워크·DB 파일 없음)
 ```
 
 ---
@@ -128,8 +128,103 @@ tests/                   단위·통합 테스트 146개 (네트워크·DB 파�
 pip install -r requirements.txt
 cp .env.example .env          # 토큰/시크릿 입력
 uvicorn api.app:app --reload --port 8000
-pytest                        # 146 passed
+pytest                        # 159 passed
 ```
+
+### 운영 데이터 파이프라인과 암호화 Secret material
+
+스캔·인벤토리 입력은 공통 `CredentialObservation` 으로 정규화되고, NHI 관계와
+분석 스냅샷(점수/정책 버전 포함), 추천 조치 `ActionRequest` 가 SQLite 에 저장된다.
+원문 Secret 은 기존처럼 일반 finding JSON 에 저장하지 않는다.
+
+검증·폐기 같은 후속 작업을 위해 원문을 잠시 보관해야 할 때만 AES-256-GCM 분리
+저장소를 사용할 수 있다. 로컬 개발 키는 다음처럼 생성해 `.env` 에 넣는다.
+
+```bash
+python -c "from security.secret_store import AESGCMSecretMaterialStore as S; print(S.generate_key())"
+```
+
+```dotenv
+NHI_MASTER_KEY=<위 명령의 출력>
+NHI_MASTER_KEY_ID=local-v1
+NHI_SECRET_TTL_SECONDS=3600
+NHI_ADMIN_API_KEY=<충분히 긴 관리자 API 키>
+```
+
+운영 환경에서는 로컬 master key 대신 KMS/Vault 기반 구현으로 교체하는 것을
+권장한다. `persist_secret_material=true` 스캔, 저장된 Credential 재검증, 조치
+승인·취소 API 는 `X-NHI-Admin-Key` 헤더가 필요하며, 관리자 키가 설정되지 않으면
+비활성화된다.
+
+추가된 주요 API:
+
+| Method | Path | 설명 |
+| --- | --- | --- |
+| GET | `/analyses` | 버전이 포함된 분석 스냅샷 이력 |
+| GET | `/actions` · `/actions/{action_id}` | 추천에서 생성된 조치 요청 |
+| POST | `/actions/{action_id}/approve` · `/cancel` | 관리자 승인·취소 |
+| POST | `/credentials/verify` | 암호화 참조를 이용한 읽기 전용 재검증 |
+
+### Backend 운영 API와 Dashboard
+
+FastAPI 서버가 별도 빌드 없이 운영 Dashboard를 함께 제공한다.
+
+- Dashboard: <http://127.0.0.1:8000/dashboard/>
+- Executive KPI: `GET /dashboard/summary`
+- Project Coverage: `POST/GET /projects`, `POST /projects/{id}/scan`
+- Connector: `POST /connectors/github`, `POST /connectors/slack`,
+  `GET /connectors/status`
+- Finding Lifecycle: `GET /findings`, `GET /findings/{id}`,
+  `PATCH /findings/{id}/status`, `POST /findings/{id}/rescan`
+- NHI Inventory: `GET /nhi`, `GET /nhi/{id}`
+- Relationship Graph: `GET /graph`
+- Review Queue: `POST /reviews/{id}/approve`, `POST /reviews/{id}/reject`
+- Audit/Report: `GET /audit`, `GET /reports/summary?format=markdown`
+
+검사할 GitHub 저장소가 없어도 Dashboard 상단의 **데모 데이터 생성** 버튼으로
+전체 흐름을 확인할 수 있다. 이 기능은 실제 Secret이나 외부 API 호출 없이 합성
+Project, Finding, NHI, 관계 그래프, Review Queue를 생성한다.
+
+| Method | Path | 설명 |
+| --- | --- | --- |
+| POST | `/demo/workspace` | 안전한 합성 workspace 생성 또는 새로고침 |
+| DELETE | `/demo/workspace` | 합성 데이터만 삭제하고 사용자 데이터는 유지 |
+| POST | `/demo/reviews/{id}/approve` · `/reject` | 합성 조치 승인·거부 체험 |
+
+합성 레코드는 `nhi-sentinel-demo-v1` 표식으로 격리되며 원문 Credential을 저장하지
+않는다. 데모 Project의 `Refresh demo`는 GitHub를 호출하지 않고 동일한 안전한
+시나리오를 다시 생성한다.
+
+Finding 운영 상태는 Scanner의 단기 재스캔 상태와 분리되어 다음 lifecycle을
+따른다.
+
+```text
+NEW → TRIAGED → ASSIGNED → REMEDIATION_IN_PROGRESS
+    → CREDENTIAL_REVOKED → RESCAN_PENDING → RESOLVED
+```
+
+`REOPENED`, `RECURRENCE`, `FALSE_POSITIVE`, `EXCEPTION`, `NEEDS_REVIEW`,
+`SLA_OVERDUE`, `ACCEPTED_RISK`도 지원하며 허용되지 않은 전이는 HTTP 409로
+거부한다.
+
+### PostgreSQL 운영 스키마
+
+전체 운영 엔티티와 외래키는 `backend/database/postgres_schema.sql`에 정의되어
+있다. 로컬 PostgreSQL은 다음 명령으로 기동한다.
+
+```bash
+docker compose -f compose.postgres.yml up -d
+```
+
+직접 초기화할 경우:
+
+```bash
+export DATABASE_URL=postgresql://nhi_agent:change-me@localhost:5432/nhi_agent
+python scripts/init_postgres.py
+```
+
+현재 FastAPI 기본 저장소는 기존 호환성을 위해 SQLite이고, PostgreSQL 스키마와
+초기화 포트가 병행 제공된다. 운영 전환 시 `Storage`의 PostgreSQL 구현을 연결한다.
 
 Swagger 문서: <http://127.0.0.1:8000/docs>
 
@@ -594,7 +689,7 @@ PostgreSQL 등으로 교체하려면 `storage/base.py` 의 `Storage` 인터페�
 - 정책 엔진 6종 + 조치 결정(자동/검토/예외) + 조치 권고 9종
 - NHI 인벤토리 직접 입력 경로 (스캔 결과 없이 분석)
 - Agent 실행 계층 (Planner / Tool Registry / 조건부 Replanner / Orchestrator)
-- SQLite 영속화, FastAPI + Swagger, 테스트 146개
+- SQLite 영속화, PostgreSQL 운영 스키마, FastAPI + Dashboard/Swagger, 테스트 159개
 
 **아직 없음**
 

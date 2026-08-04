@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: nhi_agent
+      POSTGRES_USER: nhi_agent
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+    ports:
+      - "5432:5432"
+    volumes:
+      - nhi-postgres-data:/var/lib/postgresql/data
+      - ./backend/database/postgres_schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nhi_agent -d nhi_agent"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  nhi-postgres-data:
