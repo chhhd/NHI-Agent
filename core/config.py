@@ -38,7 +38,14 @@ def _env_float(key: str, default: float) -> float:
 @dataclass
 class GitHubSettings:
     token: str = field(default_factory=lambda: _env("GITHUB_TOKEN"))
+    #: 조직 App installation 인벤토리 조회 전용 토큰. 저장소 스캔 토큰과 분리한다.
+    inventory_token: str = field(
+        default_factory=lambda: _env("GITHUB_INVENTORY_TOKEN")
+    )
     api_base: str = field(default_factory=lambda: _env("GITHUB_API_BASE", "https://api.github.com"))
+    api_version: str = field(
+        default_factory=lambda: _env("GITHUB_API_VERSION", "2022-11-28")
+    )
     webhook_secret: str = field(default_factory=lambda: _env("GITHUB_WEBHOOK_SECRET"))
     # Rate Limit 여유분: 남은 호출이 이 값 이하이면 reset 까지 대기
     rate_limit_buffer: int = field(default_factory=lambda: _env_int("GITHUB_RATE_LIMIT_BUFFER", 5))
@@ -49,6 +56,28 @@ class GitHubSettings:
 class SlackSettings:
     bot_token: str = field(default_factory=lambda: _env("SLACK_BOT_TOKEN"))
     api_base: str = field(default_factory=lambda: _env("SLACK_API_BASE", "https://slack.com/api"))
+
+
+@dataclass
+class MicrosoftGraphSettings:
+    tenant_id: str = field(default_factory=lambda: _env("MICROSOFT_TENANT_ID"))
+    client_id: str = field(default_factory=lambda: _env("MICROSOFT_CLIENT_ID"))
+    client_secret: str = field(default_factory=lambda: _env("MICROSOFT_CLIENT_SECRET"))
+    access_token: str = field(default_factory=lambda: _env("MICROSOFT_GRAPH_ACCESS_TOKEN"))
+    api_base: str = field(
+        default_factory=lambda: _env("MICROSOFT_GRAPH_API_BASE", "https://graph.microsoft.com/v1.0")
+    )
+    login_base: str = field(
+        default_factory=lambda: _env("MICROSOFT_LOGIN_BASE", "https://login.microsoftonline.com")
+    )
+
+
+@dataclass
+class GoogleWorkspaceSettings:
+    access_token: str = field(default_factory=lambda: _env("GOOGLE_WORKSPACE_ACCESS_TOKEN"))
+    api_base: str = field(
+        default_factory=lambda: _env("GOOGLE_WORKSPACE_API_BASE", "https://admin.googleapis.com")
+    )
 
 
 @dataclass
@@ -82,6 +111,33 @@ class SecretStorageSettings:
 
 
 @dataclass
+class RuntimeSecuritySettings:
+    """AI Agent -> 내부 API 호출의 sender-constrained token 설정."""
+
+    #: 내부 access token HMAC key. 관리자 API key와 분리하며 최소 32 bytes를 요구한다.
+    token_signing_key: str = field(
+        default_factory=lambda: _env("NHI_RUNTIME_TOKEN_SIGNING_KEY", "")
+    )
+    issuer: str = field(default_factory=lambda: _env("NHI_RUNTIME_TOKEN_ISSUER", "nhi-agent"))
+    audience: str = field(
+        default_factory=lambda: _env("NHI_RUNTIME_TOKEN_AUDIENCE", "nhi-runtime-api")
+    )
+    token_ttl_seconds: int = field(
+        default_factory=lambda: _env_int("NHI_RUNTIME_TOKEN_TTL_SECONDS", 300)
+    )
+    dpop_proof_max_age_seconds: int = field(
+        default_factory=lambda: _env_int("NHI_DPOP_PROOF_MAX_AGE_SECONDS", 120)
+    )
+    dpop_clock_skew_seconds: int = field(
+        default_factory=lambda: _env_int("NHI_DPOP_CLOCK_SKEW_SECONDS", 30)
+    )
+    #: 외부 reverse proxy 뒤에서 보이는 정규 public origin. X-Forwarded-*를 직접 신뢰하지 않는다.
+    public_base_url: str = field(
+        default_factory=lambda: _env("NHI_RUNTIME_PUBLIC_BASE_URL", "")
+    )
+
+
+@dataclass
 class DatabaseSettings:
     #: PostgreSQL 운영 저장소 연결 문자열. 비어 있으면 기존 SQLite 를 사용한다.
     database_url: str = field(default_factory=lambda: _env("DATABASE_URL", ""))
@@ -91,8 +147,11 @@ class DatabaseSettings:
 class Settings:
     github: GitHubSettings = field(default_factory=GitHubSettings)
     slack: SlackSettings = field(default_factory=SlackSettings)
+    microsoft: MicrosoftGraphSettings = field(default_factory=MicrosoftGraphSettings)
+    google_workspace: GoogleWorkspaceSettings = field(default_factory=GoogleWorkspaceSettings)
     scanner: ScannerSettings = field(default_factory=ScannerSettings)
     secret_storage: SecretStorageSettings = field(default_factory=SecretStorageSettings)
+    runtime_security: RuntimeSecuritySettings = field(default_factory=RuntimeSecuritySettings)
     database: DatabaseSettings = field(default_factory=DatabaseSettings)
     http_timeout: float = field(default_factory=lambda: _env_float("HTTP_TIMEOUT", 15.0))
     max_retries: int = field(default_factory=lambda: _env_int("HTTP_MAX_RETRIES", 3))

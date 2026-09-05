@@ -7,6 +7,13 @@ from security.secret_store import (
     SecretMaterialStore,
     SecretReference,
 )
+from security.dpop import (
+    DPoPProof,
+    InMemoryReplayCache,
+    RuntimePrincipal,
+    RuntimeTokenService,
+    TokenBindingError,
+)
 
 __all__ = [
     "AESGCMSecretMaterialStore",
@@ -14,4 +21,9 @@ __all__ = [
     "SecretMaterialError",
     "SecretMaterialStore",
     "SecretReference",
+    "DPoPProof",
+    "InMemoryReplayCache",
+    "RuntimePrincipal",
+    "RuntimeTokenService",
+    "TokenBindingError",
 ]

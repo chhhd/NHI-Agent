@@ -6,7 +6,7 @@ import hashlib
 import json
 from typing import Optional
 
-from core.inventory_models import GitHubNHIInput
+from core.inventory_models import GitHubNHIInput, SaaSNHIInput
 from core.models import SecretFinding
 from core.observation_models import CredentialObservation, Evidence
 
@@ -88,6 +88,52 @@ def observation_from_inventory(
                 source="github_inventory",
                 field="repositories",
                 value=[repo.model_dump(mode="json") for repo in nhi.repositories],
+            ),
+            Evidence(
+                source=nhi.collection_source,
+                field="repository_selection",
+                value={
+                    "selection": nhi.repository_selection,
+                    "repository_inventory_complete": nhi.repository_inventory_complete,
+                    "inventory_is_complete": nhi.inventory_is_complete,
+                },
+            ),
+        ],
+        raw_metadata=payload,
+    )
+
+
+def observation_from_saas_inventory(
+    nhi: SaaSNHIInput,
+    *,
+    source_event_id: Optional[str] = None,
+) -> CredentialObservation:
+    """Microsoft/Google Discovery 결과를 감사 가능한 Observation으로 만든다."""
+    payload = nhi.model_dump(mode="json")
+    revision = source_event_id or "inventory:" + hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    provider = nhi.provider.strip().lower()
+    fingerprint = f"nhi:{provider}:{nhi.nhi_id}"
+    return CredentialObservation(
+        source_type=f"{provider}_inventory",
+        source_event_id=revision,
+        provider=provider,
+        raw_type=nhi.nhi_type.value,
+        fingerprint=fingerprint,
+        masked_value="",
+        evidence=[
+            Evidence(source=f"{provider}_api", field="nhi_id", value=nhi.nhi_id),
+            Evidence(source=f"{provider}_api", field="owner", value=nhi.owner),
+            Evidence(
+                source=f"{provider}_api",
+                field="raw_scopes",
+                value=list(nhi.raw_scopes),
+            ),
+            Evidence(
+                source=f"{provider}_api",
+                field="resources",
+                value=[resource.model_dump(mode="json") for resource in nhi.resources],
             ),
         ],
         raw_metadata=payload,

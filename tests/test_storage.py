@@ -36,6 +36,37 @@ def test_repository_upsert_and_list(store):
     assert store.get_repository("org/repo")["default_branch"] == "main"
 
 
+def test_agent_access_profile_and_decision_roundtrip(store):
+    profile = {
+        "agent_id": "storage-agent",
+        "display_name": "Storage Agent",
+        "status": "ACTIVE",
+        "owner": "security-team",
+        "updated_at": "2026-09-05T00:00:00+00:00",
+        "grants": [],
+    }
+    store.upsert_agent_access_profile("storage-agent", profile)
+    assert store.get_agent_access_profile("storage-agent") == profile
+    assert store.list_agent_access_profiles() == [profile]
+
+    decision = {
+        "decision_id": "00000000-0000-0000-0000-000000000001",
+        "event_id": "evt-storage",
+        "agent_id": "storage-agent",
+        "outcome": "DENY",
+        "overall_severity": "CRITICAL",
+        "evaluated_at": "2026-09-05T00:01:00+00:00",
+    }
+    assert store.save_agent_access_decision(decision) == decision["decision_id"]
+    assert store.list_agent_access_decisions(
+        agent_id="storage-agent", outcome="DENY"
+    ) == [decision]
+    summary = store.dashboard_summary()
+    assert summary["agent_access_profile_count"] == 1
+    assert summary["denied_agent_access_count"] == 1
+    assert summary["review_agent_access_count"] == 0
+
+
 def test_save_and_read_scan_result(store):
     result = _scan()
     scan_id = store.save_scan_result(result)

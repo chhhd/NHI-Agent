@@ -16,12 +16,27 @@ from agent_runtime.models import (
     ActionOrigin,
     AgentAction,
     AgentActionType,
+    GitHubInventoryAgentRequest,
     NHIAgentRequest,
 )
 
 
-def create_agent_plan(request: NHIAgentRequest) -> List[AgentAction]:
+def create_agent_plan(
+    request: NHIAgentRequest | GitHubInventoryAgentRequest,
+) -> List[AgentAction]:
     """최초 실행 계획 — 기본 NHI 위험 분석 1단계."""
+    if isinstance(request, GitHubInventoryAgentRequest):
+        return [
+            AgentAction(
+                step=1,
+                action_type=AgentActionType.COLLECT_GITHUB_DATA,
+                reason=(
+                    f"GitHub 조직 {request.organization}의 App installation을 먼저 "
+                    "수집해야 분석 대상을 확정할 수 있다."
+                ),
+                created_by=ActionOrigin.INITIAL_PLAN,
+            )
+        ]
     return [
         AgentAction(
             step=1,

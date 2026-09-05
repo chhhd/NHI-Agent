@@ -32,11 +32,18 @@ from agents.inventory_adapter import (
     build_profile,
     build_signals,
 )
+from agents.saas_inventory_adapter import (
+    build_saas_context,
+    build_saas_credential_record,
+    build_saas_profile,
+    build_saas_signals,
+)
 from agents.policy_evidence_agent import PolicyEvidenceAgent
 from agents.recommendation_agent import RecommendationAgent
 from agents.risk_scoring_agent import RiskScoringAgent
 from agents.scope_translation_agent import ScopeTranslationAgent
-from core.inventory_models import GitHubNHIInput
+from agents.usage_analysis_agent import UsageAnalysisAgent
+from core.inventory_models import GitHubNHIInput, SaaSNHIInput
 from core.models import (
     CodeContext,
     DetectorType,
@@ -52,11 +59,10 @@ from core.nhi_models import (
     NHIAnalysis,
     NHIAnalysisReport,
     NHIProfile,
-    PermissionLevel,
 )
 from graph.blast_radius import BlastRadiusCalculator, summarize_blast_radius
 from graph.relationship_graph import RelationshipGraph
-from policy.rules import EvaluationContext, PolicyConfig
+from policy.rules import EvaluationContext, PolicyConfig, evaluate_security_scenarios
 
 logger = logging.getLogger(__name__)
 
@@ -111,11 +117,13 @@ class NHIAnalysisPipeline:
         policy_evidence: Optional[PolicyEvidenceAgent] = None,
         recommendation: Optional[RecommendationAgent] = None,
         blast_radius: Optional[BlastRadiusCalculator] = None,
+        usage_analysis: Optional[UsageAnalysisAgent] = None,
     ) -> None:
         self.config = config or PolicyConfig()
         self.discovery = discovery or DiscoveryAgent()
         self.context_analysis = context_analysis or ContextAnalysisAgent()
         self.scope_translation = scope_translation or ScopeTranslationAgent()
+        self.usage_analysis = usage_analysis or UsageAnalysisAgent(self.scope_translation)
         self.risk_scoring = risk_scoring or RiskScoringAgent()
         self.policy_evidence = policy_evidence or PolicyEvidenceAgent()
         self.recommendation = recommendation or RecommendationAgent()
@@ -181,6 +189,32 @@ class NHIAnalysisPipeline:
             source=AnalysisSource.INVENTORY,
         )
 
+    def analyze_saas_nhi(
+        self,
+        nhi: SaaSNHIInput,
+        *,
+        signals: Optional[Any] = None,
+    ) -> NHIAnalysis:
+        """Microsoft/Google 등 공급자 중립 SaaS NHI를 분석한다."""
+        overrides: Optional[Dict[str, Any]]
+        if isinstance(signals, AnalysisSignals):
+            overrides = signals.to_dict()
+        else:
+            overrides = signals
+
+        analysis_signals = build_saas_signals(nhi, overrides)
+        record = build_saas_credential_record(nhi)
+        profile = build_saas_profile(nhi, analysis_signals)
+        context = build_saas_context(nhi, analysis_signals)
+        return self._assess(
+            record,
+            profile,
+            context,
+            analysis_signals,
+            repository="",
+            source=AnalysisSource.INVENTORY,
+        )
+
     # ------------------------------------------------------------------
     # 공통 평가 — 두 입력 경로가 여기서 합쳐진다
     # ------------------------------------------------------------------
@@ -195,6 +229,9 @@ class NHIAnalysisPipeline:
         source: AnalysisSource,
     ) -> NHIAnalysis:
         permissions = self.scope_translation.translate_finding(finding)
+        usage, security_events = self.usage_analysis.analyze(
+            finding, profile, permissions, signals
+        )
         blast = self.blast_radius.compute(finding, profile, permissions, context, signals)
 
         ctx = EvaluationContext(
@@ -205,14 +242,18 @@ class NHIAnalysisPipeline:
             signals=signals,
             blast_radius=blast,
             config=self.config,
-            declared_permissions=self._to_permissions(
-                signals.declared_permissions, finding.provider
-            ),
-            observed_permissions=self._to_permissions(
-                signals.observed_actions, finding.provider
-            ),
+            declared_permissions=list(usage.declared_permissions),
+            observed_permissions=list(usage.observed_permissions),
             source=source,
+            usage_analysis=usage,
+            security_events=security_events,
+            scenario_matches=[],
         )
+
+        # Scenario는 별도 조건 복제가 아니라 강제 Critical 규칙의 canonical 결과로
+        # 만든다. 이 시점 이후 보고서와 RiskScorer가 같은 ScenarioMatch를 본다.
+        scenario_matches = evaluate_security_scenarios(ctx)
+        ctx.scenario_matches = scenario_matches
 
         # 정책 위반 판정이 점수보다 먼저다 (Owner·정책 관리 배점에 위반 수가 들어간다).
         violations = self.policy_evidence.collect_violations(ctx)
@@ -231,6 +272,9 @@ class NHIAnalysisPipeline:
             permissions=permissions,
             risk=risk,
             policy=policy,
+            usage_analysis=usage,
+            security_events=security_events,
+            scenario_matches=scenario_matches,
             recommendations=recommendations,
             blast_radius=blast,
             source=source,
@@ -311,22 +355,6 @@ class NHIAnalysisPipeline:
     @staticmethod
     def blast_radius_summary(analyses: Iterable[NHIAnalysis]) -> Dict[str, Any]:
         return summarize_blast_radius(a.blast_radius for a in analyses)
-
-    # ------------------------------------------------------------------
-    def _to_permissions(self, values: Sequence[str], provider: str) -> List[PermissionLevel]:
-        """`["READ"]` 또는 `["chat:write"]` 를 공통 권한으로 정규화한다."""
-        levels: List[PermissionLevel] = []
-        for value in values or []:
-            if not isinstance(value, str) or not value.strip():
-                continue
-            try:
-                level = PermissionLevel(value.strip().upper())
-            except ValueError:
-                mapping = self.scope_translation.translate_scope(value, provider=provider)
-                level = mapping.permission
-            if level is not None and level not in levels:
-                levels.append(level)
-        return levels
 
     @staticmethod
     def _clone_signals(

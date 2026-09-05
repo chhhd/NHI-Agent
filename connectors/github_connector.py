@@ -13,19 +13,22 @@ from __future__ import annotations
 
 import base64
 import logging
+import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import httpx
 
 from connectors.base_connector import (
+    AuthenticationError,
     BaseConnector,
     ConnectorError,
     NotFoundError,
     RateLimitError,
 )
 from core.config import get_settings
+from core.inventory_models import GitHubNHIInput, GitHubNHIType
 from core.models import CredentialStatus, ScanTarget
 from scanner.regex_scanner import is_scannable_path
 
@@ -66,6 +69,42 @@ class Repository:
         }
 
 
+@dataclass
+class GitHubOrganizationDiscoveryResult:
+    """조직의 GitHub App installation 인벤토리와 수집 완전성."""
+
+    organization: str
+    items: List[GitHubNHIInput] = field(default_factory=list)
+    total_count: Optional[int] = None
+    pages_fetched: int = 0
+    inventory_complete: bool = False
+    retrieval_truncated: bool = False
+    failures: List[Dict[str, str]] = field(default_factory=list)
+
+    @property
+    def coverage_note(self) -> str:
+        return (
+            "조직의 GitHub App installation 목록은 수집했지만 이 API는 각 설치가 "
+            "접근하는 개별 저장소 이름을 제공하지 않는다. repository_selection은 "
+            "평가하되 저장소 목록 미확인을 0개 접근으로 해석하지 않는다."
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "collection_executed": True,
+            "organization": self.organization,
+            "total_count": self.total_count,
+            "count": len(self.items),
+            "pages_fetched": self.pages_fetched,
+            "inventory_complete": self.inventory_complete,
+            "truncated": self.retrieval_truncated,
+            "parse_failure_count": len(self.failures),
+            "failures": list(self.failures),
+            "coverage_note": self.coverage_note,
+            "inventory": [item.model_dump(mode="json") for item in self.items],
+        }
+
+
 class GitHubConnector(BaseConnector):
     """GitHub REST API v3 Connector."""
 
@@ -77,23 +116,43 @@ class GitHubConnector(BaseConnector):
         *,
         api_base: Optional[str] = None,
         client: Optional[httpx.Client] = None,
+        fallback_to_default_token: bool = True,
         **kwargs: Any,
     ) -> None:
         settings = get_settings().github
+        resolved_token = token
+        if fallback_to_default_token and not resolved_token:
+            resolved_token = settings.token
         super().__init__(
             base_url=api_base or settings.api_base,
-            token=token or settings.token,
+            token=resolved_token,
             client=client,
             **kwargs,
         )
         self.rate_limit_buffer = settings.rate_limit_buffer
         self.max_wait_seconds = settings.max_wait_seconds
+        self.api_version = settings.api_version
+
+    @classmethod
+    def for_inventory(cls, **kwargs: Any) -> "GitHubConnector":
+        """조직 App 인벤토리 전용 토큰으로 Connector를 만든다.
+
+        ``GITHUB_INVENTORY_TOKEN``이 비어 있어도 일반 ``GITHUB_TOKEN``으로
+        fallback하지 않는다. 두 권한 경계를 섞으면 조직 관리 read credential이
+        저장소 파일 스캔에 재사용될 수 있기 때문이다.
+        """
+        settings = get_settings().github
+        return cls(
+            token=settings.inventory_token,
+            fallback_to_default_token=False,
+            **kwargs,
+        )
 
     # ------------------------------------------------------------------
     def default_headers(self) -> Dict[str, str]:
         headers = {
             "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
+            "X-GitHub-Api-Version": self.api_version,
             "User-Agent": "nhi-secret-agent/1.0",
         }
         if self.token:
@@ -130,26 +189,251 @@ class GitHubConnector(BaseConnector):
             "type": payload.get("type"),
             "name": payload.get("name"),
         }
-        status.accessible_resources = self._accessible_repositories(headers)
+        (
+            status.accessible_resources,
+            status.resource_inventory_complete,
+            status.resource_inventory_note,
+        ) = self._accessible_repositories(headers)
         return status
 
-    def _accessible_repositories(self, headers: Optional[Dict[str, str]]) -> List[Dict[str, Any]]:
-        """토큰으로 접근 가능한 Repository 표본 (영향 범위 파악용)."""
-        try:
-            response = self.get(
-                "/user/repos", params={"per_page": 30, "sort": "updated"}, headers=headers
+    # ------------------------------------------------------------------
+    # 조직 GitHub App installation 인벤토리
+    # ------------------------------------------------------------------
+    def discover_organization_apps(
+        self, organization: str, *, limit: int = 100
+    ) -> GitHubOrganizationDiscoveryResult:
+        """``GET /orgs/{org}/installations``을 페이지 순회해 NHI로 정규화한다.
+
+        이 endpoint는 조직 내 모든 GitHub App installation을 보여 주지만 개별
+        repository 이름은 제공하지 않는다. 다른 App의 installation token을 발급할
+        수도 없으므로 저장소 범위를 꾸며내지 않고 불완전 상태로 남긴다.
+        """
+        if not self.token:
+            raise AuthenticationError(
+                "GitHub 조직 App 인벤토리 수집에 GITHUB_INVENTORY_TOKEN이 필요합니다.",
+                status_code=401,
             )
-        except ConnectorError as exc:
-            logger.info("접근 가능 repo 조회 생략: %s", exc)
-            return []
-        return [
-            {
-                "full_name": item.get("full_name"),
-                "private": item.get("private"),
-                "permissions": item.get("permissions", {}),
-            }
-            for item in response.json()
-        ]
+        org = (organization or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?", org):
+            raise ConnectorError("올바른 GitHub organization 이름이 아닙니다.", status_code=400)
+        if limit < 1 or limit > 2000:
+            raise ConnectorError("GitHub 인벤토리 limit은 1~2000이어야 합니다.", status_code=400)
+
+        raw_items: List[Dict[str, Any]] = []
+        failures: List[Dict[str, str]] = []
+        total_count: Optional[int] = None
+        pages_fetched = 0
+        received_count = 0
+        page = 1
+        while received_count < limit and page <= 20:
+            per_page = min(100, limit - received_count)
+            response = self.get(
+                f"/orgs/{org}/installations",
+                params={"per_page": per_page, "page": page},
+            )
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ConnectorError(
+                    "GitHub organization installations 응답 형식이 올바르지 않습니다."
+                )
+            raw_total = payload.get("total_count")
+            if isinstance(raw_total, int) and raw_total >= 0:
+                total_count = raw_total
+            batch = payload.get("installations")
+            if not isinstance(batch, list):
+                raise ConnectorError(
+                    "GitHub organization installations 응답에 installations가 없습니다."
+                )
+
+            pages_fetched += 1
+            accepted_batch = batch[: limit - received_count]
+            received_count += len(accepted_batch)
+            for index, item in enumerate(accepted_batch):
+                if isinstance(item, dict):
+                    raw_items.append(item)
+                    continue
+                failures.append(
+                    {
+                        "installation_id": "unknown",
+                        "error": (
+                            "installation 항목 형식이 객체가 아님 "
+                            f"(page={page}, index={index})"
+                        ),
+                    }
+                )
+            if not batch:
+                break
+            if total_count is not None and received_count >= min(total_count, limit):
+                break
+            if 'rel="next"' not in response.headers.get("Link", ""):
+                break
+            page += 1
+
+        retrieval_complete = (
+            total_count is not None and received_count >= total_count
+        )
+        items: List[GitHubNHIInput] = []
+        seen_installation_ids: set[int] = set()
+        for raw in raw_items:
+            try:
+                item = self._organization_installation_to_nhi(
+                    raw, organization=org, inventory_complete=retrieval_complete
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                failures.append(
+                    {
+                        "installation_id": str(raw.get("id") or "unknown"),
+                        "error": f"필수 installation 필드 파싱 실패: {exc}",
+                    }
+                )
+                continue
+
+            installation_id = int(item.account["installation_id"])
+            if installation_id in seen_installation_ids:
+                failures.append(
+                    {
+                        "installation_id": str(installation_id),
+                        "error": "중복 installation_id 항목을 제외함",
+                    }
+                )
+                continue
+            seen_installation_ids.add(installation_id)
+            items.append(item)
+
+        complete = retrieval_complete and not failures
+        for item in items:
+            item.inventory_is_complete = complete
+        return GitHubOrganizationDiscoveryResult(
+            organization=org,
+            items=items,
+            total_count=total_count,
+            pages_fetched=pages_fetched,
+            inventory_complete=complete,
+            retrieval_truncated=not retrieval_complete,
+            failures=failures,
+        )
+
+    @staticmethod
+    def _organization_installation_to_nhi(
+        payload: Dict[str, Any], *, organization: str, inventory_complete: bool
+    ) -> GitHubNHIInput:
+        installation_id = int(payload["id"])
+        account = payload.get("account") or {}
+        if not isinstance(account, dict):
+            account = {}
+        account_login = str(account.get("login") or organization)
+        app_id = payload.get("app_id")
+        app_slug = str(payload.get("app_slug") or f"github-app-{app_id or 'unknown'}")
+        raw_permissions = payload.get("permissions") or {}
+        if not isinstance(raw_permissions, dict):
+            raise TypeError("permissions")
+        permissions = {
+            str(resource): str(level)
+            for resource, level in raw_permissions.items()
+            if resource and level
+        }
+        events = payload.get("events") or []
+        if not isinstance(events, list):
+            events = []
+        repository_selection = str(payload.get("repository_selection") or "unknown")
+        suspended_at = payload.get("suspended_at")
+
+        return GitHubNHIInput(
+            nhi_id=f"github-app-installation:{installation_id}",
+            nhi_name=f"{app_slug}@{account_login}",
+            nhi_type=GitHubNHIType.GITHUB_APP,
+            # installation 대상 조직은 보안 책임자가 아니므로 Owner로 승격하지 않는다.
+            owner=None,
+            active=suspended_at is None,
+            account={
+                "installation_id": installation_id,
+                "app_id": app_id,
+                "app_slug": app_slug,
+                "login": account_login,
+                "account_id": account.get("id"),
+                "account_type": account.get("type"),
+                "target_type": payload.get("target_type"),
+            },
+            repositories=[],
+            repository_selection=repository_selection,
+            repository_inventory_complete=False,
+            inventory_is_complete=inventory_complete,
+            collection_source="github_org_installations_api",
+            collection_evidence=[
+                f"GET /orgs/{organization}/installations",
+                f"installation_id={installation_id}",
+                f"repository_selection={repository_selection}",
+                "개별 접근 저장소 이름은 이 API 응답에 포함되지 않음",
+            ],
+            subscribed_events=[str(event) for event in events if event],
+            suspended_at=suspended_at,
+            raw_permissions=permissions,
+            created_at=payload.get("created_at"),
+        )
+
+    def _accessible_repositories(
+        self, headers: Optional[Dict[str, str]], *, max_pages: int = 5
+    ) -> Tuple[List[Dict[str, Any]], bool, Optional[str]]:
+        """토큰으로 접근 가능한 Repository를 페이지 단위로 수집한다.
+
+        토큰의 실제 Scope는 ``X-OAuth-Scopes`` 또는 별도 권한 API에서만 판단한다.
+        Repository 응답의 ``permissions``는 개별 리소스 메타데이터로만 보존하며,
+        토큰 전체 권한을 추정하는 근거로 승격하지 않는다.
+        """
+        resources: List[Dict[str, Any]] = []
+        malformed_items = 0
+        for page in range(1, max_pages + 1):
+            try:
+                response = self.get(
+                    "/user/repos",
+                    params={"per_page": 100, "page": page, "sort": "updated"},
+                    headers=headers,
+                )
+            except ConnectorError as exc:
+                logger.info("접근 가능 repo 조회 미완료(page=%d): %s", page, exc)
+                return (
+                    resources,
+                    False,
+                    f"GitHub Repository 조회가 {page}페이지에서 중단됨",
+                )
+
+            try:
+                payload = response.json()
+            except ValueError:
+                logger.info("접근 가능 repo JSON 해석 오류(page=%d)", page)
+                return resources, False, "GitHub Repository 응답을 해석할 수 없음"
+            if not isinstance(payload, list):
+                logger.info("접근 가능 repo 응답 형식 오류(page=%d)", page)
+                return resources, False, "GitHub Repository 응답 형식을 확인할 수 없음"
+
+            for item in payload:
+                if not isinstance(item, dict):
+                    malformed_items += 1
+                    continue
+                owner = item.get("owner")
+                resources.append(
+                    {
+                        "name": item.get("name"),
+                        "full_name": item.get("full_name"),
+                        "private": item.get("private"),
+                        "owner_login": owner.get("login") if isinstance(owner, dict) else None,
+                    }
+                )
+            has_next = 'rel="next"' in response.headers.get("Link", "")
+            if not has_next:
+                if malformed_items:
+                    return (
+                        resources,
+                        False,
+                        f"GitHub Repository 응답 {malformed_items}건을 해석하지 못함",
+                    )
+                return resources, True, None
+
+        return (
+            resources,
+            False,
+            f"GitHub Repository 조회 상한({max_pages * 100}개)에 도달함",
+        )
 
     # ------------------------------------------------------------------
     # Repository

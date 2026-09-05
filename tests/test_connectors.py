@@ -18,6 +18,7 @@ from connectors.github_webhook import (
     verify_signature,
 )
 from connectors.slack_connector import SlackConnector
+from core.config import reset_settings
 from core.models import ResolutionStatus, ScanTarget
 from rescan.revalidator import Revalidator
 from scanner.scan_service import SecretScanService
@@ -50,6 +51,74 @@ def test_github_validate_credential_parses_scopes():
     assert status.revoked is False
     assert status.raw_scopes == ["repo", "read:org", "admin:repo_hook"]
     assert status.account["login"] == "octocat"
+    assert status.resource_inventory_complete is True
+    assert status.resource_inventory_note is None
+
+
+def test_github_validate_credential_paginates_accessible_repositories():
+    requested_pages = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/user":
+            return httpx.Response(200, json={"login": "octocat", "id": 1})
+        page = int(request.url.params["page"])
+        requested_pages.append(page)
+        if page == 1:
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "name": "one",
+                        "full_name": "org/one",
+                        "private": True,
+                        "owner": {"login": "org"},
+                        "irrelevant_raw_field": "discard-me",
+                    }
+                ],
+                headers={"Link": '<https://api.github.com/user/repos?page=2>; rel="next"'},
+            )
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "name": "two",
+                    "full_name": "org/two",
+                    "private": False,
+                    "owner": {"login": "org"},
+                }
+            ],
+        )
+
+    with GitHubConnector("ghp_dummy", client=_client(handler)) as gh:
+        status = gh.validate_credential()
+
+    assert requested_pages == [1, 2]
+    assert [item["full_name"] for item in status.accessible_resources] == [
+        "org/one",
+        "org/two",
+    ]
+    assert status.resource_inventory_complete is True
+    assert status.accessible_resources[0] == {
+        "name": "one",
+        "full_name": "org/one",
+        "private": True,
+        "owner_login": "org",
+    }
+
+
+def test_github_validate_credential_marks_repository_inventory_incomplete():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/user":
+            return httpx.Response(200, json={"login": "octocat", "id": 1})
+        return httpx.Response(403, json={"message": "Resource not accessible"})
+
+    with GitHubConnector("ghp_dummy", client=_client(handler)) as gh:
+        status = gh.validate_credential()
+
+    assert status.active is True
+    assert status.accessible_resources == []
+    assert status.resource_inventory_complete is False
+    assert "중단" in status.resource_inventory_note
 
 
 def test_github_401_marks_token_revoked():
@@ -122,6 +191,137 @@ def test_github_file_content_decodes_base64():
         assert gh.get_file_content("org/repo", "config/slack.env") == content
 
 
+def test_github_inventory_connector_never_falls_back_to_scan_token(monkeypatch):
+    """수집 토큰 미설정을 일반 GITHUB_TOKEN으로 조용히 대체하지 않는다."""
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:  # pragma: no cover
+        calls.append(request)
+        return httpx.Response(200, json={"total_count": 0, "installations": []})
+
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_scan_only")
+    monkeypatch.delenv("GITHUB_INVENTORY_TOKEN", raising=False)
+    reset_settings()
+    try:
+        with GitHubConnector.for_inventory(client=_client(handler)) as gh:
+            assert gh.token == ""
+            with pytest.raises(AuthenticationError, match="GITHUB_INVENTORY_TOKEN"):
+                gh.discover_organization_apps("acme")
+    finally:
+        reset_settings()
+
+    assert calls == []
+
+
+def test_github_api_version_default_remains_backward_compatible(monkeypatch):
+    monkeypatch.delenv("GITHUB_API_VERSION", raising=False)
+    reset_settings()
+    try:
+        with GitHubConnector("ghp_dummy", client=_client(lambda request: httpx.Response(200))) as gh:
+            assert gh.default_headers()["X-GitHub-Api-Version"] == "2022-11-28"
+    finally:
+        reset_settings()
+
+
+def test_github_organization_discovery_deduplicates_and_records_malformed_items():
+    inventory_token = "github-inventory-test-token"
+
+    def installation(installation_id: int, *, suspended: bool = False):
+        return {
+            "id": installation_id,
+            "app_id": 9000 + installation_id,
+            "app_slug": f"security-app-{installation_id}",
+            "account": {"login": "acme", "id": 7, "type": "Organization"},
+            "target_type": "Organization",
+            "repository_selection": "selected",
+            "permissions": {"contents": "read", "issues": "write"},
+            "events": ["push"],
+            "suspended_at": "2026-08-01T00:00:00Z" if suspended else None,
+            "created_at": "2026-01-01T00:00:00Z",
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["Authorization"] == f"Bearer {inventory_token}"
+        page = int(request.url.params.get("page", "1"))
+        if page == 1:
+            return httpx.Response(
+                200,
+                json={
+                    "total_count": 4,
+                    "installations": [installation(1), "malformed-item"],
+                },
+                headers={
+                    "Link": '<https://api.github.com/orgs/acme/installations?page=2>; rel="next"'
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "total_count": 4,
+                "installations": [installation(1), installation(2, suspended=True)],
+            },
+        )
+
+    with GitHubConnector(inventory_token, client=_client(handler)) as gh:
+        result = gh.discover_organization_apps("acme", limit=100)
+
+    assert result.pages_fetched == 2
+    assert result.total_count == 4
+    assert [item.account["installation_id"] for item in result.items] == [1, 2]
+    assert result.items[0].owner is None
+    assert result.items[1].active is False
+    assert result.inventory_complete is False
+    assert result.retrieval_truncated is False
+    assert result.to_dict()["truncated"] is False
+    assert result.to_dict()["parse_failure_count"] == 2
+    assert len(result.failures) == 2
+    assert any("형식이 객체가 아님" in failure["error"] for failure in result.failures)
+    assert any("중복 installation_id" in failure["error"] for failure in result.failures)
+    assert inventory_token not in str(result.to_dict())
+
+
+def test_github_organization_discovery_distinguishes_complete_empty_result():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"total_count": 0, "installations": []})
+
+    with GitHubConnector("inventory-token", client=_client(handler)) as gh:
+        result = gh.discover_organization_apps("acme")
+
+    assert result.items == []
+    assert result.total_count == 0
+    assert result.inventory_complete is True
+    assert result.retrieval_truncated is False
+    assert result.failures == []
+
+
+def test_github_organization_discovery_marks_limit_as_retrieval_truncation():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "total_count": 2,
+                "installations": [
+                    {
+                        "id": 1,
+                        "app_id": 10,
+                        "app_slug": "limited-app",
+                        "account": {"login": "acme"},
+                        "permissions": {"metadata": "read"},
+                    }
+                ],
+            },
+        )
+
+    with GitHubConnector("inventory-token", client=_client(handler)) as gh:
+        result = gh.discover_organization_apps("acme", limit=1)
+
+    assert len(result.items) == 1
+    assert result.inventory_complete is False
+    assert result.retrieval_truncated is True
+    assert result.to_dict()["truncated"] is True
+    assert result.failures == []
+
+
 # ---------------------------------------------------------------------------
 # Slack Connector
 # ---------------------------------------------------------------------------
@@ -157,6 +357,8 @@ def test_slack_validate_credential_success():
     assert status.account["team"] == "Hanium"
     assert status.account["token_kind"] == "bot"
     assert status.accessible_resources[0]["name"] == "general"
+    assert status.resource_inventory_complete is False
+    assert "표본" in status.resource_inventory_note
 
 
 def test_slack_revoked_token_detected():

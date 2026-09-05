@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#08111f">
+  <title>NHI Sentinel · 공모전 보안 운영 대시보드</title>
+  <link rel="stylesheet" href="/competition/styles.css">
+</head>
+<body>
+  <div class="shell competition-shell">
+    <aside class="sidebar">
+      <a class="brand" href="/competition/" aria-label="NHI Sentinel 공모전 대시보드 홈">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 40 40"><path d="M20 3 34 10v10c0 8.8-5.8 14.4-14 17-8.2-2.6-14-8.2-14-17V10L20 3Z"/><path d="m13 20 4 4 10-10"/></svg>
+        </span>
+        <span><strong>NHI</strong><small>SENTINEL</small></span>
+      </a>
+
+      <nav aria-label="주요 메뉴">
+        <button class="nav-item active" data-view-target="overview">
+          <span class="nav-icon">⌂</span><span class="nav-copy"><span>Overview</span><small>전체 보안 현황</small></span>
+        </button>
+        <button class="nav-item" data-view-target="findings">
+          <span class="nav-icon">◇</span><span class="nav-copy"><span>Findings</span><small>탐지 및 조치 상태</small></span><b id="nav-finding-count">0</b>
+        </button>
+        <button class="nav-item" data-view-target="finding-detail" data-decision-navigation>
+          <span class="nav-icon">⌁</span><span class="nav-copy"><span>Decision Flow</span><small>선택 Finding 판단 근거</small></span><b id="nav-scenario-count">0</b>
+        </button>
+        <button class="nav-item" data-view-target="reviews">
+          <span class="nav-icon">✓</span><span class="nav-copy"><span>Review</span><small>승인 대기 조치</small></span><b id="nav-review-count">0</b>
+        </button>
+        <button class="nav-item" data-view-target="audit">
+          <span class="nav-icon">≡</span><span class="nav-copy"><span>Audit</span><small>실행 및 변경 이력</small></span>
+        </button>
+      </nav>
+
+      <div class="secondary-nav" aria-label="보조 기능">
+        <span>MORE</span>
+        <button data-secondary-target="projects">Projects</button>
+        <button data-secondary-target="identity">NHI Inventory</button>
+        <button data-secondary-target="relationship">Relationships</button>
+      </div>
+
+      <div class="sidebar-foot">
+        <span id="system-status" class="system-status"><i></i> 상태 확인 중</span>
+        <span class="competition-badge"><i></i> COMPETITION DEMO</span>
+        <button id="admin-key-button" class="ghost-button">관리자 키 설정</button>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">NHI SECURITY OPERATIONS</p>
+          <h1 id="page-title">보안 운영 현황</h1>
+        </div>
+        <div class="top-actions">
+          <button id="demo-workspace-button" class="secondary-button">데모 데이터 생성</button>
+          <button id="refresh-button" class="icon-button" title="데이터 새로고침" aria-label="데이터 새로고침">↻</button>
+        </div>
+      </header>
+
+      <div id="error-banner" class="error-banner" hidden></div>
+
+      <section class="view active" data-view="overview">
+        <div class="section-heading overview-heading">
+          <div><h2>Executive overview</h2><p>NHI exposure, risky behavior, and pending actions</p></div>
+          <span id="last-updated" class="updated">—</span>
+        </div>
+
+        <article id="demo-notice" class="demo-notice" hidden>
+          <div><span class="chip">SYNTHETIC</span><strong>안전한 합성 데모 데이터</strong><small>실제 Secret은 포함되지 않습니다.</small></div>
+          <button id="demo-reset-button" class="danger-button">초기화</button>
+        </article>
+
+        <div class="kpi-grid">
+          <article class="kpi critical primary-kpi">
+            <div class="kpi-top"><span>CRITICAL + HIGH</span><i>!</i></div>
+            <strong id="kpi-critical">0</strong>
+            <small>즉시 대응이 필요한 Findings</small>
+          </article>
+          <article class="kpi secondary-kpi">
+            <div class="kpi-top"><span>보호 프로젝트</span><i>▦</i></div>
+            <strong id="kpi-projects">0</strong>
+            <small>연동된 Repository</small>
+          </article>
+          <article class="kpi secondary-kpi">
+            <div class="kpi-top"><span>비인간 계정</span><i>◎</i></div>
+            <strong id="kpi-nhi">0</strong>
+            <small><em id="kpi-ownerless">0</em>개 소유자 미지정</small>
+          </article>
+          <article class="kpi secondary-kpi">
+            <div class="kpi-top"><span>승인 대기</span><i>✓</i></div>
+            <strong id="kpi-pending-reviews">0</strong>
+            <small>Human Review가 필요한 조치</small>
+            <span hidden><b id="kpi-credentials">0</b><b id="kpi-unrotated">0</b></span>
+          </article>
+        </div>
+
+        <article class="panel intelligence-panel">
+          <div class="panel-head">
+            <div><h3>Decision intelligence</h3><p>수집된 근거가 위험 판단과 사람의 검토로 연결되는 과정을 보여줍니다.</p></div>
+            <button class="text-button" data-select-top-finding>Critical 분석 흐름 보기 →</button>
+          </div>
+          <div class="intelligence-grid">
+            <div class="intel-stat"><span>사용 이력 수집</span><strong id="intel-usage">0 / 0</strong><small id="intel-usage-note">분석 없음</small></div>
+            <div class="intel-stat"><span>보안 이벤트</span><strong id="intel-events">0</strong><small id="intel-event-note">직접 관측 및 통제 공백</small></div>
+            <div class="intel-stat"><span>위험 시나리오</span><strong id="intel-scenarios">0</strong><small id="intel-scenario-note">강제 Critical 0건</small></div>
+            <div class="intel-stat decision"><span>사람 검토 필요</span><strong id="intel-reviews">0</strong><small>정책 기반 검토 대상</small></div>
+          </div>
+        </article>
+
+        <div class="analytics-grid competition-analytics">
+          <article class="panel risk-panel">
+            <div class="panel-head"><div><h3>Risk distribution</h3><p>현재 Finding 위험 등급 분포</p></div><span class="chip live-chip"><i></i> LIVE</span></div>
+            <div class="risk-content">
+              <div id="risk-donut" class="donut"><div><strong id="risk-total">0</strong><span>전체 FINDINGS</span></div></div>
+              <div id="risk-legend" class="legend"></div>
+            </div>
+          </article>
+          <article class="panel top-finding-panel">
+            <div class="panel-head"><div><h3>Most critical finding</h3><p>현재 가장 먼저 조사해야 할 위험</p></div><span id="top-finding-level" class="badge CRITICAL">CRITICAL</span></div>
+            <div id="top-finding" class="top-finding-content">
+              <div class="empty-state">분석할 Finding이 없습니다.</div>
+            </div>
+            <div id="trend-chart" class="trend-chart" hidden></div>
+          </article>
+        </div>
+
+        <article class="panel overview-table-panel">
+          <div class="panel-head">
+            <div><h3>Protected scope</h3><p>보호 중인 프로젝트와 Connector 검사 범위</p></div>
+            <button id="new-project-button" class="text-button">+ 프로젝트 등록</button>
+          </div>
+          <div id="protected-scope-summary" class="protected-scope-summary"></div>
+          <details class="scope-details"><summary>연동 프로젝트 상세</summary><div class="table-wrap"><table>
+            <thead><tr><th>프로젝트</th><th>연동 상태</th><th>최근 검사</th><th>정책</th><th>탐지 건수</th><th></th></tr></thead>
+            <tbody id="overview-projects"></tbody>
+          </table></div></details>
+        </article>
+        <div id="project-cards" hidden></div>
+
+        <article class="panel review-summary-panel">
+          <div class="panel-head">
+            <div><h3>Review queue summary</h3><p>사람의 승인이 필요한 권고 조치</p></div>
+            <button class="text-button" data-view-link="reviews">Review 열기 →</button>
+          </div>
+          <div id="review-summary" class="review-summary"></div>
+          <table hidden><tbody id="overview-findings"></tbody></table>
+        </article>
+      </section>
+
+      <section class="view findings-view" data-view="findings">
+        <div class="section-heading"><div><h2>Findings</h2><p>탐지된 Credential 위험을 우선순위에 따라 검토하고 조치합니다.</p></div><span class="section-context">위험도 높은 순</span></div>
+        <article class="filter-panel" aria-label="Finding 필터">
+          <div class="quick-filters" role="group" aria-label="빠른 필터">
+            <button class="quick-filter active" data-quick-filter="ALL">전체</button>
+            <button class="quick-filter critical" data-quick-filter="CRITICAL">Critical <b id="quick-critical-count">0</b></button>
+            <button class="quick-filter high" data-quick-filter="HIGH">High <b id="quick-high-count">0</b></button>
+            <button class="quick-filter" data-quick-filter="NEEDS_REVIEW">검토 필요 <b id="quick-review-count">0</b></button>
+            <button class="quick-filter resolved" data-quick-filter="RESOLVED">조치 완료 <b id="quick-resolved-count">0</b></button>
+          </div>
+          <div class="filter-row">
+            <label class="search finding-search"><span>⌕</span><input id="finding-search" type="search" placeholder="Secret, Provider, Project 검색" aria-label="탐지 결과 검색"></label>
+            <select id="finding-risk-filter" aria-label="위험 등급 필터"><option value="">전체 위험도</option><option>CRITICAL</option><option>HIGH</option><option>MEDIUM</option><option>LOW</option></select>
+            <select id="finding-status-filter" aria-label="상태 필터"><option value="">전체 상태</option></select>
+          </div>
+        </article>
+        <article class="panel findings-table-panel"><div class="table-wrap"><table>
+          <thead><tr><th>위험</th><th>Secret / Provider</th><th>위치</th><th>NHI / 소유자</th><th>점수</th><th>조치 상태</th><th>SLA</th></tr></thead>
+          <tbody id="all-findings"></tbody>
+        </table></div></article>
+      </section>
+
+      <section class="view finding-detail-view" data-view="finding-detail">
+        <button id="finding-detail-back" class="back-button">← Findings로 돌아가기</button>
+        <div class="finding-detail-header">
+          <div>
+            <p class="eyebrow">CRITICAL FINDING INVESTIGATION</p>
+            <h2 id="finding-detail-title">Finding 상세 분석</h2>
+            <p id="finding-detail-subtitle">Identity부터 Audit까지 하나의 조사 흐름으로 확인합니다.</p>
+          </div>
+          <div id="finding-detail-summary" class="finding-detail-summary"></div>
+        </div>
+
+        <nav class="detail-tabs" aria-label="Finding 상세 분석 탭">
+          <button class="detail-tab active" data-detail-tab="summary">Summary</button>
+          <button class="detail-tab" data-detail-tab="decision">Decision Flow</button>
+          <button class="detail-tab" data-detail-tab="relationship">Relationships</button>
+          <button class="detail-tab" data-detail-tab="evidence">Evidence</button>
+        </nav>
+
+        <div class="drill-tab active" data-drill-tab="summary">
+          <article class="journey-overview panel">
+            <div class="journey-overview-copy"><span>END-TO-END INVESTIGATION</span><strong>탐지에서 승인·감사까지</strong><p>각 단계를 선택하면 해당 근거로 이동합니다.</p></div>
+            <div id="finding-journey-steps" class="journey-steps" aria-label="분석 단계"></div>
+          </article>
+          <div id="permission-usage-comparison" class="permission-usage-comparison"></div>
+          <div id="finding-journey" class="finding-journey"></div>
+        </div>
+
+        <div class="drill-tab" data-drill-tab="evidence">
+          <div class="section-heading drill-heading"><div><h2>NHI / Identity</h2><p>선택한 Finding과 연결된 자동화 계정, Owner, 권한 기준선을 확인합니다.</p></div><button id="github-discover-button" class="primary-button">GitHub 조직 수집</button></div>
+          <div id="selected-nhi-summary" class="selected-nhi-summary"></div>
+          <details class="inventory-details panel"><summary>전체 NHI Inventory 보기</summary><div id="nhi-cards" class="card-grid"></div></details>
+        </div>
+
+        <div class="drill-tab" data-drill-tab="decision">
+          <div class="section-heading drill-heading"><div><h2>Decision evidence</h2><p>선택한 Finding의 Permission, Usage, Event, Scenario와 최종 판단 근거입니다.</p></div><label class="analysis-picker">분석 선택<select id="analysis-selector" aria-label="분석 선택"></select></label></div>
+          <div id="decision-empty" class="empty-state panel" hidden>저장된 분석이 없습니다. Scan 또는 Inventory 분석을 먼저 실행하세요.</div>
+          <div id="decision-content">
+            <div id="decision-coverage" class="coverage-row"></div>
+            <article class="panel decision-flow-panel"><div class="panel-head"><div><h3>Explainable decision path</h3><p>각 분석 단계의 산출물과 다음 단계에 전달된 핵심 값</p></div><span id="decision-risk-badge"></span></div><div id="decision-flow" class="decision-flow"></div></article>
+            <div class="decision-grid">
+              <article class="panel"><div class="panel-head"><div><h3>Security events</h3><p>관측 사실과 파생된 통제 공백을 구분합니다.</p></div><span id="event-count" class="chip">0 EVENTS</span></div><div id="event-timeline" class="event-timeline"></div></article>
+              <article class="panel"><div class="panel-head"><div><h3>Scenario matches</h3><p>보안 이벤트가 어떤 공격 시나리오와 일치하는지 보여줍니다.</p></div><span id="scenario-count" class="chip">0 MATCHES</span></div><div id="scenario-list" class="scenario-list"></div></article>
+            </div>
+            <article class="panel"><div class="panel-head"><div><h3>Risk composition &amp; action</h3><p>100점 위험 점수의 영역별 기여와 최종 권고</p></div><strong id="decision-action" class="action-callout">—</strong></div><div id="risk-factor-list" class="risk-factor-list"></div></article>
+            <article class="panel history-panel"><div class="panel-head"><div><h3>분석 변화 이력</h3><p>직전 분석과 비교해 개선·악화된 결정 근거를 보여줍니다.</p></div><span id="history-trend" class="chip">비교 중</span></div><div id="history-comparison" class="history-comparison"><div class="empty-state">이전 분석을 확인하고 있습니다.</div></div></article>
+          </div>
+          <article class="panel collection-run-panel agent-execution-panel">
+            <div class="panel-head"><div><h3>Agent execution</h3><p>How the agent got here · 수집, 재계획, 분석과 정책 근거 생성 과정</p></div><div class="run-heading"><span id="github-run-status"></span><small id="github-run-time">실행 기록 없음</small></div></div>
+            <div id="github-run-empty" class="empty-state">아직 GitHub 조직 수집 실행 기록이 없습니다.</div>
+            <div id="github-run-content" hidden><div id="github-coverage-metrics" class="collection-metrics"></div><div id="github-run-plan" class="run-plan"></div><div id="github-run-notes" class="run-notes"></div></div>
+          </article>
+        </div>
+
+        <div class="drill-tab" data-drill-tab="relationship">
+          <div class="section-heading drill-heading"><div><h2>Relationship impact</h2><p>AI Agent에서 Credential, Service, 사내 Resource까지 이어지는 접근 경로입니다.</p></div><div id="graph-stats" class="filter-row"></div></div>
+          <div id="impact-summary" class="impact-summary"></div>
+          <article class="panel graph-panel"><div class="graph-key"><span><i class="agent"></i>AI Agent</span><span><i class="nhi"></i>NHI</span><span><i class="credential"></i>Credential</span><span><i class="permission"></i>Permission</span><span><i class="service"></i>Service</span><span><i class="resource"></i>Resource</span></div><div id="relationship-graph" class="relationship-graph"></div></article>
+        </div>
+      </section>
+
+      <section class="view" data-view="reviews">
+        <div class="section-heading"><div><h2>Review queue</h2><p>고위험 조치의 근거를 확인하고 승인 또는 거부합니다.</p></div></div>
+        <div id="review-result" class="review-result" hidden></div>
+        <div id="review-list" class="review-list"></div>
+      </section>
+
+      <section class="view" data-view="audit">
+        <div class="section-heading"><div><h2>System audit</h2><p>수집, 분석, 승인, 상태 변경의 전체 이력을 추적합니다.</p></div><a class="secondary-button" href="/reports/summary?format=markdown" target="_blank">Markdown 보고서</a></div>
+        <article class="panel"><div id="audit-list" class="audit-list"></div></article>
+      </section>
+    </main>
+  </div>
+
+  <dialog id="project-dialog">
+    <form id="project-form" method="dialog">
+      <div class="dialog-head"><div><p class="eyebrow">PROJECT COVERAGE</p><h2>프로젝트 등록</h2></div><button value="cancel" class="dialog-close" aria-label="닫기">×</button></div>
+      <label>표시 이름<input name="name" required placeholder="Payment backend"></label>
+      <label>GitHub Repository<input name="repository" required placeholder="acme/backend"></label>
+      <label>설명<textarea name="description" rows="3" placeholder="Production payment service"></textarea></label>
+      <div class="check-row"><label><input type="checkbox" name="policy_enabled" checked> 정책 적용</label></div>
+      <div class="dialog-actions"><button value="cancel" class="secondary-button">취소</button><button type="submit" value="default" class="primary-button">등록</button></div>
+    </form>
+  </dialog>
+
+  <script src="/dashboard/app.js" defer></script>
+  <script src="/competition/app.js" defer></script>
+</body>
+</html>

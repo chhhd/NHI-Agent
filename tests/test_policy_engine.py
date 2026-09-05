@@ -194,6 +194,27 @@ def test_forced_critical_revoked_token_still_used():
     assert "REVOKED_TOKEN_STILL_USED" in {r["rule_id"] for r in evaluate_forced_critical(ctx)}
 
 
+def test_runtime_token_replay_is_critical_and_recommends_revocation():
+    ctx = build_ctx(
+        finding=make_finding(credential_active=True),
+        signals=AnalysisSignals(
+            token_replay_suspected=True,
+            sender_constrained=True,
+            token_binding_method="DPoP",
+            request_source_ip="203.0.113.77",
+            request_user_agent="curl/8.0",
+        ),
+    )
+    violations = evaluate_policies(ctx)
+    risk = RiskScorer().score(ctx, violations)
+    decision = DecisionEngine().decide(ctx, risk, violations)
+    recommendations = RecommendationAgent().recommend(ctx, risk, decision)
+
+    assert risk.level is RiskLevel.CRITICAL
+    assert "TOKEN_REPLAY_SUSPECTED" in {item["rule_id"] for item in risk.forced_rules}
+    assert recommendations[0].action is RecommendedAction.TOKEN_REVOCATION
+
+
 def test_forced_critical_token_shared_across_projects():
     ctx = build_ctx(
         finding=make_finding(credential_active=True),

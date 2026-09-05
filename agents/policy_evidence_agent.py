@@ -82,4 +82,11 @@ class PolicyEvidenceAgent:
             evidence.append("Repository 공개 여부 미제공 — 노출 위치 점수는 보수적 기본값")
         if not ctx.from_code_scan and not ctx.accessible_repositories:
             evidence.append("접근 가능 저장소 목록 미제공 — 노출 면적 점수는 보수적 기본값")
+        if ctx.usage_analysis is not None:
+            evidence.append(
+                "Usage 분석 완료 "
+                f"(보안 이벤트 {len(ctx.security_events)}건, "
+                f"시나리오 일치 {len(ctx.scenario_matches or [])}건, "
+                f"데이터 완전성={ctx.usage_analysis.data_complete})"
+            )
         return evidence
