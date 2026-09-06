@@ -34,6 +34,7 @@ from agents.github_inventory_service import (
 from agents.slack_inventory_service import analyze_slack_nhi_from_connector
 from agents.aws_inventory_service import analyze_aws_nhi_from_connector
 from agents.inventory_adapter import _slack_channel_records
+from agents.dry_run_service import build_dry_run_result
 from agents.scope_translation_agent import ScopeTranslationAgent
 from connectors.base_connector import (
     AuthenticationError,
@@ -56,9 +57,10 @@ from core.agent_access_models import (
 )
 from core.inventory_models import GitHubNHIInput, SaaSNHIInput
 from core.models import ScanResult, ScanTrigger, SecretFinding
-from core.nhi_models import AnalysisSignals, NHIAnalysisReport, NHIType
+from core.nhi_models import AnalysisSignals, NHIAnalysisReport, NHIType, RecommendedAction
 from core.observation_models import CredentialObservation, Evidence
 from core.action_models import ActionStatus
+from core.approval_models import ApprovalRequest, ApprovalStatus
 from core.config import get_settings
 from normalization import (
     UsageEventAdapter,
@@ -263,6 +265,11 @@ class CredentialVerifyRequest(BaseModel):
 
 
 class ActionDecisionRequest(BaseModel):
+    actor: str = Field(..., min_length=1)
+    reason: str = ""
+
+
+class ApprovalDecisionRequest(BaseModel):
     actor: str = Field(..., min_length=1)
     reason: str = ""
 
@@ -1063,9 +1070,18 @@ def analyze_github_app_inventory_from_api() -> Dict[str, Any]:
         raise _http_error(exc)
 
     results = []
-    for analysis in analyses:
+    for analysis, nhi in analyses:
+        provider_detail = {
+            "github_app": {
+                "installation_id": nhi.installation_id,
+                "repository_selection": nhi.repository_selection,
+                "credential_verified": nhi.credential_verified,
+            }
+        }
         payload = analysis.to_dict()
-        payload["persistence"] = persist_analysis(storage, analysis)
+        payload["persistence"] = persist_analysis(
+            storage, analysis, provider_detail=provider_detail
+        )
         results.append(payload)
 
     return {"count": len(results), "analyses": results}
@@ -1624,8 +1640,16 @@ def request_finding_rescan(finding_id: str) -> Dict[str, Any]:
 
 
 @app.get("/nhi")
-def list_nhi_inventory(limit: int = 100) -> Dict[str, Any]:
-    records = storage.list_nhi_records(limit=min(max(limit, 1), 500))
+def list_nhi_inventory(limit: int = 100, provider: Optional[str] = None) -> Dict[str, Any]:
+    """NHI 인벤토리 목록.
+
+    `provider` 를 생략하면 기존과 동일하게 전체를 반환한다. 지정하면 정확히
+    일치하는 것만 반환하고, 저장된 레코드가 하나도 없는 provider(오타 포함)는
+    오류가 아니라 빈 목록으로 처리한다 — provider 값 자체를 검증하는
+    허용 목록은 두지 않는다(새 provider 추가 시 이 엔드포인트를 매번 손댈
+    필요가 없게 하기 위함).
+    """
+    records = storage.list_nhi_records(limit=min(max(limit, 1), 500), provider=provider)
     return {"count": len(records), "nhi": records}
 
 
@@ -1635,6 +1659,115 @@ def get_nhi_inventory_item(nhi_id: str) -> Dict[str, Any]:
     if record is None:
         raise HTTPException(status_code=404, detail="NHI 를 찾을 수 없습니다.")
     return record
+
+
+@app.post("/nhi/{nhi_id}/dry-run")
+def dry_run_nhi_action(nhi_id: str) -> Dict[str, Any]:
+    """저장된 NHI 의 `recommended_action` 기준으로, 실제 변경 없이 예상 조치
+    결과만 계산한다 (기본 구조). 실제 Credential 폐기/회전/권한 축소 등
+    조치 실행과 승인 처리는 이번 단계에서 구현하지 않는다 —
+    `agents/dry_run_service.py` 참고.
+    """
+    record = storage.get_nhi_record(nhi_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="NHI 를 찾을 수 없습니다.")
+    return build_dry_run_result(nhi_id, record)
+
+
+@app.post("/nhi/{nhi_id}/approval-request")
+def create_nhi_approval_request(nhi_id: str) -> Dict[str, Any]:
+    """NHI 의 현재 `recommended_action` 을 기준으로 승인 요청을 생성한다 (기본 흐름).
+
+    Dry-run 과 마찬가지로 실제 권한 변경은 하지 않는다 — 승인 상태
+    (pending/approved/rejected)와 감사 가능한 기록만 남긴다. 승인이 나도
+    자동으로 실행되지 않는다(실행 엔진 연결은 이후 별도 단계).
+    """
+    record = storage.get_nhi_record(nhi_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="NHI 를 찾을 수 없습니다.")
+
+    recommended_action = record.get("recommended_action") or RecommendedAction.MONITOR.value
+    approval = storage.create_approval(
+        ApprovalRequest(target_nhi_id=nhi_id, recommended_action=recommended_action)
+    )
+    storage.append_audit_event(
+        "APPROVAL_REQUESTED",
+        actor="api",
+        target=approval.approval_id,
+        detail={"target_nhi_id": nhi_id, "recommended_action": recommended_action},
+    )
+    return approval.to_dict()
+
+
+@app.get("/approvals")
+def list_nhi_approval_requests(limit: int = 100) -> Dict[str, Any]:
+    approvals = storage.list_approvals(limit=min(max(limit, 1), 500))
+    return {"count": len(approvals), "approvals": [item.to_dict() for item in approvals]}
+
+
+def _decide_approval(
+    approval_id: str,
+    body: ApprovalDecisionRequest,
+    x_nhi_admin_key: Optional[str],
+    *,
+    new_status: ApprovalStatus,
+    audit_event_type: str,
+) -> Dict[str, Any]:
+    _require_admin_key(x_nhi_admin_key)
+    approval = storage.get_approval(approval_id)
+    if approval is None:
+        raise HTTPException(status_code=404, detail="승인 요청을 찾을 수 없습니다.")
+    if approval.status is not ApprovalStatus.PENDING:
+        raise HTTPException(
+            status_code=409,
+            detail=f"이미 처리된 승인 요청입니다 (status={approval.status.value}).",
+        )
+    approval.status = new_status
+    approval.decided_at = datetime.now(timezone.utc).isoformat()
+    storage.update_approval(approval)
+    storage.append_audit_event(
+        audit_event_type,
+        actor=body.actor,
+        target=approval.approval_id,
+        detail={
+            "target_nhi_id": approval.target_nhi_id,
+            "recommended_action": approval.recommended_action,
+            "reason": body.reason,
+        },
+    )
+    return approval.to_dict()
+
+
+@app.post("/approvals/{approval_id}/approve")
+def approve_nhi_approval_request(
+    approval_id: str,
+    body: ApprovalDecisionRequest,
+    x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
+) -> Dict[str, Any]:
+    """승인 요청을 승인 상태로 전이한다. 실제 권한 변경은 수행하지 않는다."""
+    return _decide_approval(
+        approval_id,
+        body,
+        x_nhi_admin_key,
+        new_status=ApprovalStatus.APPROVED,
+        audit_event_type="APPROVAL_GRANTED",
+    )
+
+
+@app.post("/approvals/{approval_id}/reject")
+def reject_nhi_approval_request(
+    approval_id: str,
+    body: ApprovalDecisionRequest,
+    x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
+) -> Dict[str, Any]:
+    """승인 요청을 거부 상태로 전이한다."""
+    return _decide_approval(
+        approval_id,
+        body,
+        x_nhi_admin_key,
+        new_status=ApprovalStatus.REJECTED,
+        audit_event_type="APPROVAL_REJECTED",
+    )
 
 
 @app.get("/dashboard/summary")

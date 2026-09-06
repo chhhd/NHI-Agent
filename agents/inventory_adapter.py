@@ -145,6 +145,8 @@ def build_github_app_nhi_input(
     else:
         nhi_name = f"installation-{installation_id}"
 
+    repository_selection = installation.get("repository_selection")
+
     return GitHubNHIInput(
         nhi_id=f"github-app-installation-{installation_id}",
         nhi_name=nhi_name,
@@ -153,7 +155,13 @@ def build_github_app_nhi_input(
         # Installation 이 정지되면 이 Credential 은 실질적으로 쓸 수 없다.
         active=not bool(installation.get("suspended", False)),
         credential_verified=credential_verified,
+        installation_id=str(installation_id),
         repositories=repository_infos,
+        repository_selection=(
+            repository_selection.strip()
+            if isinstance(repository_selection, str) and repository_selection.strip()
+            else None
+        ),
         raw_permissions=dict(permissions) if isinstance(permissions, dict) else {},
     )
 

@@ -68,6 +68,32 @@ def test_repositories_are_converted_to_repository_info():
     assert [r.visibility for r in nhi.repositories] == ["private", "public"]
 
 
+def test_installation_id_field_is_populated_as_string():
+    """`provider_detail["github_app"]["installation_id"]` 저장에 쓰인다
+    (`api/app.py::analyze_github_app_inventory_from_api`) — nhi_id 조립에만
+    쓰이던 값을 필드로도 노출한다."""
+    nhi = build_github_app_nhi_input(_INSTALLATION, _REPOSITORIES)
+    assert nhi.installation_id == "555"
+
+
+def test_repository_selection_field_is_populated_from_installation():
+    nhi = build_github_app_nhi_input(_INSTALLATION, _REPOSITORIES)
+    assert nhi.repository_selection == "selected"
+
+
+def test_repository_selection_field_reflects_all_selection():
+    installation = {**_INSTALLATION, "repository_selection": "all"}
+    nhi = build_github_app_nhi_input(installation, _REPOSITORIES)
+    assert nhi.repository_selection == "all"
+
+
+def test_repository_selection_defaults_to_none_when_missing():
+    installation = dict(_INSTALLATION)
+    del installation["repository_selection"]
+    nhi = build_github_app_nhi_input(installation, _REPOSITORIES)
+    assert nhi.repository_selection is None
+
+
 def test_account_login_is_not_used_as_owner():
     nhi = build_github_app_nhi_input(_INSTALLATION, _REPOSITORIES)
     assert nhi.owner is None

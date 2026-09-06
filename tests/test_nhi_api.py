@@ -589,6 +589,274 @@ def test_connector_and_dashboard_static_assets(client):
     assert "renderDecisionIntelligence" in script.text
 
 
+def test_dashboard_nhi_provider_filter_ui_is_present(client):
+    """Unified Inventory 화면의 provider 필터 버튼(전체/GitHub/Slack/AWS)이
+    정적 페이지·스크립트에 포함돼 있고, 클릭 시 GET /nhi?provider= 를
+    호출하도록 연결돼 있는지 확인한다. 기존 dashboard 마크업/로직은
+    그대로 유지됐는지도 함께 확인한다(기존 assertion 은 건드리지 않음 —
+    `test_connector_and_dashboard_static_assets` 참고)."""
+    page = client.get("/dashboard/")
+    assert page.status_code == 200
+    assert 'id="nhi-provider-filter"' in page.text
+    assert 'data-nhi-provider=""' in page.text
+    assert 'data-nhi-provider="github"' in page.text
+    assert 'data-nhi-provider="slack"' in page.text
+    assert 'data-nhi-provider="aws"' in page.text
+    # 기존 NHI 섹션 마크업(GitHub 조직 수집 버튼, 카드 컨테이너)은 그대로 남아 있다.
+    assert 'id="github-discover-button"' in page.text
+    assert 'id="nhi-cards"' in page.text
+
+    script = client.get("/dashboard/app.js")
+    assert script.status_code == 200
+    assert "setNhiProviderFilter" in script.text
+    assert "provider=${encodeURIComponent(provider)}" in script.text
+    # 기존 loadDashboard()/renderNhi() 흐름은 그대로 남아 있다.
+    assert 'api("/nhi?limit=100")' in script.text
+    assert "function renderNhi()" in script.text
+
+
+def test_dashboard_nhi_card_renders_provider_detail(client):
+    """Unified Inventory 카드에 provider_detail(AWS/Slack/GitHub App)을 표시하는
+    `renderProviderDetail()` 이 스크립트에 포함돼 있고, `renderNhi()` 카드
+    템플릿에서 실제로 호출되는지 확인한다. `provider_detail` 이 없는 카드는
+    기존 그대로 렌더링돼야 하므로(빈 문자열 반환), 기존 `<dl>`/`evidence-mini`
+    마크업이 그대로 남아 있는지도 함께 확인한다."""
+    script = client.get("/dashboard/app.js")
+    assert script.status_code == 200
+    text = script.text
+
+    assert "function renderProviderDetail(item)" in text
+    assert "renderProviderDetail(item)" in text  # renderNhi() 카드 템플릿에서 호출
+
+    # AWS
+    assert "detail.aws" in text
+    assert "aws.access_key_id" in text
+    assert "aws.broad_access" in text
+    assert "aws.policy_fetch_errors" in text
+
+    # Slack
+    assert "detail.slack" in text
+    assert "slack.channels" in text
+    assert "slack.channels_error" in text
+
+    # GitHub App
+    assert "detail.github_app" in text
+    assert "app.installation_id" in text
+    assert "app.repository_selection" in text
+    assert "app.credential_verified" in text
+
+    # provider_detail 이 없으면 빈 문자열을 반환해 기존 카드 그대로 유지한다.
+    assert 'const detail = item.provider_detail || {};' in text
+    assert "return \"\";" in text
+
+    # 기존 카드 구조(오너/신뢰도/위험도 등 <dl>, evidence-mini)는 그대로 남아 있다.
+    assert "<dt>Owner</dt>" in text
+    assert "<dt>Permissions</dt>" in text
+    assert 'class="evidence-mini"' in text
+
+
+def test_dashboard_nhi_detail_view_basic_structure(client):
+    """Inventory 카드를 클릭하면 GET /nhi/{nhi_id} 로 상세를 불러와 보여주는
+    기본 구조(다이얼로그 + 기본정보/risk_score·risk_level/permissions/
+    raw_scopes/blast_radius)가 정적 페이지·스크립트에 있는지 확인한다.
+    기존 카드 클릭 이외 동작(판단 근거 보기 버튼)은 그대로 남아 있는지도
+    함께 확인한다."""
+    page = client.get("/dashboard/")
+    assert page.status_code == 200
+    assert '<dialog id="nhi-detail-dialog">' in page.text
+    assert 'id="nhi-detail-title"' in page.text
+    assert 'id="nhi-detail-body"' in page.text
+
+    script = client.get("/dashboard/app.js")
+    assert script.status_code == 200
+    text = script.text
+
+    # 카드 클릭 → 상세 조회 (GET /nhi/{nhi_id})
+    assert 'onclick="showNhiDetail(' in text
+    assert "async function showNhiDetail(nhiId)" in text
+    assert "api(`/nhi/${encodeURIComponent(nhiId)}`)" in text
+
+    # 요구된 표시 항목들
+    assert "function renderNhiDetailBody(record)" in text
+    assert "record.risk_score" in text
+    assert "record.risk_level" in text
+    assert "record.permissions" in text
+    assert "record.raw_scopes" in text
+    assert "record.blast_radius" in text
+
+    # 기존 "판단 근거 보기" 버튼 동작(analysis 상세 화면 전환)은 그대로 남아 있고,
+    # 카드 클릭과 충돌하지 않도록 이벤트 버블링을 막았는지 확인한다.
+    assert "event.stopPropagation(); openAnalysis(" in text
+
+
+def test_dashboard_nhi_detail_view_shows_evidence_and_recommendations(client):
+    """NHI 상세 다이얼로그에 evidence/risk evidence, credential 상태, usage 상태,
+    recommended_action, scenario/risk reason 이 표시되고 — 값이 없으면 해당
+    섹션이 숨겨지는(빈 문자열 반환) 구조인지 확인한다. 기존 기본 구조
+    (기본정보/위험도/permissions/raw_scopes/blast_radius) 는 그대로인지도
+    함께 확인한다."""
+    script = client.get("/dashboard/app.js")
+    assert script.status_code == 200
+    text = script.text
+
+    # 필드 없으면 섹션을 숨기는 공용 헬퍼
+    assert "function nhiDetailSection(title, innerHtml)" in text
+    assert "if (!innerHtml) return \"\";" in text
+
+    # recent_analyses[0] 에서 근거 데이터를 가져온다 (새 API 호출 없음)
+    assert "(record.recent_analyses || [])[0]" in text
+
+    # evidence / risk evidence
+    assert "record.evidence" in text
+    assert "riskDetail?.reasons" in text
+    assert "policy?.evidence" in text
+
+    # credential 상태 (risk_detail.factors 의 credential_state 영역)
+    assert 'factor.area === "credential_state"' in text
+
+    # usage 상태
+    assert "permissionUsage?.usage_status" in text
+    assert "usage?.activity_status" in text
+
+    # recommended_action (+ 근거가 있으면 rationale 도 표시)
+    assert "record.recommended_action" in text
+    assert "topRecommendation?.rationale" in text
+
+    # scenario / risk reason (canonical + permission 기반 모두 포함)
+    assert "latest?.scenario_matches" in text
+    assert "latest?.permission_scenario_matches" in text
+
+    # 섹션이 실제로 조립돼 있는지 (숨김 로직을 거치는 위치)
+    for title in ["Evidence", "Credential 상태", "Usage 상태", "추천 조치", "Scenario / Risk reason"]:
+        assert f'nhiDetailSection("{title}"' in text
+
+    # 기존 기본 구조는 그대로 남아 있다.
+    assert "function renderNhiDetailBody(record)" in text
+    assert "record.risk_score" in text
+    assert "record.raw_scopes" in text
+    assert "record.blast_radius" in text
+
+
+def test_dashboard_nhi_detail_has_dry_run_and_approval_request_ui(client):
+    """NHI 상세 다이얼로그에 Dry-run 버튼 → 결과 표시 → 승인 요청 버튼 노출 →
+    승인 요청 결과 표시까지 연결돼 있는지 확인한다.
+
+    NHI 상세 다이얼로그 자체에는 approve/reject 버튼을 넣지 않았다(별도
+    Review queue 화면에 있다 — `test_dashboard_approval_management_ui`
+    참고) — 이 다이얼로그 전용 함수/버튼 id 가 없는지만 확인한다.
+    `/approvals/{id}/approve|reject` 호출 자체는 이제 Review queue 화면에
+    정상적으로 존재하므로 스크립트 전체에서 금지하지 않는다."""
+    script = client.get("/dashboard/app.js")
+    assert script.status_code == 200
+    text = script.text
+
+    # Dry-run 버튼 → POST /nhi/{nhi_id}/dry-run
+    assert 'id="nhi-dry-run-button"' in text
+    assert 'onclick="runNhiDryRun()"' in text
+    assert "async function runNhiDryRun()" in text
+    assert "api(`/nhi/${encodeURIComponent(nhiId)}/dry-run`, { method: \"POST\" })" in text
+
+    # Dry-run 결과 표시 항목
+    assert "result.expected_changes" in text
+    assert "result.risk_before" in text
+    assert "result.risk_after_estimate" in text
+
+    # 결과 확인 후 승인 요청 버튼 노출 (기본은 숨김 상태로 시작)
+    assert 'id="nhi-approval-request-button" class="secondary-button" onclick="requestNhiApproval()" hidden' in text
+    assert "approvalButton.hidden = false;" in text
+
+    # 승인 요청 → POST /nhi/{nhi_id}/approval-request, 결과 상태 표시
+    assert "async function requestNhiApproval()" in text
+    assert "api(`/nhi/${encodeURIComponent(nhiId)}/approval-request`, { method: \"POST\" })" in text
+    assert "approval.status" in text
+    assert "approval.id" in text
+    assert "approval.created_at" in text
+
+    # NHI 상세 다이얼로그 전용 approve/reject 버튼/함수는 여전히 없다
+    # (승인/거부는 Review queue 화면의 decideApproval() 이 전담한다).
+    assert "nhi-approve-button" not in text
+    assert "nhi-reject-button" not in text
+    assert "approveNhiApproval" not in text
+    assert "rejectNhiApproval" not in text
+
+
+def test_dashboard_approval_management_ui(client):
+    """Review queue 화면에 pending 승인 요청 목록 + approve/reject 버튼이
+    추가돼 있고, 기존 approve/reject API(`/approvals/{id}/approve|reject`)를
+    actor/reason 바디와 관리자 키 헤더로 호출한 뒤 대시보드를 새로고침하는지
+    확인한다. 기존 Review queue(Action 기반) 마크업/로직은 그대로인지도
+    함께 확인한다."""
+    page = client.get("/dashboard/")
+    assert page.status_code == 200
+    assert 'id="approval-list"' in page.text
+    assert "NHI 승인 요청" in page.text
+    # 기존 review-list 는 그대로 남아 있다.
+    assert 'id="review-list"' in page.text
+    assert "Review queue" in page.text
+
+    script = client.get("/dashboard/app.js")
+    assert script.status_code == 200
+    text = script.text
+
+    # GET /approvals 로 pending 목록을 불러온다.
+    assert 'api("/approvals?limit=100")' in text
+    assert "function renderApprovals()" in text
+    assert 'item.status === "pending"' in text
+
+    # 각 요청에 approve/reject 버튼
+    assert 'onclick="decideApproval(' in text
+    assert "async function decideApproval(approvalId, approve)" in text
+
+    # 기존 approve/reject API 를 그대로 호출 (actor/reason 은 기존 형식 그대로)
+    assert "api(`/approvals/${approvalId}/${approve ? \"approve\" : \"reject\"}`" in text
+    assert '"X-NHI-Admin-Key": key' in text
+    assert 'JSON.stringify({ actor: "dashboard-admin", reason })' in text
+
+    # 처리 후 상태 갱신
+    assert "await loadDashboard();" in text
+
+    # 기존 Review(Action 기반) 로직은 그대로 남아 있다.
+    assert "function renderReviews()" in text
+    assert "async function decideReview(actionId, approve)" in text
+    assert 'api("/actions?limit=100")' in text
+
+
+def test_dashboard_nhi_summary_panel(client):
+    """NHI inventory 화면의 요약 카드(전체 NHI 수, provider별 NHI 수,
+    HIGH/CRITICAL 위험 NHI 수, pending approval 수, 최근 분석 시각)가
+    기존 GET /nhi, /approvals 데이터만으로 계산되고, provider 필터와
+    무관하게 항상 전체 기준으로 집계되는지 확인한다. 새 API 는 만들지
+    않았으므로 새 엔드포인트 호출이 없어야 한다."""
+    page = client.get("/dashboard/")
+    assert page.status_code == 200
+    assert 'id="nhi-kpi-total"' in page.text
+    assert 'id="nhi-kpi-providers"' in page.text
+    assert 'id="nhi-kpi-high-risk"' in page.text
+    assert 'id="nhi-kpi-pending-approvals"' in page.text
+    assert 'id="nhi-kpi-latest-analysis"' in page.text
+    # 기존 .kpi-grid/.kpi 카드 디자인을 그대로 재사용한다 (새 CSS 클래스 없음).
+    assert page.text.count('class="kpi-grid"') >= 2  # Overview + NHI inventory
+
+    script = client.get("/dashboard/app.js")
+    assert script.status_code == 200
+    text = script.text
+
+    assert "function renderNhiSummary()" in text
+    # provider 필터로 갱신되는 state.nhi 가 아니라, 항상 전체인 state.allNhi 를 쓴다.
+    assert "const all = state.allNhi" in text
+    assert 'allNhi: nhi.nhi' in text
+
+    # 요구된 5개 항목의 계산 로직
+    assert "providerCounts" in text
+    assert 'item.risk_level === "HIGH" || item.risk_level === "CRITICAL"' in text
+    assert 'item.status === "pending"' in text
+    assert "item.analyzed_at" in text
+
+    # 새 API 를 호출하지 않는다 — 기존 /nhi, /approvals 응답만 쓴다.
+    assert "/nhi/summary" not in text
+    assert "/dashboard/nhi-summary" not in text
+
+
 def test_competition_dashboard_static_assets(client):
     page = client.get("/competition/")
     assert page.status_code == 200

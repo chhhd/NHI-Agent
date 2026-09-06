@@ -25,6 +25,7 @@ from backend.models.entities import (
 )
 from backend.services.finding_lifecycle import validate_transition
 from core.action_models import ActionRequest, ActionStatus
+from core.approval_models import ApprovalRequest
 from core.models import (
     CodeContext,
     DetectorType,
@@ -164,6 +165,18 @@ CREATE TABLE IF NOT EXISTS action_requests (
     data            TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_actions_status ON action_requests(status);
+
+CREATE TABLE IF NOT EXISTS approval_requests (
+    approval_id         TEXT PRIMARY KEY,
+    target_nhi_id       TEXT NOT NULL,
+    recommended_action  TEXT NOT NULL,
+    status              TEXT NOT NULL,
+    created_at          TEXT NOT NULL,
+    decided_at          TEXT,
+    data                TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_approvals_status ON approval_requests(status);
+CREATE INDEX IF NOT EXISTS idx_approvals_target ON approval_requests(target_nhi_id);
 
 CREATE TABLE IF NOT EXISTS encrypted_secret_material (
     secret_id    TEXT PRIMARY KEY,
@@ -836,6 +849,61 @@ class SQLiteStorage(Storage):
             )
             self._conn.commit()
 
+    # -- Human Approval (Dry-run 기반 승인 요청) --------------------------
+    def create_approval(self, approval: ApprovalRequest) -> ApprovalRequest:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO approval_requests
+                    (approval_id, target_nhi_id, recommended_action, status,
+                     created_at, decided_at, data)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    approval.approval_id,
+                    approval.target_nhi_id,
+                    approval.recommended_action,
+                    approval.status.value,
+                    approval.created_at,
+                    approval.decided_at,
+                    json.dumps(approval.to_dict(), ensure_ascii=False),
+                ),
+            )
+            self._conn.commit()
+        return approval
+
+    def get_approval(self, approval_id: str) -> Optional[ApprovalRequest]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT data FROM approval_requests WHERE approval_id=?", (approval_id,)
+            ).fetchone()
+        return ApprovalRequest.from_dict(json.loads(row["data"])) if row else None
+
+    def list_approvals(self, *, limit: int = 100) -> List[ApprovalRequest]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT data FROM approval_requests ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [ApprovalRequest.from_dict(json.loads(row["data"])) for row in rows]
+
+    def update_approval(self, approval: ApprovalRequest) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE approval_requests
+                SET status=?, decided_at=?, data=?
+                WHERE approval_id=?
+                """,
+                (
+                    approval.status.value,
+                    approval.decided_at,
+                    json.dumps(approval.to_dict(), ensure_ascii=False),
+                    approval.approval_id,
+                ),
+            )
+            self._conn.commit()
+
     # -- 암호화 Secret material -----------------------------------------
     def put_encrypted_secret(self, record: Dict[str, Any]) -> None:
         with self._lock:
@@ -1210,12 +1278,18 @@ class SQLiteStorage(Storage):
                 )
             self._conn.commit()
 
-    def list_nhi_records(self, *, limit: int = 100) -> List[Dict[str, Any]]:
+    def list_nhi_records(
+        self, *, limit: int = 100, provider: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        sql = "SELECT data FROM nhi_identities"
+        args: tuple = ()
+        if provider is not None:
+            sql += " WHERE provider=?"
+            args = (provider,)
+        sql += " ORDER BY updated_at DESC LIMIT ?"
+        args += (limit,)
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT data FROM nhi_identities ORDER BY updated_at DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+            rows = self._conn.execute(sql, args).fetchall()
         return [json.loads(row["data"]) for row in rows]
 
     def get_nhi_record(self, nhi_id: str) -> Optional[Dict[str, Any]]:

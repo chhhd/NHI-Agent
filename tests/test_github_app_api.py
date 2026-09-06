@@ -171,6 +171,81 @@ def test_github_app_inventory_endpoint_persists_each_installation(
     assert records["github:github-app-installation-1"]["owner"] is None
 
 
+def test_github_app_inventory_endpoint_persists_provider_detail_per_installation(
+    client, monkeypatch, rsa_private_key_pem: str
+):
+    """provider_detail["github_app"] 에 installation_id/repository_selection/
+    credential_verified 가 installation 별로 정확히 저장돼야 한다."""
+    import api.app as app_module
+
+    settings = GitHubAppSettings(app_id="123456", private_key=rsa_private_key_pem)
+    handler = _make_handler([_INSTALLATION_1, _INSTALLATION_2], _REPOS_BY_INSTALLATION)
+    _patch_connector_factory(monkeypatch, app_module, settings, handler)
+
+    response = client.post("/nhi/github/app/inventory/analyze")
+    assert response.status_code == 200
+
+    records = {item["nhi_id"]: item for item in client.get("/nhi").json()["nhi"]}
+
+    installation_1 = records["github:github-app-installation-1"]
+    assert installation_1["provider_detail"]["github_app"] == {
+        "installation_id": "1",
+        "repository_selection": "selected",
+        "credential_verified": True,
+    }
+
+    installation_2 = records["github:github-app-installation-2"]
+    assert installation_2["provider_detail"]["github_app"] == {
+        "installation_id": "2",
+        "repository_selection": "all",
+        "credential_verified": True,
+    }
+
+
+def test_github_app_inventory_endpoint_persists_credential_verified_false_on_fetch_failure(
+    client, monkeypatch, rsa_private_key_pem: str
+):
+    """저장소 조회가 실패한 installation 은 provider_detail 에도 그대로
+    credential_verified=False 가 반영돼야 한다(감추지 않는다)."""
+    import api.app as app_module
+
+    settings = GitHubAppSettings(app_id="123456", private_key=rsa_private_key_pem)
+    # installation 2 의 저장소 조회만 실패하도록, repos_by_installation 에서 빼지 않고
+    # 대신 handler 자체가 installation 2 요청에 500 을 주도록 구성한다.
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/app/installations":
+            return httpx.Response(200, json=[_INSTALLATION_1, _INSTALLATION_2])
+        if request.method == "POST" and request.url.path.endswith("/access_tokens"):
+            installation_id = int(request.url.path.split("/")[3])
+            return httpx.Response(
+                201,
+                json={
+                    "token": f"ghs-installation-token-{installation_id}",
+                    "expires_at": _iso(FIXED_NOW + timedelta(hours=1)),
+                    "permissions": {},
+                    "repository_selection": "selected",
+                },
+            )
+        if request.method == "GET" and request.url.path == "/installation/repositories":
+            token = request.headers.get("authorization", "").removeprefix("Bearer ")
+            installation_id = int(token.removeprefix("ghs-installation-token-"))
+            if installation_id == 2:
+                return httpx.Response(403, json={"message": "installation suspended"})
+            repos = _REPOS_BY_INSTALLATION.get(installation_id, [])
+            return httpx.Response(200, json={"total_count": len(repos), "repositories": repos})
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    _patch_connector_factory(monkeypatch, app_module, settings, handler)
+
+    response = client.post("/nhi/github/app/inventory/analyze")
+    assert response.status_code == 200
+
+    records = {item["nhi_id"]: item for item in client.get("/nhi").json()["nhi"]}
+    installation_2 = records["github:github-app-installation-2"]
+    assert installation_2["provider_detail"]["github_app"]["credential_verified"] is False
+    assert installation_2["provider_detail"]["github_app"]["installation_id"] == "2"
+
+
 def test_github_app_inventory_endpoint_empty_installations_returns_zero_count(
     client, monkeypatch, rsa_private_key_pem: str
 ):

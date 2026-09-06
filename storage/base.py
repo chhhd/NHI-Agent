@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Set
 from connectors.github_connector import Repository
 from backend.models.entities import ConnectorRecord, FindingRecord, FindingStatus, ProjectRecord
 from core.action_models import ActionRequest, ActionStatus
+from core.approval_models import ApprovalRequest
 from core.models import ScanResult, SecretFinding
 from core.observation_models import CredentialObservation
 
@@ -142,6 +143,23 @@ class Storage(abc.ABC):
     def update_action(self, action: ActionRequest) -> None:
         ...
 
+    # -- Human Approval (Dry-run 기반 승인 요청) --------------------------
+    @abc.abstractmethod
+    def create_approval(self, approval: ApprovalRequest) -> ApprovalRequest:
+        ...
+
+    @abc.abstractmethod
+    def get_approval(self, approval_id: str) -> Optional[ApprovalRequest]:
+        ...
+
+    @abc.abstractmethod
+    def list_approvals(self, *, limit: int = 100) -> List[ApprovalRequest]:
+        ...
+
+    @abc.abstractmethod
+    def update_approval(self, approval: ApprovalRequest) -> None:
+        ...
+
     # -- 암호화 Secret material -----------------------------------------
     @abc.abstractmethod
     def put_encrypted_secret(self, record: Dict[str, Any]) -> None:
@@ -217,7 +235,12 @@ class Storage(abc.ABC):
         ...
 
     @abc.abstractmethod
-    def list_nhi_records(self, *, limit: int = 100) -> List[Dict[str, Any]]:
+    def list_nhi_records(
+        self, *, limit: int = 100, provider: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """저장된 NHI 레코드 목록. `provider` 를 주면 정확히 일치하는 것만 반환한다
+        (일치하는 레코드가 없으면 빈 리스트 — 존재하지 않는 provider 도 오류가
+        아니라 빈 결과다)."""
         ...
 
     @abc.abstractmethod

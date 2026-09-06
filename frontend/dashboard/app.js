@@ -3,11 +3,15 @@ const state = {
   projects: [],
   findings: [],
   nhi: [],
+  allNhi: [],
+  nhiProviderFilter: "",
+  nhiDetailId: null,
   analyses: [],
   selectedAnalysisId: null,
   historyComparisons: {},
   actions: [],
   audit: [],
+  approvals: [],
   graph: { nodes: [], edges: [], stats: {} },
 };
 
@@ -47,7 +51,7 @@ async function loadDashboard() {
   const banner = document.querySelector("#error-banner");
   banner.hidden = true;
   try {
-    const [summary, projects, findings, nhi, analyses, actions, audit, graph] = await Promise.all([
+    const [summary, projects, findings, nhi, analyses, actions, audit, graph, approvals] = await Promise.all([
       api("/dashboard/summary"),
       api("/projects"),
       api("/findings?limit=100"),
@@ -56,16 +60,20 @@ async function loadDashboard() {
       api("/actions?limit=100"),
       api("/audit?limit=50"),
       api("/graph?limit=100"),
+      api("/approvals?limit=100"),
     ]);
     Object.assign(state, {
       summary,
       projects: projects.projects,
       findings: findings.findings,
       nhi: nhi.nhi,
+      allNhi: nhi.nhi,
+      nhiProviderFilter: "",
       analyses: analyses.analyses,
       actions: actions.actions,
       audit: audit.events,
       graph,
+      approvals: approvals.approvals,
     });
     render();
     document.querySelector("#last-updated").textContent =
@@ -74,6 +82,12 @@ async function loadDashboard() {
     banner.textContent = `Dashboard 데이터를 불러오지 못했습니다: ${error.message}`;
     banner.hidden = false;
   }
+}
+
+function updateNavReviewCount() {
+  document.querySelector("#nav-review-count").textContent =
+    state.actions.filter((item) => item.status === "PENDING_APPROVAL").length
+    + (state.approvals || []).filter((item) => item.status === "pending").length;
 }
 
 function render() {
@@ -85,12 +99,12 @@ function render() {
   renderGitHubRun();
   renderDecisionIntelligence();
   renderReviews();
+  renderApprovals();
   renderAudit();
   renderGraph();
   document.querySelector("#nav-finding-count").textContent =
     state.summary.critical_high_findings || 0;
-  document.querySelector("#nav-review-count").textContent =
-    state.actions.filter((item) => item.status === "PENDING_APPROVAL").length;
+  updateNavReviewCount();
   document.querySelector("#nav-scenario-count").textContent =
     latestAnalyses().reduce(
       (sum, item) => sum + (item.scenario_matches || []).filter(
@@ -235,7 +249,306 @@ function renderFindings() {
   document.querySelector("#all-findings").innerHTML = findingRows(filtered, true);
 }
 
+function syncNhiProviderFilterButtons() {
+  document.querySelectorAll("#nhi-provider-filter [data-nhi-provider]").forEach((button) => {
+    button.classList.toggle(
+      "active",
+      button.dataset.nhiProvider === (state.nhiProviderFilter || ""),
+    );
+  });
+}
+
+async function setNhiProviderFilter(provider) {
+  state.nhiProviderFilter = provider || "";
+  syncNhiProviderFilterButtons();
+  try {
+    const query = provider ? `&provider=${encodeURIComponent(provider)}` : "";
+    const result = await api(`/nhi?limit=100${query}`);
+    state.nhi = result.nhi;
+    renderNhi();
+  } catch (error) {
+    showError(error.message);
+  }
+}
+
+function renderProviderDetail(item) {
+  const detail = item.provider_detail || {};
+
+  if (item.provider === "aws" && detail.aws) {
+    const aws = detail.aws;
+    const errorCount = (aws.policy_fetch_errors || []).length;
+    return `<div class="evidence-mini">
+      <span>Access Key ${escapeHtml(aws.access_key_id || "—")}</span>
+      ${aws.broad_access ? `<span class="badge CRITICAL">BROAD ACCESS</span>` : ""}
+      ${errorCount ? `<span class="badge NEEDS_REVIEW">Policy 조회 실패 ${errorCount}건</span>` : ""}
+    </div>`;
+  }
+
+  if (item.provider === "slack" && detail.slack) {
+    const slack = detail.slack;
+    const channels = slack.channels || [];
+    if (slack.channels_error) {
+      return `<div class="evidence-mini">
+        <span class="badge NEEDS_REVIEW">채널 조회 실패</span>
+        <span>${escapeHtml(slack.channels_error)}</span>
+      </div>`;
+    }
+    const sensitiveCount = channels.filter((channel) => channel.is_sensitive).length;
+    return `<div class="evidence-mini">
+      <span>접근 채널 ${channels.length}개</span>
+      ${sensitiveCount ? `<span class="badge HIGH">민감 채널 ${sensitiveCount}개</span>` : ""}
+    </div>`;
+  }
+
+  if (item.provider === "github" && detail.github_app) {
+    const app = detail.github_app;
+    return `<div class="evidence-mini">
+      <span>Installation ${escapeHtml(app.installation_id || "—")}</span>
+      <span>${escapeHtml(app.repository_selection || "미확인")}</span>
+      ${app.credential_verified === false ? `<span class="badge NEEDS_REVIEW">검증 실패</span>` : ""}
+    </div>`;
+  }
+
+  return "";
+}
+
+async function showNhiDetail(nhiId) {
+  const dialog = document.querySelector("#nhi-detail-dialog");
+  const body = document.querySelector("#nhi-detail-body");
+  state.nhiDetailId = nhiId;
+  document.querySelector("#nhi-detail-title").textContent = "NHI 상세";
+  body.innerHTML = `<div class="empty-state">불러오는 중…</div>`;
+  dialog.showModal();
+  try {
+    const record = await api(`/nhi/${encodeURIComponent(nhiId)}`);
+    renderNhiDetailBody(record);
+  } catch (error) {
+    body.innerHTML = `<div class="empty-state">상세 정보를 불러오지 못했습니다: ${escapeHtml(error.message)}</div>`;
+  }
+}
+
+async function runNhiDryRun() {
+  const nhiId = state.nhiDetailId;
+  if (!nhiId) return;
+  const button = document.querySelector("#nhi-dry-run-button");
+  const resultBox = document.querySelector("#nhi-dry-run-result");
+  const approvalButton = document.querySelector("#nhi-approval-request-button");
+  button.disabled = true;
+  resultBox.innerHTML = `<div class="empty-state">Dry-run 실행 중…</div>`;
+  approvalButton.hidden = true;
+  document.querySelector("#nhi-approval-result").innerHTML = "";
+  try {
+    const result = await api(`/nhi/${encodeURIComponent(nhiId)}/dry-run`, { method: "POST" });
+    resultBox.innerHTML = `
+      <dl>
+        <div><dt>Recommended action</dt><dd>${badge(result.recommended_action)}</dd></div>
+        <div><dt>Risk before</dt><dd>${result.risk_before} / 100</dd></div>
+        <div><dt>Risk after (estimate)</dt><dd>${result.risk_after_estimate} / 100</dd></div>
+      </dl>
+      ${(result.expected_changes || []).map((change) => `<div class="risk-reason">${escapeHtml(change)}</div>`).join("")}
+    `;
+    approvalButton.hidden = false;
+  } catch (error) {
+    resultBox.innerHTML = `<div class="empty-state">Dry-run 실행에 실패했습니다: ${escapeHtml(error.message)}</div>`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function requestNhiApproval() {
+  const nhiId = state.nhiDetailId;
+  if (!nhiId) return;
+  const button = document.querySelector("#nhi-approval-request-button");
+  const resultBox = document.querySelector("#nhi-approval-result");
+  button.disabled = true;
+  resultBox.innerHTML = `<div class="empty-state">승인 요청 생성 중…</div>`;
+  try {
+    const approval = await api(`/nhi/${encodeURIComponent(nhiId)}/approval-request`, { method: "POST" });
+    const statusLabel = (approval.status || "unknown").toUpperCase();
+    const statusClass = { PENDING: "PENDING_APPROVAL", APPROVED: "RESOLVED", REJECTED: "CRITICAL" }[statusLabel] || "";
+    resultBox.innerHTML = `
+      <dl>
+        <div><dt>Approval ID</dt><dd>${escapeHtml(approval.id)}</dd></div>
+        <div><dt>Status</dt><dd><span class="badge ${statusClass}">${escapeHtml(statusLabel)}</span></dd></div>
+        <div><dt>Created at</dt><dd>${fmtDate(approval.created_at)}</dd></div>
+      </dl>
+    `;
+    // Review queue/요약 카드가 새로고침 전까지 이 승인 요청을 모르는 채로
+    // 남아있지 않도록, 방금 만든 항목을 state 에도 반영해 관련 화면만
+    // 다시 그린다 (전체 loadDashboard() 재호출은 불필요하다).
+    state.approvals = [approval, ...(state.approvals || [])];
+    renderApprovals();
+    renderNhiSummary();
+    updateNavReviewCount();
+  } catch (error) {
+    resultBox.innerHTML = `<div class="empty-state">승인 요청 생성에 실패했습니다: ${escapeHtml(error.message)}</div>`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function nhiDetailSection(title, innerHtml) {
+  // innerHtml 이 비어 있으면(표시할 데이터가 없으면) 섹션 전체를 숨긴다.
+  if (!innerHtml) return "";
+  return `<h3>${escapeHtml(title)}</h3>${innerHtml}`;
+}
+
+function renderNhiDetailBody(record) {
+  document.querySelector("#nhi-detail-title").textContent = record.nhi_name || record.nhi_id || "NHI 상세";
+
+  const permissions = record.permissions || [];
+  const rawScopes = record.raw_scopes || [];
+  const blast = record.blast_radius || {};
+  const notes = blast.notes || [];
+
+  // 상세 근거(위험/정책 이유, credential/usage 상태, scenario)는 최근 저장된
+  // 전체 분석(`recent_analyses[0]`)에만 있다 — `GET /nhi/{nhi_id}` 가 이미
+  // 돌려주는 기존 필드이며, 이번 변경으로 새로 추가한 API 는 없다.
+  const latest = (record.recent_analyses || [])[0] || null;
+  const riskDetail = latest?.risk_detail || null;
+  const policy = latest?.policy || null;
+  const usage = latest?.usage_analysis || null;
+  const permissionUsage = latest?.permission_usage || null;
+  const recommendations = latest?.recommendations || [];
+  const scenarios = [
+    ...(latest?.scenario_matches || []),
+    ...(latest?.permission_scenario_matches || []),
+  ];
+
+  // 근거 (신원 판별 evidence + risk evidence)
+  const identityEvidence = record.evidence || [];
+  const riskReasons = riskDetail?.reasons || [];
+  const policyEvidence = policy?.evidence || [];
+  const evidenceHtml = (identityEvidence.length || riskReasons.length || policyEvidence.length)
+    ? `
+      ${identityEvidence.length ? `<p class="sub">신원 판별 근거</p>${identityEvidence.map((item) => `<div class="risk-reason">${escapeHtml(item)}</div>`).join("")}` : ""}
+      ${riskReasons.length ? `<p class="sub">위험 판단 근거</p>${riskReasons.map((item) => `<div class="risk-reason">${escapeHtml(item)}</div>`).join("")}` : ""}
+      ${policyEvidence.length ? `<p class="sub">정책 판단 근거</p>${policyEvidence.map((item) => `<div class="risk-reason">${escapeHtml(item)}</div>`).join("")}` : ""}
+    `
+    : "";
+
+  // credential 상태 — risk_detail.factors 중 area === "credential_state" 인 항목의 사유
+  const credentialFactor = (riskDetail?.factors || []).find((factor) => factor.area === "credential_state");
+  const credentialHtml = credentialFactor
+    ? (credentialFactor.reasons || []).map((reason) => `<div class="risk-reason">${escapeHtml(reason)}</div>`).join("")
+    : "";
+
+  // usage 상태 — permission_usage.usage_status(단순 비교) / usage_analysis.activity_status(canonical) 중 있는 것
+  const usageRows = [];
+  if (permissionUsage?.usage_status) {
+    usageRows.push(`<div><dt>Usage status</dt><dd>${escapeHtml(permissionUsage.usage_status)}</dd></div>`);
+  }
+  if (usage?.activity_status) {
+    usageRows.push(`<div><dt>Activity status</dt><dd>${escapeHtml(usage.activity_status)}</dd></div>`);
+  }
+  if (usage && typeof usage.data_complete === "boolean") {
+    usageRows.push(`<div><dt>Data complete</dt><dd>${usage.data_complete ? "예" : "아니오"}</dd></div>`);
+  }
+  const usageHtml = usageRows.length ? `<dl>${usageRows.join("")}</dl>` : "";
+
+  // recommended action — 요약 값은 항상 있으나(top-level 필드), 근거(rationale)는 있을 때만 덧붙인다.
+  const topRecommendation = recommendations[0];
+  const recommendedActionHtml = `
+    <dl><div><dt>Recommended action</dt><dd>${badge(record.recommended_action || "MONITOR")}</dd></div></dl>
+    ${topRecommendation?.rationale ? `<div class="risk-reason">${escapeHtml(topRecommendation.rationale)}</div>` : ""}
+  `;
+
+  // scenario / risk reason — canonical scenario_matches 와 permission_scenario_matches 를 함께 표시
+  const scenarioHtml = scenarios.length
+    ? scenarios.map((scenario) => {
+      const name = scenario.name || scenario.scenario_name || scenario.scenario_id;
+      const reason = scenario.reason || scenario.matched_reason || "";
+      return `
+        <article class="scenario-item">
+          <header><code>${escapeHtml(scenario.scenario_id || "")}</code>${badge(scenario.severity || "UNKNOWN")}</header>
+          <strong>${escapeHtml(name)}</strong>
+          ${reason ? `<p>${escapeHtml(reason)}</p>` : ""}
+        </article>
+      `;
+    }).join("")
+    : "";
+
+  document.querySelector("#nhi-detail-body").innerHTML = `
+    <h3>기본 정보</h3>
+    <dl>
+      <div><dt>NHI ID</dt><dd>${escapeHtml(record.nhi_id)}</dd></div>
+      <div><dt>이름</dt><dd>${escapeHtml(record.nhi_name)}</dd></div>
+      <div><dt>Provider</dt><dd>${escapeHtml(record.provider)}</dd></div>
+      <div><dt>유형</dt><dd>${escapeHtml(record.nhi_type)}</dd></div>
+      <div><dt>Owner</dt><dd>${escapeHtml(record.owner || "Not assigned")}</dd></div>
+      <div><dt>Environment</dt><dd>${escapeHtml(record.environment || "unknown")}</dd></div>
+    </dl>
+
+    <h3>위험도</h3>
+    <dl>
+      <div><dt>Risk score</dt><dd>${record.risk_score ?? "—"} / 100</dd></div>
+      <div><dt>Risk level</dt><dd>${badge(record.risk_level || "UNKNOWN")}</dd></div>
+    </dl>
+
+    <h3>Permissions</h3>
+    <p>${permissions.length ? permissions.map((item) => badge(item)).join(" ") : `<span class="empty-state">권한 정보 없음</span>`}</p>
+
+    <h3>Raw scopes</h3>
+    <p>${rawScopes.length ? escapeHtml(rawScopes.join(", ")) : `<span class="empty-state">원본 scope 없음</span>`}</p>
+
+    <h3>Blast radius</h3>
+    <dl>
+      <div><dt>Impact score</dt><dd>${blast.impact_score ?? "—"} / 100</dd></div>
+      <div><dt>Accessible resources</dt><dd>${blast.accessible_resources ?? 0}${blast.broad_access ? ` · <span class="badge CRITICAL">BROAD ACCESS</span>` : ""}</dd></div>
+      <div><dt>Connected services</dt><dd>${escapeHtml((blast.connected_services || []).join(", ") || "—")}</dd></div>
+      <div><dt>Cross-project impact</dt><dd>${blast.cross_project_impact ? "예" : "아니오"}</dd></div>
+    </dl>
+    ${notes.length ? `<div class="evidence-mini">${notes.map((note) => `<span>${escapeHtml(note)}</span>`).join("")}</div>` : ""}
+
+    ${nhiDetailSection("Evidence", evidenceHtml)}
+    ${nhiDetailSection("Credential 상태", credentialHtml)}
+    ${nhiDetailSection("Usage 상태", usageHtml)}
+    ${nhiDetailSection("추천 조치", recommendedActionHtml)}
+    ${nhiDetailSection("Scenario / Risk reason", scenarioHtml)}
+
+    <h3>조치 (Dry-run)</h3>
+    <button type="button" id="nhi-dry-run-button" class="secondary-button" onclick="runNhiDryRun()">Dry-run</button>
+    <div id="nhi-dry-run-result"></div>
+    <button type="button" id="nhi-approval-request-button" class="secondary-button" onclick="requestNhiApproval()" hidden>승인 요청</button>
+    <div id="nhi-approval-result"></div>
+  `;
+}
+
+function renderNhiSummary() {
+  // provider 필터와 무관하게 항상 "전체" 기준으로 집계한다 — `state.nhi`
+  // 는 필터 선택에 따라 바뀌지만 `state.allNhi`(마지막 전체 새로고침 결과)
+  // 는 그대로이므로 여기서는 이것만 쓴다.
+  const all = state.allNhi || [];
+
+  const providerCounts = {};
+  for (const item of all) {
+    const key = item.provider || "unknown";
+    providerCounts[key] = (providerCounts[key] || 0) + 1;
+  }
+  const providerText = Object.entries(providerCounts)
+    .sort((a, b) => b[1] - a[1])
+    .map(([provider, count]) => `${provider} ${count}`)
+    .join(" · ");
+
+  const highRiskCount = all.filter((item) =>
+    item.risk_level === "HIGH" || item.risk_level === "CRITICAL").length;
+
+  const pendingApprovals = (state.approvals || []).filter((item) => item.status === "pending").length;
+
+  const latestAnalyzedAt = all.reduce((latest, item) =>
+    item.analyzed_at && (!latest || item.analyzed_at > latest) ? item.analyzed_at : latest, null);
+
+  document.querySelector("#nhi-kpi-total").textContent = all.length;
+  document.querySelector("#nhi-kpi-providers").textContent = providerText || "provider 없음";
+  document.querySelector("#nhi-kpi-high-risk").textContent = highRiskCount;
+  document.querySelector("#nhi-kpi-pending-approvals").textContent = pendingApprovals;
+  document.querySelector("#nhi-kpi-latest-analysis").textContent =
+    latestAnalyzedAt ? fmtDate(latestAnalyzedAt) : "—";
+}
+
 function renderNhi() {
+  syncNhiProviderFilterButtons();
+  renderNhiSummary();
   const analyses = latestAnalyses();
   document.querySelector("#nhi-cards").innerHTML = state.nhi.length
     ? state.nhi.map((item) => {
@@ -244,7 +557,7 @@ function renderNhi() {
       const eventCount = analysis?.security_events?.length || 0;
       const scenarioCount = analysis?.scenario_matches?.length || 0;
       return `
-      <article class="entity-card">
+      <article class="entity-card nhi-card" onclick="showNhiDetail('${escapeHtml(item.nhi_id)}')">
         <header><div><h3>${escapeHtml(item.nhi_name)}</h3><p>${escapeHtml(item.provider)} · ${escapeHtml(item.nhi_type)}</p></div>${badge(item.identified ? "IDENTIFIED" : "UNKNOWN")}</header>
         <dl>
           <div><dt>Owner</dt><dd>${escapeHtml(item.owner || "Not assigned")}</dd></div>
@@ -254,8 +567,9 @@ function renderNhi() {
           <div><dt>Permissions</dt><dd>${escapeHtml((item.permissions || []).join(", ") || "Unknown")}</dd></div>
           <div><dt>AI Agent</dt><dd>${escapeHtml(item.linked_ai_agent || "—")}</dd></div>
         </dl>
+        ${renderProviderDetail(item)}
         ${analysis ? `<div class="evidence-mini"><span>Usage ${analysis.usage_analysis?.data_complete ? "complete" : "unknown"}</span><span>Events ${eventCount}</span><span>Scenarios ${scenarioCount}</span></div>
-        <footer><button class="text-button" onclick="openAnalysis('${analysis.analysis_id}')">판단 근거 보기 →</button></footer>` : ""}
+        <footer><button class="text-button" onclick="event.stopPropagation(); openAnalysis('${analysis.analysis_id}')">판단 근거 보기 →</button></footer>` : ""}
       </article>`;
     }).join("")
     : `<div class="empty-state">분석된 NHI가 없습니다. Scan 또는 Inventory 분석을 실행하세요.</div>`;
@@ -602,6 +916,24 @@ function renderReviews() {
     : `<div class="empty-state">대기 중인 Review가 없습니다.</div>`;
 }
 
+function renderApprovals() {
+  const pending = (state.approvals || []).filter((item) => item.status === "pending");
+  document.querySelector("#approval-list").innerHTML = pending.length
+    ? pending.map((item) => `
+      <article class="review-card">
+        <div>
+          <h3>${badge(item.recommended_action)}</h3>
+          <p>대상 NHI · ${escapeHtml(item.target_nhi_id)}</p>
+          <div class="review-meta"><span>Status · ${escapeHtml(item.status)}</span><span>Created · ${fmtDate(item.created_at)}</span></div>
+        </div>
+        <div class="review-actions">
+          <button class="secondary-button" onclick="showNhiDetail('${escapeHtml(item.target_nhi_id)}')">NHI 상세</button>
+          <button class="danger-button" onclick="decideApproval('${item.id}', false)">Reject</button><button class="primary-button" onclick="decideApproval('${item.id}', true)">Approve</button>
+        </div>
+      </article>`).join("")
+    : `<div class="empty-state">대기 중인 승인 요청이 없습니다.</div>`;
+}
+
 function renderAudit() {
   document.querySelector("#audit-list").innerHTML = state.audit.length
     ? state.audit.map((event) => `
@@ -686,6 +1018,21 @@ async function decideReview(actionId, approve) {
   } catch (error) { showError(error.message); }
 }
 
+async function decideApproval(approvalId, approve) {
+  const key = sessionStorage.getItem("nhiAdminKey") || prompt("관리자 API Key를 입력하세요.");
+  if (!key) return;
+  sessionStorage.setItem("nhiAdminKey", key);
+  const reason = approve ? "Dashboard approval reviewed" : prompt("거부 사유를 입력하세요.") || "Rejected";
+  try {
+    await api(`/approvals/${approvalId}/${approve ? "approve" : "reject"}`, {
+      method: "POST",
+      headers: { "X-NHI-Admin-Key": key },
+      body: JSON.stringify({ actor: "dashboard-admin", reason }),
+    });
+    await loadDashboard();
+  } catch (error) { showError(error.message); }
+}
+
 async function updateFindingStatus(findingId, status, previous) {
   if (status === previous) return;
   try {
@@ -757,6 +1104,8 @@ document.querySelector("#refresh-button").addEventListener("click", loadDashboar
 document.querySelector("#demo-workspace-button").addEventListener("click", seedDemoWorkspace);
 document.querySelector("#demo-reset-button").addEventListener("click", resetDemoWorkspace);
 document.querySelector("#github-discover-button").addEventListener("click", discoverGitHubOrganization);
+document.querySelectorAll("#nhi-provider-filter [data-nhi-provider]").forEach((button) =>
+  button.addEventListener("click", () => setNhiProviderFilter(button.dataset.nhiProvider)));
 document.querySelector("#admin-key-button").addEventListener("click", () => {
   const key = prompt("세션에만 보관할 관리자 API Key를 입력하세요.");
   if (key) sessionStorage.setItem("nhiAdminKey", key);

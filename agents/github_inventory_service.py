@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from agents.inventory_adapter import build_github_app_nhi_input, build_github_nhi_input
 from agents.pipeline import NHIAnalysisPipeline
 from connectors.base_connector import ConnectorError
 from connectors.github_app_connector import GitHubAppConnector
 from connectors.github_connector import GitHubConnector
+from core.inventory_models import GitHubNHIInput
 from core.nhi_models import AnalysisSignals, NHIAnalysis
 
 logger = logging.getLogger(__name__)
@@ -34,7 +35,7 @@ def analyze_github_app_nhi_from_connector(
     connector: GitHubAppConnector,
     *,
     pipeline: Optional[NHIAnalysisPipeline] = None,
-) -> List[NHIAnalysis]:
+) -> List[Tuple[NHIAnalysis, GitHubNHIInput]]:
     """Fetch every GitHub App installation's inventory and run the existing pipeline.
 
     한 App 은 여러 조직/계정에 설치될 수 있으므로 PAT 경로(항상 단일 신원)와
@@ -50,9 +51,15 @@ def analyze_github_app_nhi_from_connector(
     에 전달해 `credential_active` 판정에 반영한다(`agents/inventory_adapter.py` 참고).
     한 Installation 의 검증 실패가 다른 Installation 분석까지 막지 않도록 이 호출만
     개별적으로 감싼다.
+
+    `analyze_aws_nhi_from_connector()`/`analyze_slack_nhi_from_connector()` 와
+    동일하게 `NHIAnalysis` 하나만이 아니라 조립에 쓰인 `GitHubNHIInput` 도 함께
+    반환한다 — 호출부(`api/app.py`)가 `installation_id`/`repository_selection`/
+    `credential_verified` 처럼 공통 `NHIAnalysis`/`NHIProfile` 에는 실리지 않는
+    GitHub App 고유 필드를 `provider_detail` 로 저장하려면 원본 입력이 필요하다.
     """
     active_pipeline = pipeline or NHIAnalysisPipeline()
-    analyses: List[NHIAnalysis] = []
+    results: List[Tuple[NHIAnalysis, GitHubNHIInput]] = []
 
     for installation in connector.list_installations():
         installation_id = installation.get("installation_id")
@@ -76,6 +83,7 @@ def analyze_github_app_nhi_from_connector(
                 "github_installation": installation,
             }
         )
-        analyses.append(active_pipeline.analyze_github_nhi(nhi, signals=signals))
+        analysis = active_pipeline.analyze_github_nhi(nhi, signals=signals)
+        results.append((analysis, nhi))
 
-    return analyses
+    return results

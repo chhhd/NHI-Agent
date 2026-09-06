@@ -36,6 +36,26 @@ def test_repository_upsert_and_list(store):
     assert store.get_repository("org/repo")["default_branch"] == "main"
 
 
+def test_list_nhi_records_provider_filter(store):
+    store.upsert_nhi("github:x", {"nhi_id": "github:x", "provider": "github", "nhi_name": "octocat"})
+    store.upsert_nhi("slack:x", {"nhi_id": "slack:x", "provider": "slack", "nhi_name": "support-bot"})
+    store.upsert_nhi("aws:x", {"nhi_id": "aws:x", "provider": "aws", "nhi_name": "ci-deploy-user"})
+
+    assert {r["nhi_id"] for r in store.list_nhi_records()} == {
+        "github:x",
+        "slack:x",
+        "aws:x",
+    }
+    aws_only = store.list_nhi_records(provider="aws")
+    assert [r["nhi_id"] for r in aws_only] == ["aws:x"]
+
+
+def test_list_nhi_records_unknown_provider_returns_empty(store):
+    store.upsert_nhi("github:x", {"nhi_id": "github:x", "provider": "github", "nhi_name": "octocat"})
+
+    assert store.list_nhi_records(provider="not-a-real-provider") == []
+
+
 def test_agent_access_profile_and_decision_roundtrip(store):
     profile = {
         "agent_id": "storage-agent",

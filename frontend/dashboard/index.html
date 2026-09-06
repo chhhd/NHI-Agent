@@ -161,6 +161,34 @@
 
       <section class="view" data-view="nhi">
         <div class="section-heading"><div><h2>NHI inventory</h2><p>Credential과 연결된 자동화 계정의 권한과 소유자를 확인합니다.</p></div><button id="github-discover-button" class="primary-button">GitHub 조직 수집</button></div>
+        <div class="kpi-grid">
+          <article class="kpi">
+            <div class="kpi-top"><span>Total NHI</span><i>◎</i></div>
+            <strong id="nhi-kpi-total">0</strong>
+            <small id="nhi-kpi-providers">provider 없음</small>
+          </article>
+          <article class="kpi critical">
+            <div class="kpi-top"><span>High / Critical risk</span><i>!</i></div>
+            <strong id="nhi-kpi-high-risk">0</strong>
+            <small>즉시 검토가 필요한 NHI</small>
+          </article>
+          <article class="kpi warning">
+            <div class="kpi-top"><span>Pending approvals</span><i>⌁</i></div>
+            <strong id="nhi-kpi-pending-approvals">0</strong>
+            <small>승인 대기 중</small>
+          </article>
+          <article class="kpi">
+            <div class="kpi-top"><span>Latest analysis</span><i>▦</i></div>
+            <strong id="nhi-kpi-latest-analysis">—</strong>
+            <small>가장 최근 분석 시각</small>
+          </article>
+        </div>
+        <div class="filter-row" id="nhi-provider-filter">
+          <button class="chip filter-chip active" data-nhi-provider="">전체</button>
+          <button class="chip filter-chip" data-nhi-provider="github">GitHub</button>
+          <button class="chip filter-chip" data-nhi-provider="slack">Slack</button>
+          <button class="chip filter-chip" data-nhi-provider="aws">AWS</button>
+        </div>
         <article class="panel collection-run-panel">
           <div class="panel-head">
             <div><h3>Latest collection & agent run</h3><p>실제 수집 완전성, 재계획, Secret Scan 결과를 구분해 표시합니다.</p></div>
@@ -220,6 +248,9 @@
       <section class="view" data-view="reviews">
         <div class="section-heading"><div><h2>Review queue</h2><p>고위험 조치의 근거를 검토하고 승인 또는 거부합니다.</p></div></div>
         <div id="review-list" class="review-list"></div>
+
+        <div class="section-heading"><div><h2>NHI 승인 요청</h2><p>Dry-run 결과를 기반으로 생성된 승인 요청을 처리합니다.</p></div></div>
+        <div id="approval-list" class="review-list"></div>
       </section>
 
       <section class="view" data-view="audit">
@@ -228,6 +259,14 @@
       </section>
     </main>
   </div>
+
+  <dialog id="nhi-detail-dialog">
+    <form method="dialog">
+      <div class="dialog-head"><div><p class="eyebrow">NHI DETAIL</p><h2 id="nhi-detail-title">NHI 상세</h2></div><button value="cancel" class="dialog-close">×</button></div>
+      <div id="nhi-detail-body"><div class="empty-state">불러오는 중…</div></div>
+      <div class="dialog-actions"><button value="cancel" class="secondary-button">닫기</button></div>
+    </form>
+  </dialog>
 
   <dialog id="project-dialog">
     <form id="project-form" method="dialog">

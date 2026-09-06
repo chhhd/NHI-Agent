@@ -55,6 +55,14 @@ API 호출과 과도한 권한·민감 자원 접근을 근거 기반으로 식�
 정책 위반 판정이 위험 점수보다 **먼저** 실행된다("Owner·정책 관리 상태" 배점에 위반 건수가
 들어간다). 반대로 조치 결정은 점수가 나온 **뒤에** 한다.
 
+경로 (B)는 provider마다 별도 입력 모델과 조립 함수를 쓰지만(`GitHubNHIInput`/
+`SlackNHIInput`/`AWSNHIInput`, `agents/inventory_adapter.py`의 provider별 `build_*`
+함수), Scope Translation부터는 완전히 같은 엔진을 공유한다. AWS는 IAM 정책이
+Scope가 아니라 JSON Statement라 자체 정규화·권한 매핑 단계
+(`agents/aws_policy_normalizer.py` → `agents/aws_permission_mapper.py` →
+`agents/aws_policy_permission_analyzer.py`)를 거친 뒤 같은 Scope Translation
+결과 형태로 합류한다. 지원 provider와 각 엔드포인트는 3.1절 참고.
+
 Agent 실행 계층은 이 파이프라인을 하나의 도구로 감싼 다음, 결과를 보고 다음 도구를 고른다.
 여기서 Agent 실행 계층은 보안 분석을 수행하는 **Analysis Orchestrator**이며, 감시 대상인
 회사 AI Agent와는 다른 개념이다.
@@ -88,11 +96,14 @@ Agent → 승인 NHI → Credential                    실제 호출
 
 ```
 core/
-├─ config.py             환경 설정 (.env)
+├─ config.py             환경 설정 (.env) — GitHubSettings(PAT) / GitHubAppSettings(App) 별도
 ├─ models.py             SecretFinding / ScanResult / CredentialStatus  ← 탐지 계층 스키마
 ├─ nhi_models.py         NHIProfile / ContextInsight / PermissionProfile / RiskAssessment /
 │                        PolicyEvaluation / BlastRadiusReport / NHIAnalysis / AnalysisSignals
-├─ inventory_models.py   GitHubNHIInput / RepositoryInfo  ← 인벤토리 입력 스키마 (Pydantic)
+├─ inventory_models.py   GitHubNHIInput / RepositoryInfo  ← GitHub(PAT/App) 인벤토리 입력 (Pydantic)
+├─ slack_inventory_models.py  SlackNHIInput / ChannelInfo ← Slack 인벤토리 입력
+├─ aws_inventory_models.py    AWSNHIInput ← AWS IAM Access Key 인벤토리 입력 (broad_access 포함)
+├─ approval_models.py    ApprovalRequest / ApprovalStatus ← Dry-run 기반 승인 요청 최소 레코드
 ├─ usage_models.py       UsageEvent  ← 공급자별 감사 로그의 최소 공통 스키마
 └─ agent_access_models.py 회사 Agent 접근 기준선 / API 관측 / ALLOW·REVIEW·DENY
 
@@ -102,9 +113,13 @@ normalization/
 
 connectors/              외부 서비스 연동 (HTTP 재시도·Rate Limit·인증 예외 공통 처리)
 ├─ base_connector.py     공통 기반
-├─ github_connector.py   Repo 등록/조회·페이지 순회·완전성 표시, Commit/PR 변경 파일
+├─ github_connector.py   Repo 등록/조회·페이지 순회·완전성 표시, Commit/PR 변경 파일 (PAT)
+├─ github_app_connector.py  GitHub App JWT 발급, installation 목록, Installation Token 캐싱,
+│                        installation별 저장소 조회
 ├─ github_webhook.py     HMAC 서명 검증, push/PR 이벤트 파싱, 자동 검사 트리거
-├─ slack_connector.py    Workspace/Bot/App 정보, Scope, 토큰 유효성·폐기 확인
+├─ slack_connector.py    Workspace/Bot/App 정보, OAuth Scope, 채널 목록, 토큰 유효성·폐기 확인
+├─ aws_connector.py      boto3 기반(BaseConnector 미상속, SigV4) — 신원·Access Key·
+│                        연결된 Managed Policy 문서 조회
 ├─ microsoft_graph_connector.py  Entra 서비스 주체·Owner·OAuth/App 권한 Discovery
 ├─ google_workspace_connector.py OAuth Token 감사 이벤트 기반 Client Discovery
 └─ gitlab_ / notion_ / huggingface_connector.py
@@ -120,13 +135,21 @@ scanner/
 agents/                  NHI 분석 Agent
 ├─ discovery_agent.py          Credential → NHI 식별 (유형·Bot·AI Agent·Owner)
 ├─ context_analysis_agent.py   경로/변수명/주변 코드 → 환경·민감도·사용 여부
-├─ scope_translation_agent.py  서비스별 Scope → Read/Write/Delete/Admin
-├─ usage_analysis_agent.py     승인 권한과 관측 행위 비교 → Event 추출
+├─ scope_translation_agent.py  서비스별 Scope → Read/Write/Delete/Admin (AWS는 별도 분기)
+├─ usage_analysis_agent.py     UsageAnalysisAgent(canonical) + PermissionUsageAgent(단순 비교,
+│                              EventExtractionAgent/ScenarioMappingAgent 가 쓰는 별도 결과 타입)
 ├─ risk_scoring_agent.py       100점 위험 점수 (policy/scoring 위임)
 ├─ policy_evidence_agent.py    정책 위반 판정 + 판단 근거(Evidence) 수집
 ├─ recommendation_agent.py     조치 권고 9종 생성
-├─ inventory_adapter.py        GitHubNHIInput → 분석 입력 변환 (인벤토리 경로)
-├─ pipeline.py                 두 입력 경로를 하나로 묶는 단일 분석 엔진
+├─ dry_run_service.py          recommended_action 기준 예상 변경 사항·위험도 추정 (실행 없음)
+├─ inventory_adapter.py        GitHub/Slack/AWS *NHIInput → 분석 입력 변환 (provider별 build_* 함수)
+├─ github_inventory_service.py PAT/App installation → GitHubNHIInput 조립 + 파이프라인 실행
+├─ slack_inventory_service.py  auth.test 결과 → SlackNHIInput 조립 + 파이프라인 실행
+├─ aws_inventory_service.py    신원·Access Key·연결 Policy → AWSNHIInput 조립 + 파이프라인 실행
+├─ aws_policy_normalizer.py    IAM Policy Document → {effect, actions, resources, condition}
+├─ aws_permission_mapper.py    AWS Action 문자열 → Read/Write/Delete/Admin
+├─ aws_policy_permission_analyzer.py  Allow Action 집계 + Resource wildcard → broad_access
+├─ pipeline.py                 모든 입력 경로를 하나로 묶는 단일 분석 엔진
 └─ heuristics.py               경로·변수명·주석 신호 추출 공용 유틸
 
 policy/
@@ -151,14 +174,20 @@ rescan/
 
 storage/
 ├─ base.py               저장소 인터페이스 (Storage) — DB 교체 시 이 계약만 맞추면 된다
-└─ sqlite_store.py       SQLite 구현 (기본)
+└─ sqlite_store.py       SQLite 구현 (기본). `nhi_identities`(provider 컬럼으로 필터),
+                         `approval_requests`(Human Approval) 테이블 포함
 
 backend/services/
 ├─ analysis_history.py        NHI별 분석 스냅샷 변화 비교
 └─ agent_access_evaluator.py  Agent 위장·Credential·권한·자원 범위 초과 판정
 
+frontend/dashboard/      운영 Dashboard 정적 파일 (별도 빌드 없이 FastAPI가 서빙)
+├─ index.html            Unified Inventory(provider 필터·상세 다이얼로그) 포함 전체 레이아웃
+├─ app.js                데이터 로딩·렌더링·Dry-run/Approval 호출 전부(바닐라 JS)
+└─ styles.css            카드/배지/필터 칩 등 공용 컴포넌트 스타일
+
 api/app.py               FastAPI 단일 진입점 (Webhook 수신 포함)
-tests/                   단위·통합 테스트 227개 (외부 네트워크 호출 없음)
+tests/                   단위·통합 테스트 (외부 네트워크 호출 없음)
 ```
 
 ---
@@ -169,7 +198,7 @@ tests/                   단위·통합 테스트 227개 (외부 네트워크 �
 pip install -r requirements.txt
 cp .env.example .env          # 토큰/시크릿 입력
 uvicorn api.app:app --reload --port 8000
-pytest                        # 227 passed
+pytest                        # 전체 테스트 실행
 ```
 
 ### 운영 데이터 파이프라인과 암호화 Secret material
@@ -226,13 +255,86 @@ FastAPI 서버가 별도 빌드 없이 운영 Dashboard를 함께 제공한다.
   `GET /connectors/status`
 - Finding Lifecycle: `GET /findings`, `GET /findings/{id}`,
   `PATCH /findings/{id}/status`, `POST /findings/{id}/rescan`
-- NHI Inventory: `GET /nhi`, `GET /nhi/{id}`
+- NHI Inventory (Unified Inventory): `GET /nhi?provider=`, `GET /nhi/{id}` — provider별 상세는
+  3.2절, Dry-run·승인 요청은 3.3절 참고
 - Agent Access: `PUT/GET /agent-access/profiles`, `POST /agent-access/evaluate`,
   `GET /agent-access/decisions`
 - Decision Flow: Usage → Event → Scenario → Risk/Action과 직전 분석 대비 변화
 - Relationship Graph: `GET /graph`
-- Review Queue: `POST /reviews/{id}/approve`, `POST /reviews/{id}/reject`
+- Review Queue: 기존 조치 `POST /reviews/{id}/approve`/`reject` +
+  NHI 승인 요청 `POST /approvals/{id}/approve`/`reject` (3.3절)
 - Audit/Report: `GET /audit`, `GET /reports/summary?format=markdown`
+
+### 3.1 GitHub / Slack / AWS NHI 인벤토리 분석
+
+코드 스캔 없이 provider API를 직접 호출해 NHI 1건(또는 GitHub App은 installation마다
+1건)을 분석하고 저장한다. 분석·채점·정책 로직은 셋 다 6장의 동일한 엔진을 그대로 쓴다.
+
+| Provider | 인증 방식 | 엔드포인트 | 필요 환경변수 |
+| --- | --- | --- | --- |
+| GitHub (PAT) | Personal Access Token | `POST /nhi/github/inventory/analyze` | `GITHUB_TOKEN` |
+| GitHub (App) | App JWT → Installation Token (설치마다 자동 발급) | `POST /nhi/github/app/inventory/analyze` | `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`(또는 `GITHUB_APP_PRIVATE_KEY_PATH`) |
+| Slack | Bot/User Token | `POST /nhi/slack/inventory/analyze` | `SLACK_BOT_TOKEN` |
+| AWS | IAM Access Key (boto3 표준 자격 증명 체인) | `POST /nhi/aws/inventory/analyze` | `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` 또는 `AWS_PROFILE`/IAM 역할 |
+
+세 provider 모두 실제 라이브 API 호출로 신원·권한·접근 범위를 확인한다(추정하지 않음).
+GitHub App은 installation당 저장소 조회 성공 여부를 `credential_verified`로 남기고,
+Installation Token은 시간 단위로 자동 만료되므로 `ROTATION_PERIOD` 등 PAT용 회전 정책은
+적용하지 않는다. AWS는 Access Key에 연결된 Managed Policy를 모두 모아 허용 Action을
+집계하고, Policy의 Resource에 전체/서비스 전체 wildcard가 있으면 `broad_access=true`로
+표시한다(정확한 리소스 개수 대신 이 값만 위험 근거로 쓴다). Slack은 채널 조회 "성공 +
+0개"와 "조회 실패"를 구분해 후자를 미확인으로 보수적으로 채점한다.
+
+provider별로 공통 `NHIAnalysis`에는 없는 고유 필드는 저장 시 `provider_detail`에 그대로
+담겨 `GET /nhi`/`GET /nhi/{id}` 응답에 노출된다.
+
+```jsonc
+// provider_detail (provider에 해당하는 키만 채워진다)
+{
+  "aws": { "access_key_id": "AKIA...", "broad_access": true, "policy_fetch_errors": [] },
+  "slack": { "channels": [{ "name": "general", "is_private": false, "is_sensitive": false }], "channels_error": null },
+  "github_app": { "installation_id": "12345", "repository_selection": "selected", "credential_verified": true }
+}
+```
+
+### 3.2 Unified Inventory 화면
+
+`/dashboard/` 의 **NHI inventory** 탭 하나에서 GitHub/Slack/AWS 결과를 함께 본다.
+
+- 상단 요약 카드(전체 NHI 수, provider별 개수, HIGH/CRITICAL 위험 NHI 수, pending approval
+  수, 최근 분석 시각)는 **새 API 없이** `GET /nhi`/`GET /approvals` 응답만으로 화면에서
+  계산한다. provider 필터를 눌러도 이 요약은 항상 "전체" 기준을 유지한다.
+- 전체/GitHub/Slack/AWS 필터 버튼을 누르면 `GET /nhi?provider=<값>` 을 다시 호출해 목록만
+  갱신한다(전체 새로고침 없음). 존재하지 않는 provider는 오류가 아니라 빈 목록이다.
+- 각 카드는 `provider_detail` 이 있으면 provider별 배지(예: AWS `BROAD ACCESS`, Slack
+  "채널 조회 실패", GitHub App 검증 실패)를 추가로 보여주고, 없으면 기존 카드 그대로다.
+- 카드를 클릭하면 `GET /nhi/{nhi_id}` 로 상세를 불러와 다이얼로그에 표시한다: 기본정보,
+  risk_score/risk_level, permissions, raw_scopes, blast_radius, 그리고 최근 저장된 분석
+  (`recent_analyses[0]`)에서 뽑은 identity/risk/policy evidence, credential 상태
+  (`risk_detail.factors`의 `credential_state` 영역), usage 상태, 추천 조치, scenario/risk
+  reason — 값이 없는 섹션은 자동으로 숨는다.
+
+### 3.3 Dry-run · Human Approval (실행 없음)
+
+NHI 상세 다이얼로그에서 이어지는 흐름이며, **이 단계는 실제 Credential 폐기·회전·권한
+축소를 수행하지 않는다.** 상태와 감사 가능한 기록만 남긴다.
+
+| Method | Path | 설명 |
+| --- | --- | --- |
+| POST | `/nhi/{nhi_id}/dry-run` | 저장된 `recommended_action` 기준으로 예상 변경 사항과 위험도 추정치 계산 |
+| POST | `/nhi/{nhi_id}/approval-request` | 위 조치에 대한 승인 요청 생성 (`pending`) |
+| GET | `/approvals` | 승인 요청 목록 |
+| POST | `/approvals/{approval_id}/approve` · `/reject` | 승인/거부 (기존 조치 승인과 동일하게 `X-NHI-Admin-Key` + `{actor, reason}` 필요) |
+
+`POST /nhi/{nhi_id}/dry-run` 응답은 `target_nhi_id`, `recommended_action`,
+`expected_changes`(조치 유형별 안내 문구), `risk_before`, `risk_after_estimate`(조치
+유형별 고정 감소율을 적용한 **추정치** — 정책 엔진을 재실행한 값이 아니다)다.
+`POST /nhi/{nhi_id}/approval-request` 응답은 `id`, `target_nhi_id`, `recommended_action`,
+`status`(`pending`/`approved`/`rejected`), `created_at`, `decided_at`다. 승인/거부는
+`APPROVAL_GRANTED`/`APPROVAL_REJECTED` 감사 이벤트로 남는다(`GET /audit`).
+
+Dashboard의 Review queue 화면에는 기존 조치 승인 목록 아래에 "NHI 승인 요청" 목록이
+추가로 있어 pending 요청을 같은 화면에서 승인/거부할 수 있다.
 
 ### GitHub 조직 NHI Discovery
 
@@ -451,6 +553,32 @@ python scripts/demo_github_analysis.py --repo psf/requests --max-files 5 --run-a
 `--max-files` 로 검사 파일 수를 제한한다. 토큰이 있으면 저장소 전체를 검사한다.
 `--verify-credentials` 를 주면 탐지된 토큰을 해당 서비스 API 로 재검증한다(읽기 전용, 기본 꺼짐).
 
+### 데모 순서
+
+실제 Credential 이 있으면 provider별로 그대로 시연하고, 없으면 **데모 데이터 생성**
+버튼(합성 데이터, 실제 API 호출 없음)으로 같은 화면을 채운 뒤 이어서 진행한다.
+
+1. **서버 기동** — `uvicorn api.app:app --reload --port 8000` → <http://127.0.0.1:8000/dashboard/>
+2. **Provider 분석 실행** (Swagger `/docs` 또는 curl) — 준비된 `.env` 값에 따라
+   `POST /nhi/github/inventory/analyze`, `/nhi/github/app/inventory/analyze`,
+   `/nhi/slack/inventory/analyze`, `/nhi/aws/inventory/analyze` 중 가능한 것을 호출한다.
+   Credential 이 전혀 없으면 Dashboard 상단의 **데모 데이터 생성** 버튼으로 대체한다.
+3. **Unified Inventory** — `NHI inventory` 탭에서 요약 카드(전체/HIGH·CRITICAL/pending
+   approval/최근 분석 시각) 확인 → 전체/GitHub/Slack/AWS 필터 버튼으로 provider 전환 →
+   AWS/Slack/GitHub App 카드의 provider별 배지(broad access, 채널 조회 실패, 검증 실패 등)를
+   보여준다.
+4. **NHI 상세** — 카드 클릭 → 기본정보/위험도/permissions/raw_scopes/blast_radius와
+   evidence·credential 상태·usage 상태·추천 조치·scenario reason을 확인한다.
+5. **Dry-run** — 상세 다이얼로그의 `Dry-run` 버튼 → `expected_changes`/`risk_before`/
+   `risk_after_estimate` 확인(추정치이며 아직 아무것도 변경되지 않았음을 강조).
+6. **승인 요청** — Dry-run 결과 확인 후 나타나는 `승인 요청` 버튼 클릭 → 생성된 승인의
+   `pending` 상태를 그 자리에서 확인.
+7. **Review queue에서 처리** — `Review Queue` 탭의 "NHI 승인 요청" 목록에서 방금 만든
+   요청을 Approve/Reject(관리자 API Key 필요, `NHI_ADMIN_API_KEY`) → 상태가
+   `approved`/`rejected`로 바뀌고 `GET /audit`에 `APPROVAL_GRANTED`/`APPROVAL_REJECTED`로
+   남는 것을 확인한다. **이 시점까지도 실제 Credential은 변경되지 않는다** — 이 흐름은
+   상태 추적까지만 구현되어 있다(12장 참고).
+
 ---
 
 ## 4. 엔드포인트
@@ -470,6 +598,16 @@ python scripts/demo_github_analysis.py --repo psf/requests --max-files 5 --run-a
 | GET | `/nhi/{owner}/{repo}/blast-radius` | 영향 범위 (합산 + NHI 별) |
 | **POST** | **`/nhi/inventory/analyze`** | **NHI 정보 직접 입력 → 분석 (스캔 결과 불필요)** |
 | POST | `/nhi/inventory/saas/analyze` | Microsoft/Google 등 공급자 중립 NHI 입력 → 분석 |
+| **POST** | **`/nhi/github/inventory/analyze`** | **GitHub PAT 라이브 인벤토리 분석 (3.1절)** |
+| **POST** | **`/nhi/github/app/inventory/analyze`** | **GitHub App installation별 라이브 인벤토리 분석** |
+| **POST** | **`/nhi/slack/inventory/analyze`** | **Slack Bot/User Token 라이브 인벤토리 분석** |
+| **POST** | **`/nhi/aws/inventory/analyze`** | **AWS IAM Access Key 라이브 인벤토리 분석** |
+| GET | `/nhi` `?provider=` | NHI 목록, provider 필터(생략 시 전체, 미존재 provider는 빈 목록) |
+| GET | `/nhi/{nhi_id}` | NHI 상세 (`recent_analyses` 포함) |
+| **POST** | **`/nhi/{nhi_id}/dry-run`** | **recommended_action 기준 예상 변경/위험도 추정 (실행 없음, 3.3절)** |
+| **POST** | **`/nhi/{nhi_id}/approval-request`** | **승인 요청 생성 (`pending`)** |
+| **GET** | **`/approvals`** | **승인 요청 목록** |
+| **POST** | **`/approvals/{approval_id}/approve`** · **`/reject`** | **승인/거부 (관리자 API Key 필요)** |
 | POST | `/nhi/usage/normalize` | 원본 감사 이벤트 필터링·중복 제거 → 분석 신호 |
 | POST | `/nhi/scopes/translate` | Scope → 공통 권한 변환 |
 | PUT·GET | `/agent-access/profiles/{agent_id}` | 회사 Agent의 승인 NHI·권한·자원 기준선 |
@@ -904,6 +1042,13 @@ GitHub 조직 수집 실행은 원문 inventory나 token을 감사 로그에 복
 
 **구현됨**
 
+- GitHub(PAT/App)·Slack·AWS IAM Access Key 라이브 인벤토리 분석 (3.1절) — provider별
+  고유 필드는 `provider_detail`로 저장·노출, GitHub App Installation Token은 회전 정책
+  오탐 제외
+- Unified Inventory 화면 — provider 필터, 상세 다이얼로그(근거·credential/usage 상태·
+  추천 조치·scenario reason), 요약 카드 (3.2절)
+- Dry-run 예상 조치 계산과 Human Approval 상태 추적/감사 로그 — **실제 Credential
+  변경 실행은 아직 없음** (3.3절)
 - GitHub 조직 App installation 수집, Microsoft 365·Google Workspace 인벤토리 수집,
   GitHub Webhook 자동 검사
 - Slack/GitLab/Notion/Hugging Face Credential 탐지·읽기 전용 검증 Connector
@@ -922,7 +1067,7 @@ GitHub 조직 수집 실행은 원문 inventory나 token을 감사 로그에 복
 - 위장 Agent, Token replay, 미승인 Credential, 권한·자원 초과 `ALLOW/REVIEW/DENY` 판정·이력
 - DPoP key-bound 단기 token 발급·API 검증·proof replay 차단 연구 경로
 - SQLite 분석 이력/감사 영속화와 NHI별 스냅샷 비교, PostgreSQL 운영 스키마, FastAPI + Dashboard/Swagger
-- Decision Flow·분석 변화·Agent Run 시각화와 반응형 Dashboard, 테스트 227개
+- Decision Flow·분석 변화·Agent Run 시각화와 반응형 Dashboard, 자동화 테스트 (`pytest`)
 
 **부분 구현 — 판정 모델은 있으나 실제 수집 근거가 제한됨**
 
@@ -946,7 +1091,8 @@ GitHub 조직 수집 실행은 원문 inventory나 token을 감사 로그에 복
 - GitHub/Microsoft/Slack 인벤토리에서 AgentAccessProfile을 자동 조립·정합하는 reconciler
 - 대규모 조직용 비동기·페이지형 분석 job, Scheduler, 완전 snapshot reconciliation
 - 최종 사용자 로그인/RBAC, 운영용 Agent key enrollment, 분산 DPoP replay 저장소·KMS
-- 승인 후 revoke/rotate/scope 축소 실행, Dry-run·rollback·사후 검증
+- 승인 후 실제 revoke/rotate/scope 축소 **실행**과 rollback·사후 검증 — Dry-run(예상 결과
+  계산)과 Human Approval(상태 추적)까지만 구현됨, 실행 엔진 연결은 다음 단계
 - 신규 OAuth 동의 시점의 과도한 Scope 예방 경고·차단
 - LLM 기반 목표 해석과 자연어 보고서(위험 판정은 규칙 기반 유지)
 

@@ -123,7 +123,7 @@ def test_analyzes_one_nhi_per_installation(app_settings: GitHubAppSettings):
         analyses = analyze_github_app_nhi_from_connector(connector)
 
     assert len(analyses) == 2
-    assert {a.profile.nhi_id for a in analyses} == {
+    assert {a.profile.nhi_id for a, _ in analyses} == {
         "github:github-app-installation-1",
         "github:github-app-installation-2",
     }
@@ -135,8 +135,8 @@ def test_profile_account_login_reflects_installation_account(app_settings: GitHu
     with GitHubAppConnector(app_settings, client=_client(handler)) as connector:
         analyses = analyze_github_app_nhi_from_connector(connector)
 
-    assert analyses[0].profile.account.get("login") == "acme-org"
-    assert analyses[0].profile.owner is None
+    assert analyses[0][0].profile.account.get("login") == "acme-org"
+    assert analyses[0][0].profile.owner is None
 
 
 def test_repository_from_correct_installation_is_used(app_settings: GitHubAppSettings):
@@ -145,7 +145,7 @@ def test_repository_from_correct_installation_is_used(app_settings: GitHubAppSet
     with GitHubAppConnector(app_settings, client=_client(handler)) as connector:
         analyses = analyze_github_app_nhi_from_connector(connector)
 
-    by_id = {a.profile.nhi_id: a for a in analyses}
+    by_id = {a.profile.nhi_id: a for a, _ in analyses}
     assert by_id["github:github-app-installation-1"].repository == ""
     # repositories 는 signals.extra 안에 담기고, blast radius 표본으로 드러난다.
     assert "acme/backend" in by_id["github:github-app-installation-1"].blast_radius.resource_samples
@@ -162,7 +162,7 @@ def test_permissions_are_translated_not_assumed(app_settings: GitHubAppSettings)
     with GitHubAppConnector(app_settings, client=_client(handler)) as connector:
         analyses = analyze_github_app_nhi_from_connector(connector)
 
-    by_id = {a.profile.nhi_id: a for a in analyses}
+    by_id = {a.profile.nhi_id: a for a, _ in analyses}
     installation_1 = by_id["github:github-app-installation-1"]
     installation_2 = by_id["github:github-app-installation-2"]
 
@@ -218,7 +218,7 @@ def test_installation_token_never_appears_in_analysis_output(app_settings: GitHu
     with GitHubAppConnector(app_settings, client=_client(handler)) as connector:
         analyses = analyze_github_app_nhi_from_connector(connector)
 
-    serialized = str([a.to_dict() for a in analyses])
+    serialized = str([a.to_dict() for a, _ in analyses])
     assert "ghs-installation-token-1" not in serialized
     assert app_settings.private_key not in serialized
 

@@ -251,7 +251,7 @@ def test_successful_installation_gets_credential_verified_true(
     ) as connector:
         analyses = analyze_github_app_nhi_from_connector(connector)
 
-    by_id = {a.profile.nhi_id: a for a in analyses}
+    by_id = {a.profile.nhi_id: a for a, _ in analyses}
     ok = by_id["github:github-app-installation-1"]
     credential_state = next(f for f in ok.risk.factors if f.area == "credential_state")
     assert "외부 검증 결과 활성 Token" in credential_state.reasons
@@ -269,7 +269,7 @@ def test_failed_installation_gets_credential_active_none_not_crash_whole_batch(
         analyses = analyze_github_app_nhi_from_connector(connector)
 
     assert len(analyses) == 2  # 둘 다 분석 결과가 생성됨 (배치 전체가 죽지 않음)
-    by_id = {a.profile.nhi_id: a for a in analyses}
+    by_id = {a.profile.nhi_id: a for a, _ in analyses}
 
     broken = by_id["github:github-app-installation-2"]
     broken_factor = next(f for f in broken.risk.factors if f.area == "credential_state")

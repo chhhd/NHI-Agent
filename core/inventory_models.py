@@ -72,6 +72,10 @@ class GitHubNHIInput(BaseModel):
     #: True = 검증 성공, False = 검증 시도했으나 실패 — 폐기로 단정하지 않고
     #: "상태 불명"으로 보수적으로 평가한다(`agents/inventory_adapter.py` 참고).
     credential_verified: Optional[bool] = None
+    #: GitHub App Installation ID (`GitHubAppConnector.list_installations()`
+    #: 의 `installation_id`). PAT/Actions Credential 경로는 설치 개념이
+    #: 없으므로 항상 None이다.
+    installation_id: Optional[str] = None
     #: GitHub API가 돌려준 설치 대상 계정. 보안 책임자(owner)와는 다른 개념이다.
     account: Dict[str, Any] = Field(default_factory=dict)
     repositories: List[RepositoryInfo] = Field(default_factory=list)
