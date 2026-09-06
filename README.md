@@ -959,8 +959,3 @@ GitHub 조직 수집 실행은 원문 inventory나 token을 감사 로그에 복
 | 팀원 1 | `connectors/` · `scanner/` · `rescan/` · `storage/` · 탐지 계층 스키마 |
 | 팀원 2 | `agents/` · `policy/` · `graph/` · 분석 계층 스키마 |
 | 팀원 3 | `agent_runtime/` · `core/inventory_models.py` · 인벤토리 입력 경로 |
-
-세 계층은 원래 각자 실행되는 별개 프로젝트였고, 지금은 하나의 패키지·하나의 FastAPI 앱·
-하나의 테스트 스위트로 합쳐져 있다. 통합 과정에서 중복 구현(별도의 Scope Translation /
-Context Analysis / Risk Scoring / Recommendation 모듈)과 Mock 도구는 삭제하고, 그 자리에
-실제 엔진을 연결했다.
