@@ -30,6 +30,7 @@ from agents.github_inventory_service import (
 )
 from agents.slack_inventory_service import analyze_slack_nhi_from_connector
 from agents.aws_inventory_service import analyze_aws_nhi_from_connector
+from agents.inventory_adapter import _slack_channel_records
 from agents.scope_translation_agent import ScopeTranslationAgent
 from connectors.base_connector import (
     AuthenticationError,
@@ -609,14 +610,23 @@ def analyze_slack_inventory_from_api() -> Dict[str, Any]:
     """
     try:
         with SlackConnector() as connector:
-            analysis = analyze_slack_nhi_from_connector(
+            analysis, nhi = analyze_slack_nhi_from_connector(
                 connector, pipeline=nhi_pipeline
             )
     except ConnectorError as exc:
         raise _http_error(exc)
 
+    provider_detail = {
+        "slack": {
+            "channels": _slack_channel_records(nhi),
+            "channels_error": nhi.channels_error,
+        }
+    }
+
     payload = analysis.to_dict()
-    payload["persistence"] = persist_analysis(storage, analysis)
+    payload["persistence"] = persist_analysis(
+        storage, analysis, provider_detail=provider_detail
+    )
     return payload
 
 

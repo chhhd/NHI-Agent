@@ -320,7 +320,7 @@ def test_analyze_slack_nhi_from_connector_end_to_end():
         raise AssertionError(f"unexpected path: {request.url.path}")
 
     with SlackConnector(token, client=_client(handler)) as connector:
-        analysis = analyze_slack_nhi_from_connector(connector)
+        analysis, _nhi = analyze_slack_nhi_from_connector(connector)
 
     assert analysis.profile.nhi_id == "slack:slack-T999-B1"
     assert analysis.permissions.assumed is False

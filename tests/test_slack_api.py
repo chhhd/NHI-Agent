@@ -103,6 +103,53 @@ def test_slack_inventory_endpoint_returns_analysis_and_persists_it(client, monke
     assert record["risk_score"] == body["risk_score"]
     assert record["risk_level"] == body["risk_level"]
 
+    # provider_detail — Slack 고유 필드(channels/channels_error)가 저장된
+    # 레코드에 그대로 실려 있어야 한다.
+    assert record["provider_detail"]["slack"] == {
+        "channels": [{"name": "general", "is_private": False, "is_sensitive": False}],
+        "channels_error": None,
+    }
+
+
+def test_slack_inventory_endpoint_persists_channels_error_on_fetch_failure(
+    client, monkeypatch
+):
+    """채널 조회가 실패해도(0개로 감춰지지 않고) 실패 사유가
+    provider_detail["slack"]["channels_error"] 에 그대로 남아야 한다."""
+    import api.app as app_module
+
+    token = "xoxb-endpoint-channel-fetch-failure"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/auth.test":
+            return httpx.Response(
+                200,
+                json={
+                    "ok": True,
+                    "team": "Acme",
+                    "team_id": "T998",
+                    "user": "support-bot",
+                    "user_id": "U2",
+                    "bot_id": "B2",
+                    "app_id": "A2",
+                },
+                headers={"x-oauth-scopes": "chat:write"},  # channels:read 없음
+            )
+        return httpx.Response(200, json={"ok": False, "error": "missing_scope"})
+
+    _patch_connector_factory(monkeypatch, app_module, token, handler)
+
+    response = client.post("/nhi/slack/inventory/analyze")
+
+    assert response.status_code == 200
+
+    records = client.get("/nhi").json()["nhi"]
+    record = next(item for item in records if item["nhi_id"] == "slack:slack-T998-B2")
+    detail = record["provider_detail"]["slack"]
+    assert detail["channels"] == []
+    assert detail["channels_error"] is not None
+    assert "missing_scope" in detail["channels_error"]
+
 
 def test_slack_inventory_endpoint_response_includes_blast_radius_and_policy(
     client, monkeypatch

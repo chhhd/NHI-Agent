@@ -247,8 +247,9 @@ def test_slack_inventory_endpoint_still_registered_and_independent(client, monke
     body = response.json()
     assert body["nhi_name"] == "support-bot"
 
-    # Slack 호출부는 provider_detail 을 넘기지 않으므로 저장된 레코드에
-    # 그 키 자체가 생기면 안 된다 (AWS 엔드포인트만 채운다).
+    # AWS 엔드포인트 추가가 Slack 자신의 provider_detail 채우기 동작에
+    # 영향을 주지 않았는지만 확인한다 (내용 자체의 상세 검증은
+    # tests/test_slack_api.py 몫이다).
     records = client.get("/nhi").json()["nhi"]
     slack_record = next(item for item in records if item["nhi_id"] == "slack:slack-T999-B1")
-    assert "provider_detail" not in slack_record
+    assert slack_record["provider_detail"]["slack"]["channels_error"] is None

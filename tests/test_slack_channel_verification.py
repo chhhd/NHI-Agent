@@ -266,7 +266,7 @@ def test_end_to_end_missing_scope_reaches_analysis_with_reason_visible():
         return httpx.Response(200, json={"ok": False, "error": "missing_scope"})
 
     with SlackConnector("xoxb-live-token", client=_client(handler)) as connector:
-        analysis = analyze_slack_nhi_from_connector(connector)
+        analysis, _nhi = analyze_slack_nhi_from_connector(connector)
 
     exposure_factor = next(
         f for f in analysis.risk.factors if f.area == "exposure_location"
