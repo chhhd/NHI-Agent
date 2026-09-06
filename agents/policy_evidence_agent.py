@@ -20,6 +20,12 @@ from policy.rules import EvaluationContext, evaluate_policies
 
 logger = logging.getLogger(__name__)
 
+#: provider → 사람이 읽을 이름 / 접근 자원 명칭. 목록에 없는 provider 는
+#: `provider.capitalize()` / "자원" 으로 대체한다(향후 provider 추가 시에도
+#: 하드코딩된 문구가 남지 않게).
+_PROVIDER_LABELS = {"github": "GitHub", "slack": "Slack"}
+_RESOURCE_LABELS = {"github": "저장소", "slack": "채널"}
+
 
 class PolicyEvidenceAgent:
     """정책 평가 + 근거(Evidence) 수집."""
@@ -51,6 +57,8 @@ class PolicyEvidenceAgent:
         """판단에 사용한 입력의 출처 — 신뢰도 검토용."""
         evidence: List[str] = []
         finding = ctx.finding
+        provider = (ctx.profile.provider or "").strip().lower()
+        resource_label = _RESOURCE_LABELS.get(provider, "자원")
 
         if ctx.from_code_scan:
             evidence.append(
@@ -58,9 +66,10 @@ class PolicyEvidenceAgent:
                 f"({finding.secret_type}, detector={finding.detector.value})"
             )
         else:
+            provider_label = _PROVIDER_LABELS.get(provider, provider.capitalize() or "NHI")
             evidence.append(
-                f"입력: GitHub NHI 인벤토리 ({ctx.profile.nhi_type.value}, "
-                f"접근 저장소 {len(ctx.accessible_repositories)}개) — 코드 스캔 결과 아님"
+                f"입력: {provider_label} NHI 인벤토리 ({ctx.profile.nhi_type.value}, "
+                f"접근 {resource_label} {len(ctx.accessible_repositories)}개) — 코드 스캔 결과 아님"
             )
 
         if finding.credential_active is None:
@@ -81,5 +90,16 @@ class PolicyEvidenceAgent:
         if ctx.from_code_scan and ctx.signals.repository_public is None:
             evidence.append("Repository 공개 여부 미제공 — 노출 위치 점수는 보수적 기본값")
         if not ctx.from_code_scan and not ctx.accessible_repositories:
-            evidence.append("접근 가능 저장소 목록 미제공 — 노출 면적 점수는 보수적 기본값")
+            if not ctx.accessible_resources_verification_attempted:
+                # GitHub 등 — 조회 시도 여부를 알려주지 않는 provider. 기존 문구 그대로.
+                evidence.append(f"접근 가능 {resource_label} 목록 미제공 — 노출 면적 점수는 보수적 기본값")
+            elif ctx.accessible_resources_error:
+                # Slack 등 — 조회를 시도했으나 실패한 사유를 그대로 노출한다.
+                evidence.append(
+                    f"접근 가능 {resource_label} 목록 조회 실패 ({ctx.accessible_resources_error}) "
+                    "— 노출 면적 점수는 보수적 기본값"
+                )
+            else:
+                # 조회에 성공했고 실제로 0개임이 확인된 경우.
+                evidence.append(f"조회 결과 접근 가능한 {resource_label} 없음 (확인됨)")
         return evidence

@@ -87,6 +87,12 @@ class BlastRadiusCalculator:
         resources = self._resources(finding, signals)
         report.accessible_resources = len(resources)
         report.resource_samples = [self._resource_label(r) for r in resources[:10]]
+        # AWS 는 Resource 가 ARN/와일드카드라 "개수"가 의미 없다 — 대신
+        # `agents/aws_policy_permission_analyzer.py` 가 이미 계산한 "광범위
+        # 접근 여부"만 신호로 받는다(`agents/inventory_adapter.py::build_aws_signals`
+        # 가 채운 `signals.extra["aws_broad_access"]`). 다른 provider 는 이
+        # 키를 채우지 않으므로 항상 False 다.
+        report.broad_access = bool(signals.extra.get("aws_broad_access")) if signals.extra else False
 
         report.affected_projects = list(signals.shared_projects)
         report.cross_project_impact = len(report.affected_projects) >= 2
@@ -98,8 +104,12 @@ class BlastRadiusCalculator:
 
         if permissions.assumed:
             report.notes.append("Scope 미확인 — 권한은 Secret 유형 기준 가정값")
-        if not resources:
+        if not resources and profile.provider != "aws":
+            # AWS 는 애초에 리소스 "개수"를 세지 않으므로(broad_access 만
+            # 본다) 이 문구가 "검증 실패"처럼 오인되지 않게 AWS 는 제외한다.
             report.notes.append("접근 가능 자원 목록을 확인하지 못함 (토큰 검증 미수행 또는 권한 부족)")
+        if report.broad_access:
+            report.notes.append("AWS Policy 에 광범위한 Resource 접근(전체/서비스 전체 wildcard)이 포함됨")
         if profile.linked_ai_agent:
             report.notes.append(f"AI Agent '{profile.linked_ai_agent}' 가 이 Credential 을 사용")
 
@@ -152,7 +162,11 @@ class BlastRadiusCalculator:
         score = 0
         score += min(25, len(report.connected_services) * 10)
         resources = report.accessible_resources
-        if resources >= 20:
+        if report.broad_access:
+            # AWS 등 리소스 "개수"를 세지 않는 provider — 광범위 wildcard 는
+            # 리소스 20개 이상(최고 구간)과 동급 위험으로 취급한다.
+            score += 25
+        elif resources >= 20:
             score += 25
         elif resources >= 5:
             score += 18

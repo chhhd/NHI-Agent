@@ -24,6 +24,12 @@ from pydantic import BaseModel, Field
 from agent_runtime.models import NHIAgentRequest
 from agent_runtime.orchestrator import run_nhi_agent
 from agents.pipeline import NHIAnalysisPipeline, finding_from_dict
+from agents.github_inventory_service import (
+    analyze_github_app_nhi_from_connector,
+    analyze_github_nhi_from_connector,
+)
+from agents.slack_inventory_service import analyze_slack_nhi_from_connector
+from agents.aws_inventory_service import analyze_aws_nhi_from_connector
 from agents.scope_translation_agent import ScopeTranslationAgent
 from connectors.base_connector import (
     AuthenticationError,
@@ -32,6 +38,8 @@ from connectors.base_connector import (
     PermissionDeniedError,
     RateLimitError,
 )
+from connectors.aws_connector import AWSConnector
+from connectors.github_app_connector import GitHubAppConnector
 from connectors.github_connector import GitHubConnector
 from connectors.github_webhook import GitHubWebhookHandler, WebhookVerificationError
 from connectors.slack_connector import SlackConnector
@@ -544,6 +552,102 @@ def analyze_inventory_nhi(body: InventoryAnalyzeRequest) -> Dict[str, Any]:
     payload = analysis.to_dict()
     payload["persistence"] = persist_analysis(
         storage, analysis, input_revision=observation.source_event_id
+    )
+    return payload
+
+
+@app.post("/nhi/github/inventory/analyze")
+def analyze_github_inventory_from_api() -> Dict[str, Any]:
+    """Fetch the configured GitHub inventory, analyze it, and persist the result."""
+    try:
+        with GitHubConnector() as connector:
+            analysis = analyze_github_nhi_from_connector(
+                connector, pipeline=nhi_pipeline
+            )
+    except ConnectorError as exc:
+        raise _http_error(exc)
+
+    payload = analysis.to_dict()
+    payload["persistence"] = persist_analysis(storage, analysis)
+    return payload
+
+
+@app.post("/nhi/github/app/inventory/analyze")
+def analyze_github_app_inventory_from_api() -> Dict[str, Any]:
+    """Fetch every configured GitHub App installation's inventory, analyze, and persist each result.
+
+    한 App 은 여러 조직/계정에 설치될 수 있으므로 PAT 엔드포인트
+    (`/nhi/github/inventory/analyze`, 단일 결과)와 달리 installation 당 하나씩
+    분석 결과를 만들어 목록으로 반환한다. 분석·저장 로직 자체는 완전히
+    동일하다 — `analyze_github_app_nhi_from_connector()` 가 기존
+    `NHIAnalysisPipeline.analyze_github_nhi()` 를 그대로 재사용한다.
+    """
+    try:
+        with GitHubAppConnector() as connector:
+            analyses = analyze_github_app_nhi_from_connector(
+                connector, pipeline=nhi_pipeline
+            )
+    except ConnectorError as exc:
+        raise _http_error(exc)
+
+    results = []
+    for analysis in analyses:
+        payload = analysis.to_dict()
+        payload["persistence"] = persist_analysis(storage, analysis)
+        results.append(payload)
+
+    return {"count": len(results), "analyses": results}
+
+
+@app.post("/nhi/slack/inventory/analyze")
+def analyze_slack_inventory_from_api() -> Dict[str, Any]:
+    """Fetch the configured Slack credential's inventory, analyze it, and persist the result.
+
+    GitHub PAT 엔드포인트(`/nhi/github/inventory/analyze`)와 동일한 단일 결과
+    형태다 — `analyze_slack_nhi_from_connector()` 가 기존
+    `NHIAnalysisPipeline.analyze_slack_nhi()` 를 그대로 재사용한다.
+    """
+    try:
+        with SlackConnector() as connector:
+            analysis = analyze_slack_nhi_from_connector(
+                connector, pipeline=nhi_pipeline
+            )
+    except ConnectorError as exc:
+        raise _http_error(exc)
+
+    payload = analysis.to_dict()
+    payload["persistence"] = persist_analysis(storage, analysis)
+    return payload
+
+
+@app.post("/nhi/aws/inventory/analyze")
+def analyze_aws_inventory_from_api() -> Dict[str, Any]:
+    """Fetch the configured AWS IAM Access Key inventory, analyze it, and persist the result.
+
+    GitHub PAT/Slack 엔드포인트와 동일한 단일 결과 형태다 —
+    `analyze_aws_nhi_from_connector()` 가 기존 `NHIAnalysisPipeline.analyze_aws_nhi()`
+    를 그대로 재사용한다. `AWSConnector` 는 `BaseConnector` 를 상속하지 않아
+    (SigV4 서명 — boto3 가 직접 처리) 다른 Connector 처럼 `with ... as` 컨텍스트
+    매니저로 감싸지 않고 바로 생성한다. `provider_detail` 저장 구조는 아직
+    건드리지 않는다 — 응답/저장 모양은 GitHub/Slack 과 동일하다.
+    """
+    try:
+        connector = AWSConnector()
+        analysis, nhi = analyze_aws_nhi_from_connector(connector, pipeline=nhi_pipeline)
+    except ConnectorError as exc:
+        raise _http_error(exc)
+
+    provider_detail = {
+        "aws": {
+            "access_key_id": nhi.access_key_id,
+            "broad_access": nhi.broad_access,
+            "policy_fetch_errors": list(nhi.policy_fetch_errors),
+        }
+    }
+
+    payload = analysis.to_dict()
+    payload["persistence"] = persist_analysis(
+        storage, analysis, provider_detail=provider_detail
     )
     return payload
 

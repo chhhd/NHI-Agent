@@ -66,6 +66,12 @@ class GitHubNHIInput(BaseModel):
     environment: Environment = Environment.UNKNOWN
     #: Credential 이 살아 있는가
     active: bool = True
+    #: 실제 라이브 API 호출(예: GitHub App Installation Token 발급 +
+    #: 저장소 조회)로 이 NHI 가 살아있음을 검증했는가.
+    #: None = 검증을 시도하지 않음/해당 없음 (PAT 등 기존 경로는 항상 None).
+    #: True = 검증 성공, False = 검증 시도했으나 실패 — 폐기로 단정하지 않고
+    #: "상태 불명"으로 보수적으로 평가한다(`agents/inventory_adapter.py` 참고).
+    credential_verified: Optional[bool] = None
     repositories: List[RepositoryInfo] = Field(default_factory=list)
     #: GitHub App 권한 (자원: 수준). 예: {"contents": "write", "administration": "write"}
     raw_permissions: Dict[str, str] = Field(default_factory=dict)

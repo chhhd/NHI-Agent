@@ -66,6 +66,11 @@ class CredentialStatus:
     raw_scopes: List[str] = field(default_factory=list)
     account: Dict[str, Any] = field(default_factory=dict)   # team/user/app 식별 정보
     accessible_resources: List[Dict[str, Any]] = field(default_factory=list)
+    #: 접근 가능 자원 조회 자체가 실패한 사유. `accessible_resources` 는 실패해도
+    #: 빈 리스트로 남으므로("조회 성공 + 0개"와 동일한 모양), 이 필드가 없으면
+    #: 둘을 구분할 방법이 없다. None = 조회를 시도하지 않았거나 성공함(빈 결과
+    #: 포함), 문자열 = 조회를 시도했으나 실패한 사유.
+    accessible_resources_error: Optional[str] = None
     checked_at: str = field(default_factory=_utcnow)
     error: Optional[str] = None
 

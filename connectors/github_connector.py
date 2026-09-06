@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional
@@ -20,9 +21,11 @@ from typing import Any, Dict, Iterable, List, Optional
 import httpx
 
 from connectors.base_connector import (
+    AuthenticationError,
     BaseConnector,
     ConnectorError,
     NotFoundError,
+    PermissionDeniedError,
     RateLimitError,
 )
 from core.config import get_settings
@@ -103,6 +106,111 @@ class GitHubConnector(BaseConnector):
     # ------------------------------------------------------------------
     # 자격 증명
     # ------------------------------------------------------------------
+    def get_authenticated_user(self, token: Optional[str] = None) -> Dict[str, Any]:
+        """Authenticate with ``GET /user`` and return only safe identity fields.
+
+        This intentionally performs no repository lookup. The optional token is
+        used for this request only; when omitted, the configured environment
+        token is used by :class:`BaseConnector`.
+        """
+        target_token = self.token if token is None else token
+        if not target_token:
+            raise AuthenticationError(
+                "GitHub token is not configured", status_code=401
+            )
+
+        try:
+            response = self.get(
+                "/user", headers={"Authorization": f"Bearer {target_token}"}
+            )
+        except AuthenticationError as exc:
+            raise AuthenticationError(
+                "GitHub authentication failed", status_code=401
+            ) from exc
+        except ConnectorError as exc:
+            raise ConnectorError(
+                f"GitHub API request failed ({exc.status_code or 'unknown'})",
+                status_code=exc.status_code,
+            ) from exc
+
+        payload = self._safe_json(response)
+        if not isinstance(payload, dict) or "login" not in payload or "id" not in payload:
+            raise ConnectorError("GitHub /user response is invalid", status_code=502)
+        return {"login": payload["login"], "id": payload["id"]}
+
+    def list_accessible_repositories(
+        self,
+        token: Optional[str] = None,
+        *,
+        per_page: int = 100,
+        max_pages: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Return a minimal, paginated list of repositories accessible to the user."""
+        target_token = self.token if token is None else token
+        if not target_token:
+            raise AuthenticationError(
+                "GitHub token is not configured", status_code=401
+            )
+
+        headers = {"Authorization": f"Bearer {target_token}"}
+        repositories: List[Dict[str, Any]] = []
+        next_url: Optional[str] = "/user/repos"
+
+        for page in range(1, max_pages + 1):
+            try:
+                response = self.get(
+                    next_url,
+                    params={"per_page": per_page, "page": page}
+                    if next_url == "/user/repos"
+                    else None,
+                    headers=headers,
+                )
+            except AuthenticationError as exc:
+                raise AuthenticationError(
+                    "GitHub authentication failed", status_code=401
+                ) from exc
+            except PermissionDeniedError as exc:
+                raise PermissionDeniedError(
+                    "GitHub repository access denied", status_code=403
+                ) from exc
+            except RateLimitError as exc:
+                raise RateLimitError(
+                    "GitHub API rate limit exceeded",
+                    retry_after=exc.retry_after,
+                    status_code=exc.status_code,
+                ) from exc
+            except ConnectorError as exc:
+                raise ConnectorError(
+                    f"GitHub repository API request failed ({exc.status_code or 'unknown'})",
+                    status_code=exc.status_code,
+                ) from exc
+
+            payload = self._safe_json(response)
+            if not isinstance(payload, list):
+                raise ConnectorError(
+                    "GitHub repository API response is invalid", status_code=502
+                )
+            repositories.extend(self._minimal_repository(item) for item in payload)
+
+            match = re.search(r'<([^>]+)>;\s*rel="next"', response.headers.get("Link", ""))
+            if not match or not payload:
+                break
+            next_url = match.group(1)
+
+        return repositories
+
+    @staticmethod
+    def _minimal_repository(payload: Any) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {"name": None, "full_name": None, "private": False, "owner_login": None}
+        owner = payload.get("owner")
+        return {
+            "name": payload.get("name"),
+            "full_name": payload.get("full_name"),
+            "private": payload.get("private", False),
+            "owner_login": owner.get("login") if isinstance(owner, dict) else None,
+        }
+
     def validate_credential(self, token: Optional[str] = None) -> CredentialStatus:
         """토큰 유효성 확인 및 Scope 조회.
 

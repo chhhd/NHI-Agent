@@ -26,17 +26,30 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from agents.context_analysis_agent import ContextAnalysisAgent
 from agents.discovery_agent import DiscoveryAgent
+from agents.event_extraction_agent import EventExtractionAgent
 from agents.inventory_adapter import (
+    build_aws_context,
+    build_aws_credential_record,
+    build_aws_profile,
+    build_aws_signals,
     build_context,
     build_credential_record,
     build_profile,
     build_signals,
+    build_slack_context,
+    build_slack_credential_record,
+    build_slack_profile,
+    build_slack_signals,
 )
 from agents.policy_evidence_agent import PolicyEvidenceAgent
 from agents.recommendation_agent import RecommendationAgent
 from agents.risk_scoring_agent import RiskScoringAgent
 from agents.scope_translation_agent import ScopeTranslationAgent
+from agents.scenario_mapping_agent import ScenarioMappingAgent
+from agents.usage_analysis_agent import UsageAnalysisAgent
+from core.aws_inventory_models import AWSNHIInput
 from core.inventory_models import GitHubNHIInput
+from core.slack_inventory_models import SlackNHIInput
 from core.models import (
     CodeContext,
     DetectorType,
@@ -111,6 +124,9 @@ class NHIAnalysisPipeline:
         policy_evidence: Optional[PolicyEvidenceAgent] = None,
         recommendation: Optional[RecommendationAgent] = None,
         blast_radius: Optional[BlastRadiusCalculator] = None,
+        usage_analysis: Optional[UsageAnalysisAgent] = None,
+        event_extraction: Optional[EventExtractionAgent] = None,
+        scenario_mapping: Optional[ScenarioMappingAgent] = None,
     ) -> None:
         self.config = config or PolicyConfig()
         self.discovery = discovery or DiscoveryAgent()
@@ -120,6 +136,11 @@ class NHIAnalysisPipeline:
         self.policy_evidence = policy_evidence or PolicyEvidenceAgent()
         self.recommendation = recommendation or RecommendationAgent()
         self.blast_radius = blast_radius or BlastRadiusCalculator()
+        self.usage_analysis = usage_analysis or UsageAnalysisAgent(
+            scope_translator=self.scope_translation
+        )
+        self.event_extraction = event_extraction or EventExtractionAgent()
+        self.scenario_mapping = scenario_mapping or ScenarioMappingAgent()
 
     # ------------------------------------------------------------------
     # 단건 분석
@@ -182,6 +203,79 @@ class NHIAnalysisPipeline:
         )
 
     # ------------------------------------------------------------------
+    # 인벤토리 단건 분석 — Slack (GitHub 경로와 완전히 분리, GitHub 쪽은 무수정)
+    # ------------------------------------------------------------------
+    def analyze_slack_nhi(
+        self,
+        nhi: SlackNHIInput,
+        *,
+        signals: Optional[Any] = None,
+    ) -> NHIAnalysis:
+        """Slack NHI 인벤토리 1건을 스캔 경로와 같은 기준으로 분석한다.
+
+        구조는 `analyze_github_nhi()` 와 동일하다 — Scope Translation 이후
+        (`_assess()`) 로직은 provider 와 무관하게 완전히 공유된다. `signals` 는
+        `AnalysisSignals` 또는 그 dict 표현을 모두 받는다.
+        """
+        overrides: Optional[Dict[str, Any]]
+        if isinstance(signals, AnalysisSignals):
+            overrides = signals.to_dict()
+        else:
+            overrides = signals
+
+        analysis_signals = build_slack_signals(nhi, overrides)
+        record = build_slack_credential_record(nhi)
+        profile = build_slack_profile(nhi, analysis_signals)
+        context = build_slack_context(nhi, analysis_signals)
+
+        return self._assess(
+            record,
+            profile,
+            context,
+            analysis_signals,
+            repository=analysis_signals.repository,
+            source=AnalysisSource.INVENTORY,
+        )
+
+    # ------------------------------------------------------------------
+    # 인벤토리 단건 분석 — AWS (GitHub/Slack 경로와 완전히 분리, 둘 다 무수정)
+    # ------------------------------------------------------------------
+    def analyze_aws_nhi(
+        self,
+        nhi: AWSNHIInput,
+        *,
+        signals: Optional[Any] = None,
+    ) -> NHIAnalysis:
+        """AWS IAM Access Key NHI 인벤토리 1건을 스캔 경로와 같은 기준으로 분석한다.
+
+        구조는 `analyze_github_nhi()`/`analyze_slack_nhi()` 와 동일하다 —
+        Scope Translation 이후(`_assess()`) 로직은 provider 와 무관하게
+        완전히 공유된다. Policy 수집·Scope 변환은 아직 없어 `nhi.raw_scopes`
+        는 항상 비어 있고, `_assess()` 는 이를 다른 provider 와 동일하게
+        "Scope 미확인" 으로 처리한다(AWS 전용 예외 처리를 추가하지 않았다).
+        `signals` 는 `AnalysisSignals` 또는 그 dict 표현을 모두 받는다.
+        """
+        overrides: Optional[Dict[str, Any]]
+        if isinstance(signals, AnalysisSignals):
+            overrides = signals.to_dict()
+        else:
+            overrides = signals
+
+        analysis_signals = build_aws_signals(nhi, overrides)
+        record = build_aws_credential_record(nhi)
+        profile = build_aws_profile(nhi, analysis_signals)
+        context = build_aws_context(nhi, analysis_signals)
+
+        return self._assess(
+            record,
+            profile,
+            context,
+            analysis_signals,
+            repository=analysis_signals.repository,
+            source=AnalysisSource.INVENTORY,
+        )
+
+    # ------------------------------------------------------------------
     # 공통 평가 — 두 입력 경로가 여기서 합쳐진다
     # ------------------------------------------------------------------
     def _assess(
@@ -194,7 +288,15 @@ class NHIAnalysisPipeline:
         repository: str,
         source: AnalysisSource,
     ) -> NHIAnalysis:
-        permissions = self.scope_translation.translate_finding(finding)
+        permissions = self.scope_translation.translate_finding(
+            finding,
+            assume_if_missing=source is not AnalysisSource.INVENTORY,
+        )
+        usage_analysis = self.usage_analysis.analyze(permissions, signals)
+        events = self.event_extraction.extract(
+            profile, permissions, usage_analysis, signals=signals, context=context
+        )
+        scenario_matches = self.scenario_mapping.map(events)
         blast = self.blast_radius.compute(finding, profile, permissions, context, signals)
 
         ctx = EvaluationContext(
@@ -218,7 +320,9 @@ class NHIAnalysisPipeline:
         violations = self.policy_evidence.collect_violations(ctx)
         risk = self.risk_scoring.score(ctx, violations)
         policy = self.policy_evidence.decide(ctx, risk, violations)
-        recommendations = self.recommendation.recommend(ctx, risk, policy)
+        recommendations = self.recommendation.recommend(
+            ctx, risk, policy, scenario_matches=scenario_matches
+        )
 
         return NHIAnalysis(
             fingerprint=finding.fingerprint,
@@ -234,6 +338,9 @@ class NHIAnalysisPipeline:
             recommendations=recommendations,
             blast_radius=blast,
             source=source,
+            usage_analysis=usage_analysis,
+            events=events,
+            scenario_matches=scenario_matches,
         )
 
     # ------------------------------------------------------------------

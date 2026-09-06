@@ -406,6 +406,10 @@ class BlastRadiusReport:
     connected_services: List[str] = field(default_factory=list)
     accessible_resources: int = 0
     resource_samples: List[str] = field(default_factory=list)
+    #: 정확한 접근 자원 개수 대신 "광범위한 접근"만 신호로 쓰는 provider(AWS)
+    #: 용 플래그. GitHub/Slack 등 다른 provider 는 이 값을 설정하지 않으므로
+    #: 항상 기본값 False 다 — `accessible_resources` 개수 기반 판단과는 별개다.
+    broad_access: bool = False
     can_read: bool = False
     can_write: bool = False
     can_delete: bool = False
@@ -420,6 +424,82 @@ class BlastRadiusReport:
         data = asdict(self)
         data["connected_service_count"] = len(self.connected_services)
         return data
+
+
+@dataclass
+class UsageAnalysisResult:
+    """Result of analyzing granted permissions against observed usage."""
+
+    granted_permissions: List[PermissionLevel] = field(default_factory=list)
+    used_permissions: List[PermissionLevel] = field(default_factory=list)
+    unused_permissions: List[PermissionLevel] = field(default_factory=list)
+    days_since_last_used: Optional[int] = None
+    usage_status: str = "unknown"
+    excessive_permission: bool = False
+    evidence: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "granted_permissions": [p.value for p in self.granted_permissions],
+            "used_permissions": [p.value for p in self.used_permissions],
+            "unused_permissions": [p.value for p in self.unused_permissions],
+            "days_since_last_used": self.days_since_last_used,
+            "usage_status": self.usage_status,
+            "excessive_permission": self.excessive_permission,
+            "evidence": self.evidence,
+        }
+
+
+@dataclass
+class SecurityEvent:
+    """A security event involving an NHI resource access."""
+
+    event_id: str
+    nhi_id: str
+    event_type: str
+    resource_type: str
+    access_level: Optional[PermissionLevel]
+    event_risk: RiskLevel = RiskLevel.LOW
+    event_count: int = 1
+    timestamp: str = field(default_factory=_utcnow)
+    evidence: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "event_id": self.event_id,
+            "nhi_id": self.nhi_id,
+            "event_type": self.event_type,
+            "resource_type": self.resource_type,
+            "access_level": self.access_level.value if self.access_level else None,
+            "event_risk": self.event_risk.value,
+            "event_count": self.event_count,
+            "timestamp": self.timestamp,
+            "evidence": self.evidence,
+        }
+
+
+@dataclass
+class ScenarioMatch:
+    """A risk scenario matched by security events."""
+
+    scenario_id: str
+    scenario_name: str
+    severity: RiskLevel = RiskLevel.MEDIUM
+    matched_events: List[str] = field(default_factory=list)
+    matched_reason: str = ""
+    risk_addition: int = 0
+    recommended_action: RecommendedAction = RecommendedAction.MONITOR
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "scenario_id": self.scenario_id,
+            "scenario_name": self.scenario_name,
+            "severity": self.severity.value,
+            "matched_events": self.matched_events,
+            "matched_reason": self.matched_reason,
+            "risk_addition": self.risk_addition,
+            "recommended_action": self.recommended_action.value,
+        }
 
 
 @dataclass
@@ -441,6 +521,9 @@ class NHIAnalysis:
     analyzed_at: str = field(default_factory=_utcnow)
     #: 코드 스캔 결과인가, NHI 인벤토리 입력인가
     source: AnalysisSource = AnalysisSource.CODE_SCAN
+    usage_analysis: UsageAnalysisResult = field(default_factory=UsageAnalysisResult)
+    events: List[SecurityEvent] = field(default_factory=list)
+    scenario_matches: List[ScenarioMatch] = field(default_factory=list)
 
     @property
     def recommended_action(self) -> RecommendedAction:
@@ -474,6 +557,9 @@ class NHIAnalysis:
             "policy": self.policy.to_dict(),
             "recommendations": [r.to_dict() for r in self.recommendations],
             "blast_radius": self.blast_radius.to_dict(),
+            "usage_analysis": self.usage_analysis.to_dict(),
+            "events": [event.to_dict() for event in self.events],
+            "scenario_matches": [match.to_dict() for match in self.scenario_matches],
             "analyzed_at": self.analyzed_at,
         }
 

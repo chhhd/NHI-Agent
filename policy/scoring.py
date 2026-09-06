@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from core.nhi_models import (
     DataSensitivity,
@@ -52,6 +52,27 @@ AREA_LABEL: Dict[str, str] = {
     "ownership_policy": "Owner·정책 관리 상태",
     "connected_service_impact": "연결 서비스 영향 범위",
 }
+
+#: provider 별 "접근 가능 자원" 명칭 — `_exposure_access_scope()` 리스크 사유
+#: 문구에만 쓰인다. 점수 계산에는 영향을 주지 않는다. 목록에 없는 provider 는
+#: "자원" 으로 대체한다(향후 provider 추가 시에도 하드코딩된 문구가 남지 않게).
+_EXPOSURE_RESOURCE_LABELS: Dict[str, str] = {"github": "저장소", "slack": "채널"}
+
+
+def _is_private_resource(provider: str, repo: Dict[str, Any]) -> bool:
+    """접근 가능 자원 1건이 "비공개" 인지 provider 데이터 구조에 맞게 판정한다.
+
+    GitHub 저장소(`repository_records()`)는 `visibility`(public/private/internal)
+    로, Slack 채널(`_slack_channel_records()`)은 `is_private`(bool) 로 비공개
+    여부를 표현한다 — 서로 다른 필드라 provider 로 분기해서 읽어야 한다.
+    Slack 채널 dict 에는 애초에 `visibility` 키가 없어, 이 분기 없이 GitHub
+    기준(`visibility` 미확인 → 비공개로 간주)을 그대로 적용하면 공개 채널까지
+    전부 비공개로 잘못 집계된다.
+    """
+    if provider == "slack":
+        return repo.get("is_private") is True
+    # GitHub 및 그 외 — 기존 GitHub 기준(visibility 미확인 시 비공개로 간주)을 그대로 쓴다.
+    return str(repo.get("visibility", "private")).strip().lower() != "public"
 
 #: 위험 등급 하한선
 LEVEL_THRESHOLDS = (
@@ -159,38 +180,54 @@ class RiskScorer:
         return self._factor("exposure_location", score, reasons)
 
     def _exposure_access_scope(self, ctx: EvaluationContext) -> RiskFactor:
-        """인벤토리 입력 — 접근 가능한 저장소 범위로 노출 면적을 평가한다."""
+        """인벤토리 입력 — 접근 가능한 자원 범위로 노출 면적을 평가한다.
+
+        점수 계산은 provider 와 무관하게 동일하다 — `resource_label` 은 사유
+        문구에만 쓰이고 어떤 분기 조건에도 영향을 주지 않는다. 유일한 예외는
+        `total == 0` 인 경우인데, "조회 성공 + 0개"(실제로 접근 가능한 자원이
+        없다고 확인됨)와 "조회 실패"(개수를 알 수 없음)를 구분해야 하기
+        때문이다 — `accessible_resources_verification_attempted` 가 False 인
+        provider(GitHub)는 이 분기와 무관하게 항상 기존 "미확인" 처리를 받는다.
+        """
         reasons: List[str] = []
         repositories = ctx.accessible_repositories
         total = len(repositories)
         threshold = ctx.config.broad_repository_access_threshold
+        provider = (ctx.profile.provider or "").strip().lower()
+        resource_label = _EXPOSURE_RESOURCE_LABELS.get(provider, "자원")
 
-        private = sum(
-            1
-            for repo in repositories
-            if str(repo.get("visibility", "private")).strip().lower() != "public"
-        )
+        private = sum(1 for repo in repositories if _is_private_resource(provider, repo))
         sensitive = sum(1 for repo in repositories if repo.get("is_sensitive") is True)
 
         if total == 0:
-            score = 8
-            reasons.append("접근 가능한 저장소 목록 미확인 — 보수적으로 평가")
+            if (
+                ctx.accessible_resources_verification_attempted
+                and ctx.accessible_resources_error is None
+            ):
+                # 조회는 성공했고, 실제로 접근 가능한 자원이 0개임이 확인된 경우.
+                score = 2
+                reasons.append(f"조회 결과 접근 가능한 {resource_label} 없음 (확인됨)")
+            else:
+                # GitHub(조회 시도 여부 신호 없음) 또는 Slack 조회 실패 — 기존과
+                # 동일하게 "미확인" 으로 보수적 처리한다.
+                score = 8
+                reasons.append(f"접근 가능한 {resource_label} 목록 미확인 — 보수적으로 평가")
         elif total >= threshold:
             score = 14
-            reasons.append(f"{total}개 저장소에 광범위하게 접근 가능 (기준 {threshold}개)")
+            reasons.append(f"{total}개 {resource_label}에 광범위하게 접근 가능 (기준 {threshold}개)")
         elif total >= 2:
             score = 8
-            reasons.append(f"{total}개 저장소에 접근 가능")
+            reasons.append(f"{total}개 {resource_label}에 접근 가능")
         else:
             score = 4
-            reasons.append("단일 저장소에만 접근 가능")
+            reasons.append(f"단일 {resource_label}에만 접근 가능")
 
         if private:
             score += 3
-            reasons.append(f"비공개 저장소 {private}개 접근 가능")
+            reasons.append(f"비공개 {resource_label} {private}개 접근 가능")
         if sensitive:
             score += 3
-            reasons.append(f"민감 저장소 {sensitive}개 접근 가능")
+            reasons.append(f"민감 {resource_label} {sensitive}개 접근 가능")
 
         return self._factor("exposure_location", score, reasons)
 
@@ -273,7 +310,11 @@ class RiskScorer:
             score = 5
             reasons.append("자격 증명 상태 미확인 — 보수적으로 평가")
 
-        if finding.credential_active is True and not ctx.signals.expires_at:
+        if (
+            finding.credential_active is True
+            and not ctx.signals.expires_at
+            and not ctx.is_github_app_installation_token
+        ):
             score += 3
             reasons.append("만료일 없는 활성 Token")
 
@@ -291,7 +332,11 @@ class RiskScorer:
         if rotation is not None and rotation > ctx.config.rotation_period_days:
             score += 2
             reasons.append(f"Rotation 주기 초과 ({rotation}일 경과)")
-        elif rotation is None and finding.credential_active is True:
+        elif (
+            rotation is None
+            and finding.credential_active is True
+            and not ctx.is_github_app_installation_token
+        ):
             score += 1
             reasons.append("Rotation 이력 없음")
 

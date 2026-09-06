@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
 from core.nhi_models import NHIAnalysis, NHIAnalysisReport
 from processing.action_service import ActionService
@@ -17,7 +17,17 @@ def persist_analysis(
     analysis: NHIAnalysis,
     *,
     input_revision: str = "",
+    provider_detail: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, object]:
+    """분석 결과를 저장한다.
+
+    `provider_detail` 은 선택 인자다 — GitHub/Slack 등 기존 호출부는 넘기지
+    않으므로 이전과 완전히 동일하게 동작한다(`nhi_data` 에 새 키가 아예
+    생기지 않는다). 넘기면 `nhi_data["provider_detail"]` 에 그대로 저장돼
+    `GET /nhi`/`GET /nhi/{nhi_id}` 응답에 그대로 노출된다 — provider 마다
+    필드가 다른 상세 정보(예: AWS 의 `access_key_id`/`broad_access`)를
+    가공하지 않고 담는 용도다.
+    """
     profile = analysis.profile
     nhi_data = profile.to_dict()
     nhi_data.update(
@@ -35,6 +45,8 @@ def persist_analysis(
             "analyzed_at": analysis.analyzed_at,
         }
     )
+    if provider_detail is not None:
+        nhi_data["provider_detail"] = provider_detail
     storage.upsert_nhi(profile.nhi_id, nhi_data)
     storage.bind_credential_to_nhi(
         analysis.fingerprint,

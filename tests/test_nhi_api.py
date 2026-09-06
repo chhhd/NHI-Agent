@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 
+import httpx
 import pytest
 
 from core.config import reset_settings
@@ -148,6 +149,56 @@ def test_inventory_analyze_validation_error(client):
 
     response = client.post("/nhi/inventory/analyze", json={"nhi": invalid})
     assert response.status_code == 422
+
+
+def test_github_inventory_connector_endpoint_persists_analysis(client, monkeypatch):
+    import api.app as app_module
+    from connectors.github_connector import GitHubConnector
+
+    token = "ghp-endpoint-test-secret"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/user":
+            return httpx.Response(200, json={"login": "taeheekim22", "id": 42})
+        if request.url.path == "/user/repos":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "name": "nhi-api-test",
+                        "full_name": "taeheekim22/nhi-api-test",
+                        "private": True,
+                        "owner": {"login": "taeheekim22"},
+                    }
+                ],
+            )
+        raise AssertionError(f"unexpected path: {request.url.path}")
+
+    def connector_factory():
+        return GitHubConnector(
+            token,
+            client=httpx.Client(transport=httpx.MockTransport(handler)),
+        )
+
+    monkeypatch.setattr(app_module, "GitHubConnector", connector_factory)
+
+    response = client.post("/nhi/github/inventory/analyze")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["nhi_name"] == "taeheekim22"
+    assert body["permissions"] == []
+    assert body["owner"] is None
+    assert "taeheekim22/nhi-api-test" in body["blast_radius"]["resource_samples"]
+    assert token not in response.text
+
+    records = client.get("/nhi").json()["nhi"]
+    record = next(item for item in records if item["nhi_id"] == "github:github-user-42")
+    assert record["permissions"] == []
+    assert record["risk_score"] == body["risk_score"]
+    assert record["risk_level"] == body["risk_level"]
+    assert record["owner"] is None
+    assert token not in client.get("/nhi").text
 
 
 def test_inventory_analyze_rejects_unknown_enum_value(client):

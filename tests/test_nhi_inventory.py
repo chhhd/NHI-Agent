@@ -75,7 +75,7 @@ def test_classic_pat_scopes_are_translated(pipeline):
     assert any("Token Scope" in line for line in analysis.profile.evidence)
 
 
-def test_missing_permissions_are_assumed_conservatively(pipeline):
+def test_missing_inventory_permissions_remain_unknown(pipeline):
     """권한 정보가 없다고 위험이 낮은 것은 아니다 — 유형 기준으로 가정한다."""
     nhi = GitHubNHIInput(
         nhi_id="app-no-perm",
@@ -85,7 +85,10 @@ def test_missing_permissions_are_assumed_conservatively(pipeline):
     )
     analysis = pipeline.analyze_github_nhi(nhi)
 
-    assert analysis.permissions.assumed is True
+    assert analysis.permissions.assumed is False
+    assert analysis.permissions.permissions == []
+    assert analysis.permissions.highest is None
+    return
     assert analysis.permissions.permissions  # 비워두지 않는다
     assert any("가정" in reason for reason in analysis.risk.reasons)
 
@@ -105,9 +108,14 @@ def test_high_risk_inventory_nhi(pipeline, high_risk_nhi):
     assert data["risk_level"] in {RiskLevel.HIGH.value, RiskLevel.CRITICAL.value}
     assert data["risk_reasons"]
 
-    # 관리자 권한 · Owner 미지정 · 무기한 유효가 모두 정책 위반으로 잡혀야 한다.
+    # 관리자 권한 · Owner 미지정이 정책 위반으로 잡혀야 한다.
+    # ROTATION_PERIOD 는 여기서 나오지 않는다 — GitHub App Installation Token 은
+    # 요청마다 새로 발급되는 최대 1시간짜리 자격 증명이라 PAT 용 "무기한 유효
+    # Token" 판정(회전 이력·만료일 없음)이 적용되지 않는다
+    # (`EvaluationContext.is_github_app_installation_token`, policy/rules.py).
     violated = {v["policy_id"] for v in data["policy"]["violations"]}
-    assert {"OWNER_REQUIRED", "ADMIN_SCOPE_RESTRICTED", "ROTATION_PERIOD"} <= violated
+    assert {"OWNER_REQUIRED", "ADMIN_SCOPE_RESTRICTED"} <= violated
+    assert "ROTATION_PERIOD" not in violated
 
     # 근거 없이 점수만 내지 않는다.
     assert all(factor["reasons"] for factor in data["risk_detail"]["factors"])

@@ -23,6 +23,7 @@ from core.nhi_models import (
     Recommendation,
     RiskAssessment,
     RiskLevel,
+    ScenarioMatch,
     parse_dt,
 )
 from policy.rules import EvaluationContext, is_inactive_nhi
@@ -36,6 +37,26 @@ _REVOCATION_RULES = {
     "READ_ONLY_NHI_PERFORMS_MUTATION",
 }
 
+_SCENARIO_ACTIONS = {
+    "SCN_001": RecommendedAction.DISABLE_INACTIVE_NHI,
+    "SCN_002": RecommendedAction.ASSIGN_OWNER,
+    "SCN_003": RecommendedAction.SCOPE_REDUCTION,
+    "SCN_004": RecommendedAction.TOKEN_REVOCATION,
+    "SCN_005": RecommendedAction.SPLIT_TOKEN_PER_PROJECT,
+}
+
+_ACTION_PRIORITIES = {
+    RecommendedAction.TOKEN_REVOCATION: 1,
+    RecommendedAction.TOKEN_ROTATION: 2,
+    RecommendedAction.SCOPE_REDUCTION: 3,
+    RecommendedAction.ASSIGN_OWNER: 4,
+    RecommendedAction.SPLIT_TOKEN_PER_PROJECT: 5,
+    RecommendedAction.MOVE_TO_ENV_VAR: 6,
+    RecommendedAction.DISABLE_INACTIVE_NHI: 7,
+    RecommendedAction.REQUEST_REAPPROVAL: 8,
+    RecommendedAction.MONITOR: 9,
+}
+
 
 class RecommendationAgent:
     """조치 권고 생성."""
@@ -45,6 +66,7 @@ class RecommendationAgent:
         ctx: EvaluationContext,
         risk: RiskAssessment,
         policy: PolicyEvaluation,
+        scenario_matches: Optional[List[ScenarioMatch]] = None,
     ) -> List[Recommendation]:
         target = f"{ctx.profile.nhi_name} ({ctx.profile.credential_fingerprint[:23]})"
         rules: Set[str] = {r["rule_id"] for r in risk.forced_rules}
@@ -127,6 +149,11 @@ class RecommendationAgent:
         if reapproval_reason:
             _add(RecommendedAction.REQUEST_REAPPROVAL, 8, reapproval_reason)
 
+        if scenario_matches:
+            self._apply_scenario_recommendations(
+                recommendations, scenario_matches, target
+            )
+
         if not recommendations:
             _add(
                 RecommendedAction.MONITOR,
@@ -135,6 +162,38 @@ class RecommendationAgent:
             )
 
         return sorted(recommendations, key=lambda r: r.priority)
+
+    @staticmethod
+    def _apply_scenario_recommendations(
+        recommendations: List[Recommendation],
+        scenario_matches: List[ScenarioMatch],
+        target: str,
+    ) -> None:
+        """Merge catalog scenario actions into the existing recommendations."""
+        by_action = {recommendation.action: recommendation for recommendation in recommendations}
+        for scenario in scenario_matches:
+            action = _SCENARIO_ACTIONS.get(scenario.scenario_id)
+            if action is None:
+                continue
+
+            scenario_reason = (
+                f"Scenario {scenario.scenario_name}: {scenario.matched_reason}"
+            )
+            existing = by_action.get(action)
+            if existing is not None:
+                if scenario_reason not in existing.rationale:
+                    existing.rationale = f"{existing.rationale} {scenario_reason}"
+                continue
+
+            recommendation = Recommendation(
+                action=action,
+                priority=_ACTION_PRIORITIES[action],
+                rationale=scenario_reason,
+                target=target,
+                automatable=False,
+            )
+            recommendations.append(recommendation)
+            by_action[action] = recommendation
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -160,6 +219,11 @@ class RecommendationAgent:
     @staticmethod
     def _rotation_reason(ctx: EvaluationContext) -> Optional[str]:
         """Rotation 권고 사유. 근거가 없으면 권고하지 않는다."""
+        if ctx.is_github_app_installation_token:
+            # Installation Token 은 사람이 "회전"할 대상이 아니다 — 요청마다
+            # 새로 발급되고 최대 1시간 뒤 자동 만료된다. App private key 자체의
+            # rotation 은 별도 문제이며 이번 단계에서 다루지 않는다.
+            return None
         if ctx.context.is_test_or_example and ctx.finding.credential_active is not True:
             return None
         if ctx.finding.credential_revoked is True or ctx.is_active is False:

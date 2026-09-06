@@ -78,11 +78,45 @@ class EvaluationContext:
 
     @property
     def accessible_repositories(self) -> List[Dict[str, object]]:
-        """NHI 가 접근할 수 있는 저장소 목록 (인벤토리 입력에서만 채워진다)."""
-        items = self.signals.extra.get("repositories") if self.signals.extra else None
+        """NHI 가 접근할 수 있는 자원 목록 (인벤토리 입력에서만 채워진다).
+
+        provider 별로 키 이름이 다르다 — GitHub 은 `repositories`
+        (`build_signals`), Slack 은 `channels`(`build_slack_signals`). 이름은
+        `accessible_repositories` 로 유지하지만(하위 호환 — `_exposure_access_scope`
+        등 기존 호출부를 건드리지 않기 위함), 값 자체는 provider 무관하게
+        "이 NHI 가 접근 가능한 자원" 을 뜻한다.
+        """
+        extra = self.signals.extra or {}
+        items = extra.get("repositories")
+        if not isinstance(items, (list, tuple)):
+            items = extra.get("channels")
         if not isinstance(items, (list, tuple)):
             return []
         return [item for item in items if isinstance(item, dict)]
+
+    @property
+    def accessible_resources_verification_attempted(self) -> bool:
+        """`accessible_repositories` 를 실제로 라이브 조회 시도했는가.
+
+        Slack 은 조회 성공/실패와 무관하게 `signals.extra["accessible_resources_error"]`
+        키를 항상 채운다(`build_slack_signals`) — 성공하면 값이 `None`, 실패하면
+        사유 문자열이다. GitHub 은 이 키를 아예 채우지 않으므로(`build_signals`)
+        키 부재 자체가 "이 provider 는 조회 시도 여부를 알려주지 않는다" 는 뜻이고,
+        `accessible_repositories` 가 0개여도 기존처럼 "미확인" 으로 취급한다
+        (`_exposure_access_scope` 참고) — GitHub 동작은 이 프로퍼티 도입으로
+        전혀 바뀌지 않는다.
+        """
+        return bool(self.signals.extra) and "accessible_resources_error" in self.signals.extra
+
+    @property
+    def accessible_resources_error(self) -> Optional[str]:
+        """접근 가능 자원 조회를 시도했으나 실패한 경우의 사유.
+
+        조회를 시도하지 않았거나(GitHub) 성공했으면(Slack, 빈 목록 포함) `None`.
+        """
+        if not self.accessible_resources_verification_attempted:
+            return None
+        return self.signals.extra.get("accessible_resources_error")
 
     @property
     def shared_projects(self) -> List[str]:
@@ -99,6 +133,25 @@ class EvaluationContext:
     @property
     def days_since_use(self) -> Optional[int]:
         return days_since(self.signals.last_used_at)
+
+    @property
+    def is_github_app_installation_token(self) -> bool:
+        """GitHub App Installation Token 인벤토리 입력인가.
+
+        Installation Token 은 요청마다 새로 발급되는 최대 1시간짜리 자격
+        증명이라 PAT 용 rotation/수명 정책(ROTATION_PERIOD, TOKEN_ROTATION
+        권고 등)의 전제("credential 하나가 오래 유지되며 사람이 주기적으로
+        회전해야 한다")가 성립하지 않는다. `source` 까지 함께 확인해
+        코드 스캔에서 발견된 Bot 계정 자격 증명(`NHIType.GITHUB_APP` 이지만
+        `AnalysisSource.CODE_SCAN`)은 영향받지 않게 한다.
+
+        GitHub App private key 자체의 rotation/수명 판단은 이 플래그와 무관하며
+        이번 단계에서 다루지 않는다.
+        """
+        return (
+            self.source is AnalysisSource.INVENTORY
+            and self.profile.nhi_type is NHIType.GITHUB_APP
+        )
 
     @property
     def has_admin(self) -> bool:
@@ -167,6 +220,10 @@ def _max_token_age(ctx: EvaluationContext) -> Optional[PolicyViolation]:
 
 
 def _rotation_period(ctx: EvaluationContext) -> Optional[PolicyViolation]:
+    if ctx.is_github_app_installation_token:
+        # Installation Token 은 회전 이력/만료일이 없는 게 정상이다 (자체가
+        # 최대 1시간짜리 임시 토큰). PAT 용 "무기한 유효 Token" 판정을 적용하지 않는다.
+        return None
     days = ctx.days_since_rotation
     if days is None:
         # 회전 이력 자체가 없고 만료일도 없으면 위반으로 본다.

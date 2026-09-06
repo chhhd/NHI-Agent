@@ -14,7 +14,7 @@ Slack Web API 는 HTTP 200 을 주면서 body 의 `ok: false` 로 오류를 알�
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -136,7 +136,9 @@ class SlackConnector(BaseConnector):
             "url": payload.get("url"),
             "is_enterprise_install": payload.get("is_enterprise_install", False),
         }
-        status.accessible_resources = self._safe_channels(target)
+        status.accessible_resources, status.accessible_resources_error = self._safe_channels(
+            target
+        )
         return status
 
     def is_revoked(self, token: Optional[str] = None) -> bool:
@@ -242,13 +244,18 @@ class SlackConnector(BaseConnector):
                 break
         return channels
 
-    def _safe_channels(self, token: str) -> List[Dict[str, Any]]:
-        """Scope 부족 등으로 실패해도 전체 검증이 깨지지 않도록 감싼다."""
+    def _safe_channels(self, token: str) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """Scope 부족 등으로 실패해도 전체 검증이 깨지지 않도록 감싼다.
+
+        `([], "실패 사유")` 와 `([], None)` (조회 성공 + 채널 0개) 를 호출부가
+        구분할 수 있도록 실패 사유를 함께 반환한다 — 둘 다 빈 리스트만 보면
+        똑같아 보이는 문제를 여기서부터 막는다.
+        """
         try:
-            return self.list_channels(token=token, limit=100, max_pages=1)
+            return self.list_channels(token=token, limit=100, max_pages=1), None
         except (PermissionDeniedError, ConnectorError) as exc:
-            logger.info("채널 목록 조회 생략: %s", exc)
-            return []
+            logger.info("채널 목록 조회 실패: %s", exc)
+            return [], exc.message
 
     # ------------------------------------------------------------------
     # 내부

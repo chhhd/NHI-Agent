@@ -11,6 +11,7 @@ Credential 을 NHI 관점으로 해석하는 Agent 들의 모음이다.
 from agents.context_analysis_agent import ContextAnalysisAgent
 from agents.discovery_agent import DiscoveryAgent
 from agents.inventory_adapter import build_context, build_profile, build_signals
+from agents.github_inventory_service import analyze_github_nhi_from_connector
 from agents.pipeline import NHIAnalysisPipeline, finding_from_dict
 from agents.policy_evidence_agent import PolicyEvidenceAgent
 from agents.recommendation_agent import RecommendationAgent
@@ -28,6 +29,7 @@ __all__ = [
     "build_context",
     "build_profile",
     "build_signals",
+    "analyze_github_nhi_from_connector",
     "expand_permissions",
     "finding_from_dict",
 ]

@@ -87,3 +87,35 @@ class CredentialObservation:
             ],
             raw_metadata=dict(data.get("raw_metadata") or {}),
         )
+
+
+@dataclass
+class UsageEvent:
+    """Provider-independent representation of an NHI usage event."""
+
+    nhi_id: str
+    timestamp: str
+    action: str
+    resource_type: str
+    provider: str = "unknown"
+    resource_id: Optional[str] = None
+    resource: Optional[str] = None
+    raw_action: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "UsageEvent":
+        return cls(
+            nhi_id=str(data.get("nhi_id") or data.get("credential_id") or ""),
+            timestamp=str(data.get("timestamp") or ""),
+            action=str(data.get("action") or ""),
+            resource_type=str(data.get("resource_type") or "unknown"),
+            provider=str(data.get("provider") or "unknown"),
+            resource_id=data.get("resource_id"),
+            resource=data.get("resource"),
+            raw_action=data.get("raw_action"),
+            metadata=dict(data.get("metadata") or {}),
+        )

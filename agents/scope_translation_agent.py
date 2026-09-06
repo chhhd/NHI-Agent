@@ -9,6 +9,15 @@
   2. 공통 매핑 테이블
   3. 문자열 휴리스틱 (inferred=True 로 표시)
   4. Scope 자체를 못 얻은 경우 Secret 유형 기준 보수적 가정 (assumed=True)
+
+AWS 는 이 우선순위를 타지 않는다. IAM Action(`s3:GetObject` 등)은 OAuth
+Scope 와 표기 체계가 달라 공통 매핑 테이블/문자열 휴리스틱으로 다루면
+`iam:DeleteUser` 같은 Action 을 "DELETE"로 잘못 분류하는 등 부정확해진다
+— `agents/aws_permission_mapper.py::map_action()` 을 그대로 재사용하는
+별도 경로(`_translate_aws()`)로 처리하고, 이 파일의 `SCOPE_TABLE`/
+`COMMON_SCOPE_TABLE`/`_infer()` 휴리스틱은 건드리지 않는다(GitHub/Slack
+동작 무변경). `map_action()` 이 모른다고 답한(`None`) Action 은 추측하지
+않고 "해석 불가"로 남긴다.
 """
 
 from __future__ import annotations
@@ -16,6 +25,7 @@ from __future__ import annotations
 import logging
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from agents.aws_permission_mapper import map_action
 from core.models import SecretFinding
 from core.nhi_models import (
     PERMISSION_RANK,
@@ -38,6 +48,7 @@ SCOPE_TABLE: Dict[str, Dict[str, Tuple[PermissionLevel, str]]] = {
     "slack": {
         "channels:history": (R, "Slack 채널 메시지 조회"),
         "channels:read": (R, "Slack 채널 목록 조회"),
+        "groups:read": (R, "비공개 채널 목록 조회"),
         "groups:history": (R, "비공개 채널 메시지 조회"),
         "im:history": (R, "DM 메시지 조회"),
         "mpim:history": (R, "그룹 DM 메시지 조회"),
@@ -207,11 +218,15 @@ class ScopeTranslationAgent:
         *,
         provider: str = "generic",
         secret_type: str = "",
+        assume_if_missing: bool = True,
     ) -> PermissionProfile:
         scopes = [s.strip() for s in (raw_scopes or []) if s and s.strip()]
         profile = PermissionProfile(raw_scopes=scopes)
 
-        if not scopes:
+        if (provider or "").strip().lower() == "aws":
+            return self._translate_aws(profile, scopes, secret_type, assume_if_missing)
+
+        if not scopes and assume_if_missing:
             return self._assume(profile, secret_type)
 
         table = SCOPE_TABLE.get(provider.lower(), {})
@@ -225,21 +240,89 @@ class ScopeTranslationAgent:
         if not permissions:
             # Scope 는 있었지만 하나도 해석하지 못한 경우 → 가정으로 대체
             logger.info("해석 가능한 scope 없음 (provider=%s) — 유형 기준 가정", provider)
-            return self._assume(profile, secret_type)
+            if assume_if_missing:
+                return self._assume(profile, secret_type)
+            return profile
 
         profile.permissions = self._sorted(permissions)
         return profile
 
     def translate_scope(self, scope: str, *, provider: str = "generic") -> ScopeMapping:
         """Scope 1건만 변환한다 (감사 로그의 행위 → 권한 변환 등에 사용)."""
+        if (provider or "").strip().lower() == "aws":
+            return self._map_aws_action(scope)
         return self._translate_one(scope, SCOPE_TABLE.get((provider or "").lower(), {}))
 
-    def translate_finding(self, finding: SecretFinding) -> PermissionProfile:
+    def translate_finding(
+        self,
+        finding: SecretFinding,
+        *,
+        assume_if_missing: bool = True,
+    ) -> PermissionProfile:
         """`SecretFinding` 의 raw_scopes 를 변환한다."""
         return self.translate(
             finding.raw_scopes,
             provider=finding.provider,
             secret_type=finding.secret_type,
+            assume_if_missing=assume_if_missing,
+        )
+
+    # ------------------------------------------------------------------
+    # AWS — GitHub/Slack 과 완전히 분리된 경로
+    #
+    # IAM Action(`s3:GetObject` 등)은 OAuth Scope 가 아니라서 `SCOPE_TABLE`/
+    # `COMMON_SCOPE_TABLE`/`_infer()` 문자열 휴리스틱을 그대로 타면 부정확
+    # 하다(예: `_infer()` 는 "delete" 토큰만 보고 `iam:DeleteUser` 를 DELETE
+    # 로 분류하지만, 실제로는 신원 자체를 지우는 ADMIN 급 행위다).
+    # `agents/aws_permission_mapper.py::map_action()` 이 이미 이 구분을
+    # 정확히 하므로 그 결과를 그대로 재사용하고, 이 클래스에서 다시
+    # 해석하거나 짐작을 보태지 않는다.
+    # ------------------------------------------------------------------
+    def _translate_aws(
+        self,
+        profile: PermissionProfile,
+        scopes: List[str],
+        secret_type: str,
+        assume_if_missing: bool,
+    ) -> PermissionProfile:
+        """AWS Action 문자열 목록을 `map_action()` 으로 그대로 변환한다.
+
+        `map_action()` 이 알아보지 못한(`None`) Action 은 추측하지 않고
+        "해석 불가"로 남긴다 — GitHub/Slack 처럼 문자열 휴리스틱으로
+        대체하지 않는다. `assume_if_missing` 의미(Scope 자체가 없을 때만
+        Secret 유형 기준으로 가정)는 다른 provider 와 동일하게 유지한다.
+        """
+        if not scopes and assume_if_missing:
+            return self._assume(profile, secret_type)
+
+        for scope in scopes:
+            mapping = self._map_aws_action(scope)
+            profile.mappings.append(mapping)
+            if mapping.permission is None:
+                profile.unknown_scopes.append(scope)
+
+        permissions = {m.permission for m in profile.mappings if m.permission}
+        if not permissions:
+            logger.info("해석 가능한 AWS Action 없음 — 유형 기준 가정 여부만 확인")
+            if assume_if_missing:
+                return self._assume(profile, secret_type)
+            return profile
+
+        profile.permissions = self._sorted(permissions)
+        return profile
+
+    @staticmethod
+    def _map_aws_action(action: str) -> ScopeMapping:
+        """AWS Action 1건 → `ScopeMapping`. `map_action()` 을 그대로 감싼다."""
+        level = map_action(action)
+        return ScopeMapping(
+            raw_scope=action,
+            permission=level,
+            description="AWS Action 매핑" if level is not None else "해석 불가한 AWS Action",
+            # map_action() 은 AWS 명명 관례에 기반한 확정 규칙이라(추측이
+            # 아니라 정책상 그렇게 정의됨) inferred=False 로 취급한다 —
+            # GitHub/Slack 의 문자열 휴리스틱(`_infer()`)과는 성격이 다르다.
+            inferred=False,
         )
 
     # ------------------------------------------------------------------

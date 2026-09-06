@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Optional
@@ -15,6 +16,8 @@ try:  # python-dotenv 는 선택 의존성
     load_dotenv()
 except Exception:  # pragma: no cover
     pass
+
+logger = logging.getLogger(__name__)
 
 
 def _env(key: str, default: str = "") -> str:
@@ -43,6 +46,66 @@ class GitHubSettings:
     # Rate Limit 여유분: 남은 호출이 이 값 이하이면 reset 까지 대기
     rate_limit_buffer: int = field(default_factory=lambda: _env_int("GITHUB_RATE_LIMIT_BUFFER", 5))
     max_wait_seconds: int = field(default_factory=lambda: _env_int("GITHUB_MAX_WAIT_SECONDS", 60))
+
+
+def _load_github_app_private_key() -> str:
+    """GitHub App 개인키를 환경변수 또는 파일에서 안전하게 읽는다.
+
+    우선순위:
+      1. ``GITHUB_APP_PRIVATE_KEY`` — PEM 내용을 직접 담은 값.
+         환경변수/CI Secret 에는 개행이 이스케이프된 ``\\n`` 로 들어오는 경우가
+         많아 실제 개행으로 복원한다.
+      2. ``GITHUB_APP_PRIVATE_KEY_PATH`` — PEM 파일 경로.
+
+    두 값 모두 없거나 파일을 읽을 수 없으면 빈 문자열을 반환한다. PAT 의
+    `token` 이 비어 있을 때와 동일하게, 실제 사용 시점(JWT 서명)에서 인증
+    오류로 드러나게 하고 여기서는 예외를 던지지 않는다. 이 함수는 키 내용을
+    로그에 남기지 않는다.
+    """
+    inline = os.getenv("GITHUB_APP_PRIVATE_KEY", "")
+    if inline.strip():
+        return inline.replace("\\n", "\n")
+
+    path = os.getenv("GITHUB_APP_PRIVATE_KEY_PATH", "")
+    if not path.strip():
+        return ""
+
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.read()
+    except OSError as exc:
+        logger.warning(
+            "GitHub App private key 파일을 읽을 수 없습니다: %s (%s)",
+            path,
+            exc.__class__.__name__,
+        )
+        return ""
+
+
+@dataclass
+class GitHubAppSettings:
+    """GitHub App 인증 설정 (Installation 기반 권한 수집용).
+
+    기존 `GitHubSettings` (PAT) 와는 완전히 별도 경로다. 여기 값이 비어
+    있어도 PAT 경로 동작에는 아무 영향이 없다.
+    """
+
+    app_id: str = field(default_factory=lambda: _env("GITHUB_APP_ID"))
+    #: PEM 형식 개인키 원문. 절대 로그·예외 메시지·repr 에 노출하지 않는다.
+    private_key: str = field(default_factory=_load_github_app_private_key)
+    api_base: str = field(default_factory=lambda: _env("GITHUB_API_BASE", "https://api.github.com"))
+
+    @property
+    def is_configured(self) -> bool:
+        """App ID 와 개인키가 모두 있어야 App 인증을 시도할 수 있다."""
+        return bool(self.app_id.strip()) and bool(self.private_key.strip())
+
+    def __repr__(self) -> str:  # pragma: no cover - 키 노출 방지가 목적
+        return (
+            f"GitHubAppSettings(app_id={self.app_id!r}, "
+            f"private_key={'<set>' if self.private_key.strip() else '<empty>'}, "
+            f"api_base={self.api_base!r})"
+        )
 
 
 @dataclass
@@ -90,6 +153,7 @@ class DatabaseSettings:
 @dataclass
 class Settings:
     github: GitHubSettings = field(default_factory=GitHubSettings)
+    github_app: GitHubAppSettings = field(default_factory=GitHubAppSettings)
     slack: SlackSettings = field(default_factory=SlackSettings)
     scanner: ScannerSettings = field(default_factory=ScannerSettings)
     secret_storage: SecretStorageSettings = field(default_factory=SecretStorageSettings)
