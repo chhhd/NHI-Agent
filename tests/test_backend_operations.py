@@ -12,6 +12,7 @@ from backend.services.demo_workspace import (
     seed_demo_workspace,
 )
 from core.models import ScanTarget
+from policy.rules import FORCED_CRITICAL_RULES
 from scanner.scan_service import SecretScanService
 from storage.sqlite_store import SQLiteStorage
 
@@ -123,6 +124,7 @@ def test_demo_workspace_is_synthetic_idempotent_and_isolated(store):
     projects = store.list_projects()
     findings = store.list_finding_records(limit=100)
     actions = store.list_actions(limit=100)
+    analyses = store.list_analyses(limit=100)
     assert all(
         item["metadata"]["demo_workspace"] == DEMO_WORKSPACE_ID
         for item in projects
@@ -136,6 +138,62 @@ def test_demo_workspace_is_synthetic_idempotent_and_isolated(store):
     assert all("****" in item["masked_value"] for item in findings)
     assert all(action.demo_workspace for action in actions)
     assert store.dashboard_summary()["critical_high_findings"] == 4
+
+    # 합성 데이터도 운영 NHIAnalysis와 같은 Decision Flow 스키마를 제공한다.
+    assert len(analyses) == 7
+    required = {
+        "permission_detail",
+        "usage_analysis",
+        "security_events",
+        "scenario_matches",
+        "risk_detail",
+        "recommendations",
+    }
+    assert all(required <= set(analysis) for analysis in analyses)
+    assert {analysis["usage_analysis"]["data_complete"] for analysis in analyses} == {
+        True,
+        False,
+    }
+    for analysis in analyses:
+        assert analysis["permission_detail"]["permissions"] == analysis["permissions"]
+        assert len(analysis["risk_detail"]["factors"]) == 7
+        assert sum(
+            factor["score"] for factor in analysis["risk_detail"]["factors"]
+        ) == analysis["risk_detail"]["base_score"]
+        assert analysis["recommendations"][0]["action"] == analysis["recommended_action"]
+
+    forced_ids = {
+        rule["rule_id"]
+        for analysis in analyses
+        for rule in analysis["risk_detail"]["forced_rules"]
+    }
+    assert forced_ids == {
+        "PUBLIC_REPO_ACTIVE_ADMIN_TOKEN",
+        "OWNERLESS_SENSITIVE_DATA_ACCESS",
+        "TOKEN_SHARED_ACROSS_PROJECTS",
+    }
+    assert forced_ids <= set(FORCED_CRITICAL_RULES)
+
+    shared = next(
+        analysis
+        for analysis in analyses
+        if analysis["fingerprint"] == "demo-fingerprint-shared-automation-token"
+    )
+    assert shared["risk_level"] == "CRITICAL"
+    assert shared["risk_score"] >= 80
+    assert shared["scenario_matches"][0]["event_ids"] == [
+        shared["security_events"][0]["event_id"]
+    ]
+
+    staging = next(
+        analysis
+        for analysis in analyses
+        if analysis["fingerprint"] == "demo-fingerprint-staging-webhook"
+    )
+    assert staging["usage_analysis"]["data_complete"] is False
+    assert staging["usage_analysis"]["usage_observed"] is None
+    assert staging["security_events"] == []
+    assert staging["scenario_matches"] == []
 
     cleared = clear_demo_workspace(store)
     assert cleared["deleted"]["projects"] == 3

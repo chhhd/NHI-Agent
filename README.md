@@ -1,12 +1,16 @@
 # NHI Risk Analysis Agent
 
-GitHub·Slack 등에서 사용되는 **NHI(Non-Human Identity)** 의 보안 위험을 자동으로 분석하는
-규칙 기반 시스템이다. 저장소에서 Secret 을 탐지하고, 그 자격 증명이 어떤 NHI 에 연결되는지
-식별하고, 권한·환경·사용 상태를 근거로 위험 점수와 조치 권고를 만든다. 그리고 분석 결과에
-따라 추가 검사를 실행할지 스스로 정하는 Agent 실행 계층을 얹었다.
+회사가 사용하는 **AI Agent와 NHI(Non-Human Identity)/API 계정의 연결 관계**를 수집해
+각 Agent가 어떤 권한으로 어떤 저장소·채널·파일·메일함까지 접근할 수 있는지 설명하고,
+실제 API 호출이 승인된 Agent·Credential·권한·자원 범위를 벗어나는지 탐지하는 규칙 기반
+시스템이다. 저장소 Secret 탐지와 DPoP 연구 구현은 이 핵심 목표를 보조한다.
 
-한 문장으로: **NHI 의 권한·환경·접근 범위·소유자·수명·사용 상태를 분석해 설명 가능한
-위험 점수와 조치 권고를 만들고, 결과에 따라 추가 보안 도구를 조건부로 실행하는 시스템.**
+이 시스템은 “악의적인 의도”를 추측하지 않는다. 대신 **주장 Agent와 인증 Agent 불일치,
+승인되지 않은 NHI/Credential, 권한·자원 범위 초과, 비활성 Agent 사용, Token/proof 재사용**처럼
+감사 가능한 사실을 근거로 `ALLOW / REVIEW / DENY`를 만든다.
+
+한 문장으로: **회사 AI Agent의 실제 접근 가능 범위를 인벤토리화하고, 정상 Agent로 위장한
+API 호출과 과도한 권한·민감 자원 접근을 근거 기반으로 식별하는 시스템.**
 
 ---
 
@@ -29,11 +33,17 @@ GitHub·Slack 등에서 사용되는 **NHI(Non-Human Identity)** 의 보안 위�
                             ▼
              Scope Translation   서비스별 Scope → READ/WRITE/DELETE/ADMIN
                             ▼
+             Usage Analysis      승인 권한 ↔ 관측 행위·재사용·폐기 후 사용
+                            ▼
+             Security Events     관측 사실 / 파생 신호 / 통제 공백
+                            ▼
+             Scenario Matching   canonical 정책 ID 기반 공격·오용 시나리오
+                            ▼
              Blast Radius        연결 서비스·자원·외부 전송·교차 프로젝트
                             ▼
              Policy Engine       정책 6종 위반 판정
                             ▼
-             Risk Scoring        100점 만점 7영역 + 강제 Critical 6종
+             Risk Scoring        100점 만점 7영역 + 강제 Critical 7종
                             ▼
              Decision Engine     자동 조치 / 사람 검토 / 예외 승인
                             ▼
@@ -46,12 +56,30 @@ GitHub·Slack 등에서 사용되는 **NHI(Non-Human Identity)** 의 보안 위�
 들어간다). 반대로 조치 결정은 점수가 나온 **뒤에** 한다.
 
 Agent 실행 계층은 이 파이프라인을 하나의 도구로 감싼 다음, 결과를 보고 다음 도구를 고른다.
+여기서 Agent 실행 계층은 보안 분석을 수행하는 **Analysis Orchestrator**이며, 감시 대상인
+회사 AI Agent와는 다른 개념이다.
 
 ```
-사용자 목표 + NHI 입력 → State 생성 → 초기 계획(ANALYZE_NHI)
-   → NHI 분석 실행 → 결과 관찰 → 조건부 재계획
+사용자 목표 + 단건 NHI 또는 GitHub 조직 → State 생성
+   → (조직 요청이면) COLLECT_GITHUB_DATA → 수집 결과 기반 재계획
+   → ANALYZE_NHI → 결과 관찰 → 조건부 재계획
    → (위험 등급 HIGH 이상 + 허용 시) SCAN_SECRETS
+   → 스캔 실행/부분/미실행 결과를 관찰한 2차 재계획
    → (허용 시) EVALUATE_POLICY → COMPLETE
+```
+
+실행 시점의 위장·범위 초과 호출은 별도 경로에서 판정한다.
+
+```
+회사 Agent Registry                        API Gateway / Audit Log
+Agent → 승인 NHI → Credential                    실제 호출
+     → 권한 → 허용 자원                          주장 Agent / 인증 Agent
+            └──────────────────┬────────────────── NHI / 권한 / 대상 자원
+                               ▼
+                    Agent Access Evaluator
+          신원 불일치 · Token replay · 권한/자원 초과
+                               ▼
+                    ALLOW / REVIEW / DENY + 이력
 ```
 
 ---
@@ -64,13 +92,21 @@ core/
 ├─ models.py             SecretFinding / ScanResult / CredentialStatus  ← 탐지 계층 스키마
 ├─ nhi_models.py         NHIProfile / ContextInsight / PermissionProfile / RiskAssessment /
 │                        PolicyEvaluation / BlastRadiusReport / NHIAnalysis / AnalysisSignals
-└─ inventory_models.py   GitHubNHIInput / RepositoryInfo  ← 인벤토리 입력 스키마 (Pydantic)
+├─ inventory_models.py   GitHubNHIInput / RepositoryInfo  ← 인벤토리 입력 스키마 (Pydantic)
+├─ usage_models.py       UsageEvent  ← 공급자별 감사 로그의 최소 공통 스키마
+└─ agent_access_models.py 회사 Agent 접근 기준선 / API 관측 / ALLOW·REVIEW·DENY
+
+normalization/
+├─ observation_normalizer.py  Connector 입력 → 출처가 명시된 관측 스냅샷
+└─ usage_event_adapter.py     감사 로그 필터링·중복 제거 → AnalysisSignals
 
 connectors/              외부 서비스 연동 (HTTP 재시도·Rate Limit·인증 예외 공통 처리)
 ├─ base_connector.py     공통 기반
-├─ github_connector.py   Repo 등록/조회, 브랜치·파일 목록, Commit/PR 변경 파일
+├─ github_connector.py   Repo 등록/조회·페이지 순회·완전성 표시, Commit/PR 변경 파일
 ├─ github_webhook.py     HMAC 서명 검증, push/PR 이벤트 파싱, 자동 검사 트리거
 ├─ slack_connector.py    Workspace/Bot/App 정보, Scope, 토큰 유효성·폐기 확인
+├─ microsoft_graph_connector.py  Entra 서비스 주체·Owner·OAuth/App 권한 Discovery
+├─ google_workspace_connector.py OAuth Token 감사 이벤트 기반 Client Discovery
 └─ gitlab_ / notion_ / huggingface_connector.py
 
 scanner/
@@ -85,6 +121,7 @@ agents/                  NHI 분석 Agent
 ├─ discovery_agent.py          Credential → NHI 식별 (유형·Bot·AI Agent·Owner)
 ├─ context_analysis_agent.py   경로/변수명/주변 코드 → 환경·민감도·사용 여부
 ├─ scope_translation_agent.py  서비스별 Scope → Read/Write/Delete/Admin
+├─ usage_analysis_agent.py     승인 권한과 관측 행위 비교 → Event 추출
 ├─ risk_scoring_agent.py       100점 위험 점수 (policy/scoring 위임)
 ├─ policy_evidence_agent.py    정책 위반 판정 + 판단 근거(Evidence) 수집
 ├─ recommendation_agent.py     조치 권고 9종 생성
@@ -93,7 +130,7 @@ agents/                  NHI 분석 Agent
 └─ heuristics.py               경로·변수명·주석 신호 추출 공용 유틸
 
 policy/
-├─ rules.py              정책 6종 + 강제 Critical 6종 + EvaluationContext + PolicyConfig
+├─ rules.py              정책 6종 + 강제 Critical 7종 + EvaluationContext + PolicyConfig
 ├─ scoring.py            평가 영역 7개 배점 및 등급 산정
 └─ decision_engine.py    자동 조치 / 사람 검토 / 예외 승인 판단
 
@@ -104,8 +141,8 @@ graph/
 agent_runtime/           Agent 실행 계층
 ├─ models.py             AgentAction / AgentStatus / NHIAgentRequest / NHIAgentState
 ├─ planner.py            초기 계획 (기본 분석 1단계)
-├─ tools.py              AgentTool 인터페이스 + 실제 도구 3종 + Registry
-├─ replanner.py          분석 결과 관찰 후 조건부 도구 추가
+├─ tools.py              AgentTool 인터페이스 + 실제 도구 4종 + Registry
+├─ replanner.py          수집·분석·Secret Scan 결과별 조건부 재계획
 └─ orchestrator.py       계획 실행 / 상태 관리 / 오류 기록
 
 rescan/
@@ -116,8 +153,12 @@ storage/
 ├─ base.py               저장소 인터페이스 (Storage) — DB 교체 시 이 계약만 맞추면 된다
 └─ sqlite_store.py       SQLite 구현 (기본)
 
+backend/services/
+├─ analysis_history.py        NHI별 분석 스냅샷 변화 비교
+└─ agent_access_evaluator.py  Agent 위장·Credential·권한·자원 범위 초과 판정
+
 api/app.py               FastAPI 단일 진입점 (Webhook 수신 포함)
-tests/                   단위·통합 테스트 159개 (네트워크·DB 파일 없음)
+tests/                   단위·통합 테스트 227개 (외부 네트워크 호출 없음)
 ```
 
 ---
@@ -128,7 +169,7 @@ tests/                   단위·통합 테스트 159개 (네트워크·DB 파�
 pip install -r requirements.txt
 cp .env.example .env          # 토큰/시크릿 입력
 uvicorn api.app:app --reload --port 8000
-pytest                        # 159 passed
+pytest                        # 227 passed
 ```
 
 ### 운영 데이터 파이프라인과 암호화 Secret material
@@ -161,25 +202,164 @@ NHI_ADMIN_API_KEY=<충분히 긴 관리자 API 키>
 | Method | Path | 설명 |
 | --- | --- | --- |
 | GET | `/analyses` | 버전이 포함된 분석 스냅샷 이력 |
+| GET | `/nhi/{nhi_id}/history` | 특정 NHI의 분석 결정 이력 |
+| GET | `/nhi/{nhi_id}/history/compare` | 직전 또는 지정 스냅샷 대비 위험·정책·권한·권고 변화 |
 | GET | `/actions` · `/actions/{action_id}` | 추천에서 생성된 조치 요청 |
 | POST | `/actions/{action_id}/approve` · `/cancel` | 관리자 승인·취소 |
 | POST | `/credentials/verify` | 암호화 참조를 이용한 읽기 전용 재검증 |
+| POST | `/integrations/github/discover` | 조직 GitHub App installation 수집 → 전건 분석 → 실행 요약 감사 |
+| POST | `/nhi/usage/normalize` | 공급자 감사 로그 → 공통 UsageEvent/AnalysisSignals 정규화 |
+| PUT·GET | `/agent-access/profiles/{agent_id}` | 회사 Agent별 승인 NHI·Credential·권한·자원 기준선 |
+| POST | `/agent-access/evaluate` | Gateway 호출을 기준선과 비교해 ALLOW·REVIEW·DENY |
+| GET | `/agent-access/decisions` · `/agent-access/rules` | 위장/범위 초과 판정 이력·확장 규칙 카탈로그 |
 
 ### Backend 운영 API와 Dashboard
 
 FastAPI 서버가 별도 빌드 없이 운영 Dashboard를 함께 제공한다.
 
-- Dashboard: <http://127.0.0.1:8000/dashboard/>
+- 운영 Dashboard: <http://127.0.0.1:8000/dashboard/>
+- 공모전 시연 Dashboard: <http://127.0.0.1:8000/competition/>
 - Executive KPI: `GET /dashboard/summary`
 - Project Coverage: `POST/GET /projects`, `POST /projects/{id}/scan`
 - Connector: `POST /connectors/github`, `POST /connectors/slack`,
+  `POST /connectors/microsoft`, `POST /connectors/google`,
   `GET /connectors/status`
 - Finding Lifecycle: `GET /findings`, `GET /findings/{id}`,
   `PATCH /findings/{id}/status`, `POST /findings/{id}/rescan`
 - NHI Inventory: `GET /nhi`, `GET /nhi/{id}`
+- Agent Access: `PUT/GET /agent-access/profiles`, `POST /agent-access/evaluate`,
+  `GET /agent-access/decisions`
+- Decision Flow: Usage → Event → Scenario → Risk/Action과 직전 분석 대비 변화
 - Relationship Graph: `GET /graph`
 - Review Queue: `POST /reviews/{id}/approve`, `POST /reviews/{id}/reject`
 - Audit/Report: `GET /audit`, `GET /reports/summary?format=markdown`
+
+### GitHub 조직 NHI Discovery
+
+`POST /integrations/github/discover`는 조직의 GitHub App installation 목록을 읽기
+전용으로 수집한 뒤, 각 installation을 독립 NHI로 분석한다. 조직 인벤토리에는
+`GITHUB_INVENTORY_TOKEN`, 저장소 파일 스캔에는 `GITHUB_TOKEN`을 사용하며 두 토큰은
+서로 fallback하지 않는다. 전자는 조직 Administration read 범위가 필요할 수 있으므로
+일반 코드 스캔 경로와 권한 경계를 분리한다.
+
+조직 installation API는 개별 접근 저장소 이름을 제공하지 않는다. 따라서
+`repository_inventory_complete=false`일 때 저장소 수를 0으로 해석하지 않고
+`UNKNOWN`으로 표시하며, Secret Scan도 대상 저장소를 확정하지 못한 상태로 남긴다.
+응답의 `run_summary`와 `GITHUB_INVENTORY_AGENT_COMPLETED` 감사 이벤트에는 전체 목록
+완전성, 실제 plan step, Replanner 출처, Usage/Event/Scenario 수, Secret Scan 범위가
+민감 원문 없이 저장된다.
+
+### Microsoft 365 / Google Workspace NHI Discovery
+
+계획서의 1단계인 SaaS 계정·OAuth 권한 수집을 읽기 전용 API로 구현한다. 두
+Discovery API는 조직 인벤토리를 반환하므로 `X-NHI-Admin-Key`가 필요하며,
+Credential 값은 요청 본문이나 응답/DB에 저장하지 않는다.
+
+| Method | Path | 수집 내용 |
+| --- | --- | --- |
+| POST | `/integrations/microsoft/discover` | Entra service principal, Owner, delegated grant, app role |
+| POST | `/integrations/google/discover` | Admin Reports의 OAuth authorize/activity/revoke 이벤트를 Client ID별 집계 |
+| POST | `/nhi/inventory/saas/analyze` | 이미 수집한 공급자 중립 SaaS NHI 1건 분석 |
+
+Microsoft Graph 앱에는 조회 범위에 맞는 최소 권한(일반적으로
+`Application.Read.All`과 delegated grant 조회 권한)을 부여한다. Google 쪽은
+`admin.reports.audit.readonly` Scope의 단기 access token을 사용한다. Google Reports
+결과는 감사 로그 보존 기간 안에서 관측된 이벤트이므로 전체 현재 토큰 목록으로
+단정하지 않고 응답의 `coverage_note`와 `inventory_is_complete=false`로 한계를 남긴다.
+
+```bash
+curl -X POST http://127.0.0.1:8000/integrations/microsoft/discover \
+  -H "Content-Type: application/json" \
+  -H "X-NHI-Admin-Key: $NHI_ADMIN_API_KEY" \
+  -d '{"limit": 25, "analyze": true}'
+
+curl -X POST http://127.0.0.1:8000/integrations/google/discover \
+  -H "Content-Type: application/json" \
+  -H "X-NHI-Admin-Key: $NHI_ADMIN_API_KEY" \
+  -d '{"max_events": 200, "analyze": true}'
+```
+
+### 회사 AI Agent 접근 기준선과 위장 API 판정
+
+`AgentAccessProfile`은 업무 주체인 AI Agent와 인증 주체인 NHI/API 계정을 분리한다.
+각 grant에는 provider, NHI ID, Credential fingerprint, 승인 권한, 허용 자원을 함께 둔다.
+`GET /agent-access/profiles/{agent_id}/scope`는 이 관계를 합쳐 실제 접근 가능 범위와
+Admin/Delete·wildcard 자원, Owner/인벤토리 공백을 보여준다.
+
+API Gateway 또는 감사 로그 수집기는 `POST /agent-access/evaluate`에 주장 Agent,
+인증 계층이 확인한 Agent, NHI, Credential fingerprint, 공통 권한, 대상 자원,
+sender proof 결과를 보낸다. IP·User-Agent는 보조 증거일 뿐 인증 근거로 사용하지 않는다.
+완전한 기준선에서 범위를 벗어나면 `DENY`, 기준선이나 관측 정보가 불완전하면 정상으로
+오인하지 않고 `REVIEW`, 모든 증거가 일치할 때만 `ALLOW`한다. 동일 event 재전송은 같은
+decision ID로 멱등 저장된다.
+
+규칙은 `backend/services/agent_access_evaluator.py`의 카탈로그에 모여 있다. 이후 팀원이
+조사한 정보유출·과도 권한 사례는 새 rule ID와 검증 조건으로 추가하고, GitHub/Microsoft/
+Slack Connector 결과는 원문 응답 대신 `GitHubNHIInput` 또는 `SaaSNHIInput`, 활동 로그는
+`UsageEvent`로 넘긴다. 수집 상한·권한 부족·페이지 중단은 반드시 `*_complete=false`로 남긴다.
+
+Slack 검증은 원문 Token을 body/query로 받지 않는다. 서버의 `SLACK_BOT_TOKEN`과
+`X-NHI-Admin-Key`만 사용하므로 Token이 access log나 APM에 복제되는 경로를 막는다.
+
+### AI Agent API token 탈취·재사용 방어 연구 (DPoP)
+
+검토한 방식과 이 연구에 대한 적합성은 다음과 같다.
+
+| 방식 | 장점 | 한계 | 적용 판단 |
+| --- | --- | --- | --- |
+| IP·User-Agent 비교 | 구현이 쉽고 이상행동 탐지에 유용 | NAT·프록시·모바일 환경에서 변하고 위조 가능 | 보조 증거만 사용 |
+| 자체 디바이스 fingerprint | 데모가 단순함 | 표준 proof가 아니면 값 복제·헤더 위조 가능 | 인증 근거로 사용하지 않음 |
+| 짧은 TTL·audience 제한 | 탈취 영향 시간과 사용처 축소 | 유효 시간 안의 token 재사용은 가능 | DPoP와 함께 적용 |
+| [OAuth mTLS(RFC 8705)](https://www.rfc-editor.org/rfc/rfc8705.html) | TLS 계층의 강한 client 인증·key 바인딩 | 인증서 PKI, proxy, 배포 자동화 필요 | 운영 고보안 경로 후보 |
+| [DPoP(RFC 9449)](https://www.rfc-editor.org/rfc/rfc9449.html) | HTTP 요청 단위 key 보유 증명, 앱에서 실험 가능 | key 보관과 분산 replay cache가 필요 | 연구용 보호 경로로 구현 |
+| [SPIFFE/SPIRE](https://spiffe.io/docs/latest/spiffe-specs/)·Cloud Workload Identity | secret 없는 단기 workload identity와 자동 회전 | 별도 인프라·플랫폼 연동 범위가 큼 | 장기 운영 아키텍처 후보 |
+
+현재 `/runtime/*`에는 **DPoP + 짧은 TTL + proof replay cache + IP/UA 감사 증거**를
+연구용으로 적용했다. 이 경로는 회사 Agent Registry나 실제 사내 Gateway 연동을 대체하지
+않으며, 다중 클러스터 운영 단계에서는 mTLS 또는 SPIFFE/클라우드 Workload Identity와
+공유 replay 저장소로 발급 경계를 강화해야 한다.
+
+계획서의 NHI 위험 분석을 실행 시점의 API 보호까지 확장하기 위해 RFC 9449 DPoP
+sender-constrained token을 적용한다. 단순 IP/User-Agent 또는 자체 문자열
+fingerprint가 아니라 Agent의 EC P-256 공개키 thumbprint를 access token의
+`cnf.jkt`에 바인딩한다.
+
+| 단계 | 검증 내용 | 실패 예시 |
+| --- | --- | --- |
+| Token 발급 | 관리자 승인 + ES256 DPoP proof의 공개키 보유 증명 | 서명 오류, 오래된 proof, proof 재전송 |
+| API 호출 | `Authorization: DPoP <token>` + 요청별 새 `DPoP` proof | Bearer 사용, token hash 불일치 |
+| Sender 확인 | token의 `cnf.jkt`와 proof JWK thumbprint 비교 | 탈취 token + 공격자 key |
+| Replay 확인 | `htm`, `htu`, `iat`, `ath`, 단일 사용 `jti` 검증 | token과 proof를 함께 복사해 재전송 |
+
+| Method | Path | 설명 |
+| --- | --- | --- |
+| POST | `/runtime/tokens/issue` | 연구 경로에서 관리자 지정 Agent ID에 5분 DPoP-bound token 발급 |
+| GET·POST | `/runtime/protected` | Agent private key 보유까지 검증하는 보호 리소스 |
+
+발급 API는 현재 연구용 계정 bootstrap 경계이므로 `X-NHI-Admin-Key`가 필요하다.
+운영에서는 이 경계를 조직 IdP 또는 SPIFFE/클라우드 Workload Identity로 교체한다.
+요청 IP와 User-Agent는 `ALLOW`/`DENY`의 근거가 아니라 상관분석용 증거로만 저장한다.
+보안 이벤트는 token·proof 원문 없이 감사 로그와 `CredentialObservation`에 저장되며,
+`token_replay_suspected` 신호는 강제 Critical 규칙과 즉시 폐기 권고로 연결된다.
+
+필수 설정:
+
+```dotenv
+NHI_RUNTIME_TOKEN_SIGNING_KEY=<관리자-key와 다른 32-byte 이상 random 값>
+NHI_RUNTIME_TOKEN_TTL_SECONDS=300
+NHI_DPOP_PROOF_MAX_AGE_SECONDS=120
+NHI_RUNTIME_PUBLIC_BASE_URL=https://nhi.example.com
+```
+
+API 실행 후 `python scripts/demo_dpop_replay.py`를 호출하면 정상 key의 `ALLOW`,
+탈취 token과 공격자 key의 `sender_key_mismatch`, token과 정상 proof를 함께 복사한
+경우의 `dpop_proof_replay`를 순서대로 재현한다. Token과 private key는 출력하거나
+파일에 저장하지 않는다.
+
+현재 replay cache는 단일 프로세스 메모리 구현이다. 다중 인스턴스 운영에서는 Redis
+같은 공유 TTL 저장소로 교체하고, 장기 token이 필요하면 DPoP nonce 또는 조직 IdP의
+정식 sender-constrained token 발급 기능을 사용한다. Agent private key도 가능하면
+TPM/HSM/KMS처럼 내보낼 수 없는 저장소에 둔다.
 
 검사할 GitHub 저장소가 없어도 Dashboard 상단의 **데모 데이터 생성** 버튼으로
 전체 흐름을 확인할 수 있다. 이 기능은 실제 Secret이나 외부 API 호출 없이 합성
@@ -289,9 +469,15 @@ python scripts/demo_github_analysis.py --repo psf/requests --max-files 5 --run-a
 | GET | `/nhi/{owner}/{repo}/graph` | 관계 그래프 |
 | GET | `/nhi/{owner}/{repo}/blast-radius` | 영향 범위 (합산 + NHI 별) |
 | **POST** | **`/nhi/inventory/analyze`** | **NHI 정보 직접 입력 → 분석 (스캔 결과 불필요)** |
+| POST | `/nhi/inventory/saas/analyze` | Microsoft/Google 등 공급자 중립 NHI 입력 → 분석 |
+| POST | `/nhi/usage/normalize` | 원본 감사 이벤트 필터링·중복 제거 → 분석 신호 |
 | POST | `/nhi/scopes/translate` | Scope → 공통 권한 변환 |
-| **POST** | **`/agent/nhi/run`** | **Agent 실행 (계획 → 도구 실행 → 재계획)** |
-| POST | `/integrations/slack/verify` · GET `/integrations/slack/channels` | Slack Token 검증·채널 |
+| PUT·GET | `/agent-access/profiles/{agent_id}` | 회사 Agent의 승인 NHI·권한·자원 기준선 |
+| POST | `/agent-access/evaluate` | 실제 API 호출의 위장·범위 초과 판정 |
+| GET | `/agent-access/decisions` · `/agent-access/rules` | 판정 이력·규칙 카탈로그 |
+| **POST** | **`/agent/nhi/run`** | **분석 Orchestrator 실행 (계획 → 도구 실행 → 재계획)** |
+| **POST** | **`/integrations/github/discover`** | **GitHub 조직 App installation 수집·전건 분석** |
+| POST | `/integrations/slack/verify` · GET `/integrations/slack/channels` | 서버 설정 Slack Connector 검증·채널 |
 | POST | `/webhooks/github` | Webhook 수신 → Push/PR 자동 검사 |
 
 ### GitHub Webhook 설정
@@ -328,7 +514,12 @@ Regex 로 잡히지 않은 고엔트로피 문자열은 Entropy 탐지가 보완
   "credential_active": true,
   "credential_revoked": false,
   "raw_scopes": ["chat:write", "channels:history"],
-  "credential_detail": { "account": {}, "accessible_resources": [] },
+  "credential_detail": {
+    "account": {},
+    "accessible_resources": [],
+    "resource_inventory_complete": false,
+    "resource_inventory_note": "GitHub Repository 조회가 1페이지에서 중단됨"
+  },
   "occurrence_count": 2,
   "duplicate_locations": [{ "file_path": "b.env", "line_number": 3 }],
   "status": "new"
@@ -531,7 +722,19 @@ Blast Radius 산출 항목: 연결 서비스 수, 접근 가능 자원 수, 읽�
 `declared_permissions` / `observed_actions` 는 `READ` 같은 공통 권한 표기와
 `chat:write` 같은 원본 Scope 를 모두 받는다(내부에서 정규화).
 
-### 7.2 NHI 인벤토리 입력 (`GitHubNHIInput`)
+### 7.2 감사 로그 입력 (`UsageEvent`)
+
+공급자별 Audit Log는 `POST /nhi/usage/normalize`에서 `principal_id`, `action`,
+`occurred_at` 중심의 최소 공통 모델로 바뀐다. NHI와 일치하는 이벤트만 모아 실제 사용 권한,
+최근 사용 시각, 공유 프로젝트를 계산하며 원본 Token과 불필요한 응답 필드는 보관하지 않는다.
+중복 이벤트는 제거하고 파싱 실패가 하나라도 있으면 요청의 `data_complete=true`를 그대로
+신뢰하지 않는다. 따라서 부분 수집을 근거로 미사용 권한을 확정하지 않는다.
+
+`POST /nhi/inventory/analyze`와 `/nhi/inventory/saas/analyze`에도 `usage_events`,
+`usage_data_complete`, `usage_principal_aliases`를 함께 전달하면 정규화 결과가 해당 NHI 분석에
+즉시 병합되고, 처리 건수와 실패는 응답의 `usage_ingestion`에 표시된다.
+
+### 7.3 NHI 인벤토리 입력 (`GitHubNHIInput`)
 
 ```json
 {
@@ -575,6 +778,9 @@ Blast Radius 산출 항목: 연결 서비스 수, 접근 가능 자원 수, 읽�
   "discovery": { "nhi_id": "slack:B01", "confidence": 0.95, "evidence": ["..."] },
   "context_analysis": { "data_sensitivity": "confidential", "confidence": 0.85 },
   "permission_detail": { "mappings": [{ "raw_scope": "chat:write", "permission": "WRITE" }] },
+  "usage_analysis": { "data_complete": true, "permission_comparison_complete": true, "observed_permissions": ["READ", "WRITE"] },
+  "security_events": [{ "event_type": "CROSS_PROJECT_CREDENTIAL_USE", "origin": "control_gap", "severity": "CRITICAL" }],
+  "scenario_matches": [{ "scenario_id": "TOKEN_SHARED_ACROSS_PROJECTS", "forced_critical": true }],
   "risk_detail": { "base_score": 64, "factors": [{ "label": "노출 위치", "score": 18 }], "forced_rules": [] },
   "policy": { "outcome": "HUMAN_REVIEW", "violations": [], "evidence": ["..."] },
   "recommendations": [{ "action": "TOKEN_ROTATION", "priority": 2, "rationale": "..." }],
@@ -584,7 +790,11 @@ Blast Radius 산출 항목: 연결 서비스 수, 접근 가능 자원 수, 읽�
 
 앞의 9개 필드가 요약(대시보드 목록 화면), 뒤가 그 판단의 근거(상세 화면)다.
 `risk_detail.factors` 를 보면 어느 영역에서 몇 점이 나왔는지 그대로 추적할 수 있다.
-`source` 로 스캔 결과인지 인벤토리 입력인지 구분한다.
+`source` 로 스캔 결과인지 인벤토리 입력인지 구분한다. `usage_analysis.data_complete=false`와
+`permission_comparison_complete=false`는 각각 미사용·권한 초과 없음이 아니라 **판정에 필요한
+근거가 불완전함**을 뜻한다. `unused_permissions`는 두 값이 모두 완전한 경우에만 생성되며,
+`activity_status`는 `active / inactive_warning / stale / orphaned_candidate / unknown`으로 수명
+상태를 구분한다. Scenario의 강제 규칙 ID는 `risk_detail.forced_rules`와 동일하다.
 
 ---
 
@@ -602,10 +812,11 @@ Blast Radius 산출 항목: 연결 서비스 수, 접근 가능 자원 수, 읽�
 LLM 을 붙일 때는 `agent_runtime/planner.py` 를 교체하고 보고서 생성 단계를 추가한다.
 위험 계산은 규칙 기반으로 유지한다.
 
-### 9.2 도구 3종 — 모두 실제 구현
+### 9.2 도구 4종 — 모두 실제 구현
 
 | Action | 도구 | 실제 동작 |
 | --- | --- | --- |
+| `COLLECT_GITHUB_DATA` | `CollectGitHubDataTool` | 조직 App installation 페이지 순회, 중복 제거, 수집 완전성 기록 |
 | `ANALYZE_NHI` | `AnalyzeNHITool` | `agents/pipeline.py` 통합 분석 |
 | `SCAN_SECRETS` | `SecretScanTool` | `connectors` + `scanner` 로 접근 가능 저장소를 실제 스캔하고, 탐지 결과를 같은 엔진으로 채점 |
 | `EVALUATE_POLICY` | `PolicyEvaluationTool` | `policy` 판정 결과 + 정책 카탈로그·임계값 정리 |
@@ -615,6 +826,10 @@ LLM 을 붙일 때는 `agent_runtime/planner.py` 를 교체하고 보고서 생�
 않는다.** 한 저장소 스캔이 실패해도 이미 끝난 분석 결과는 유지되고, 실패한 저장소만
 `repositories_failed` 에 남는다. 한 번에 스캔할 저장소 수는 `scan_repository_limit`(기본 3)로
 제한하고 나머지는 `repositories_skipped` 로 남긴다.
+
+`COLLECT_GITHUB_DATA`는 별도 `GITHUB_INVENTORY_TOKEN`만 사용한다. 조직 수집용 고권한
+Credential이 저장소 파일 스캔 경로로 흘러가지 않으며, 토큰이 없으면 네트워크 호출 전에
+명시적으로 실패한다.
 
 새 도구는 `build_tool_registry()` 에 등록하면 Orchestrator 를 수정하지 않아도 된다.
 
@@ -631,6 +846,10 @@ Secret 스캔  : 사용자가 허용 AND 위험 등급 HIGH 또는 CRITICAL   �
 계획이 실행 중에 늘어나므로 Orchestrator 는 `for` 가 아니라 매 반복마다 최신 계획에서
 다음 미완료 작업을 다시 찾는 방식으로 돌고, 각 작업에 생성 출처(`INITIAL_PLAN` /
 `REPLANNER`)와 실패 사유를 남긴다.
+
+조직 요청은 `COLLECT_GITHUB_DATA` 결과를 본 뒤 전건 분석 여부를 정하고, Secret Scan을
+실행한 경우에는 **미실행 / 성공 0건 / 부분 실패 / 발견 있음**을 구분한 두 번째 재계획으로
+정책 평가와 종료 이유를 확정한다.
 
 ### 9.4 실행 예시
 
@@ -658,8 +877,12 @@ PostgreSQL 등으로 교체하려면 `storage/base.py` 의 `Storage` 인터페�
 `api/app.py` 의 `storage = get_default_storage()` 한 줄만 바꾸면 된다.
 스키마는 `storage/sqlite_store.py` 의 `_SCHEMA` 참고.
 
-분석 결과는 현재 요청 시점에 계산하며 **영속화하지 않는다.** 이력 비교가 필요하면
-`Storage` 인터페이스에 분석 결과 저장 메서드를 추가하는 것이 다음 단계다.
+분석 결과는 `analysis_runs`에 입력·점수·정책 버전과 함께 저장하고 `/analyses`와
+`/nhi/{nhi_id}/history`에서 이력을 조회한다. `/nhi/{nhi_id}/history/compare`는 재채점 없이
+저장 당시 결과끼리 위험 점수, 정책/강제 규칙, 권한, 시나리오, 권고의 증감을 비교한다.
+GitHub 조직 수집 실행은 원문 inventory나 token을 감사 로그에 복제하지
+않고 compact `run_summary`만 남긴다. 다건 저장 실패는 item 단위로 보고해 부분 성공을
+전체 성공처럼 표시하지 않는다.
 
 ---
 
@@ -681,23 +904,51 @@ PostgreSQL 등으로 교체하려면 `storage/base.py` 의 `Storage` 인터페�
 
 **구현됨**
 
-- GitHub/Slack/GitLab/Notion/Hugging Face 연동, Webhook 자동 검사
+- GitHub 조직 App installation 수집, Microsoft 365·Google Workspace 인벤토리 수집,
+  GitHub Webhook 자동 검사
+- Slack/GitLab/Notion/Hugging Face Credential 탐지·읽기 전용 검증 Connector
 - Regex + Entropy Secret 탐지, 마스킹, Fingerprint, 중복 병합, 재스캔 판정
 - 탐지된 토큰의 외부 API 재검증 (읽기 전용)
 - NHI 식별 / 문맥 분석 / Scope 정규화 / Blast Radius / 관계 그래프
-- 규칙 기반 위험 점수(7영역 100점) + 강제 Critical 6종
+- 규칙 기반 위험 점수(7영역 100점) + 강제 Critical 7종
 - 정책 엔진 6종 + 조치 결정(자동/검토/예외) + 조치 권고 9종
 - NHI 인벤토리 직접 입력 경로 (스캔 결과 없이 분석)
 - Agent 실행 계층 (Planner / Tool Registry / 조건부 Replanner / Orchestrator)
-- SQLite 영속화, PostgreSQL 운영 스키마, FastAPI + Dashboard/Swagger, 테스트 159개
+- GitHub 조직 App installation 자동 수집, 전건 분석, 수집·저장소·Secret Scan 완전성 구분
+- 감사 로그 공통 UsageEvent 정규화·직접 입력, 승인 권한 ↔ 관측 사용 비교, Security Event,
+  canonical Scenario Match, Secret Scan 2차 재계획
+- GitHub 자격 증명 접근 저장소 전체 페이지 순회와 수집 실패/상한 완전성 표시
+- 회사 Agent ↔ NHI ↔ Credential ↔ 권한·자원 승인 기준선과 접근 범위 요약
+- 위장 Agent, Token replay, 미승인 Credential, 권한·자원 초과 `ALLOW/REVIEW/DENY` 판정·이력
+- DPoP key-bound 단기 token 발급·API 검증·proof replay 차단 연구 경로
+- SQLite 분석 이력/감사 영속화와 NHI별 스냅샷 비교, PostgreSQL 운영 스키마, FastAPI + Dashboard/Swagger
+- Decision Flow·분석 변화·Agent Run 시각화와 반응형 Dashboard, 테스트 227개
+
+**부분 구현 — 판정 모델은 있으나 실제 수집 근거가 제한됨**
+
+- 권한·환경·Owner·수명·사용·접근 범위 모델과 정책 판정은 구현되어 있다. 다만 공급자별
+  Audit Log·CMDB·IdP 연결이 완전하지 않아 자동 수집 값은 `UNKNOWN` 또는 부분 범위일 수 있다.
+- GitHub 조직 수집은 App installation과 권한을 수집하지만, 타사 App installation의 개별
+  저장소 이름은 조직 API 응답만으로 확정할 수 없어 불완전 범위로 표시한다.
+- Microsoft 365·Google Workspace Connector는 일부 계정·Credential·활동 근거를 수집하지만
+  전 조직의 모든 Resource·행위를 완전한 snapshot으로 보장하지 않는다.
+- Agent 접근 기준선과 판정 API는 구현됐지만 실제 사내 API Gateway가 호출·차단을 적용하는
+  연동, 조직 IdP 기반 authenticated_agent_id, 자동 profile reconciliation은 아직 없다.
+- DPoP는 탈취 Bearer Token 재사용을 막는 연구 데모와 API 검증까지 구현됐다. 운영용 key
+  enrollment·IdP 연동·분산 replay 저장소는 아직 없다.
+- Project의 schedule 필드는 저장되지만 실행 Scheduler는 아직 없다. 오해를 막기 위해
+  Dashboard의 `정기 검사` 입력은 노출하지 않는다.
 
 **아직 없음**
 
-- GitHub NHI 목록 자동 수집 (현재는 인벤토리를 요청으로 입력받는다 → `COLLECT_GITHUB_DATA` 도구 후보)
-- Secret 스캔 결과를 본 2차 재계획 (현재 재계획은 기본 분석 직후 1회)
-- LLM 기반 Planner / 자연어 보고서
-- 분석 결과 영속화 및 이력 비교
-- 사용자 인증·권한 관리, 비동기 작업 처리, 실제 자동 조치 실행
+- 주 공급자 Audit Log·CMDB·IdP를 결합한 authoritative Owner/환경/사용/수명 데이터 수집
+- 실제 사내 API Gateway의 동기 enforcement 또는 비동기 로그 스트리밍 연동
+- GitHub/Microsoft/Slack 인벤토리에서 AgentAccessProfile을 자동 조립·정합하는 reconciler
+- 대규모 조직용 비동기·페이지형 분석 job, Scheduler, 완전 snapshot reconciliation
+- 최종 사용자 로그인/RBAC, 운영용 Agent key enrollment, 분산 DPoP replay 저장소·KMS
+- 승인 후 revoke/rotate/scope 축소 실행, Dry-run·rollback·사후 검증
+- 신규 OAuth 동의 시점의 과도한 Scope 예방 경고·차단
+- LLM 기반 목표 해석과 자연어 보고서(위험 판정은 규칙 기반 유지)
 
 ---
 
@@ -707,9 +958,4 @@ PostgreSQL 등으로 교체하려면 `storage/base.py` 의 `Storage` 인터페�
 | --- | --- |
 | 팀원 1 | `connectors/` · `scanner/` · `rescan/` · `storage/` · 탐지 계층 스키마 |
 | 팀원 2 | `agents/` · `policy/` · `graph/` · 분석 계층 스키마 |
-| 팀원 3 (김태희) | `agent_runtime/` · `core/inventory_models.py` · 인벤토리 입력 경로 |
-
-세 계층은 원래 각자 실행되는 별개 프로젝트였고, 지금은 하나의 패키지·하나의 FastAPI 앱·
-하나의 테스트 스위트로 합쳐져 있다. 통합 과정에서 중복 구현(별도의 Scope Translation /
-Context Analysis / Risk Scoring / Recommendation 모듈)과 Mock 도구는 삭제하고, 그 자리에
-실제 엔진을 연결했다.
+| 팀원 3 | `agent_runtime/` · `core/inventory_models.py` · 인벤토리 입력 경로 |

@@ -12,12 +12,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field
 
 from core.inventory_models import GitHubNHIInput
 from core.nhi_models import NHIAnalysis
+from security.redaction import sanitize_security_value
 
 
 class AgentActionType(str, Enum):
@@ -28,6 +29,8 @@ class AgentActionType(str, Enum):
 
     #: NHI 통합 위험 분석 (권한 정규화 → 문맥 → 점수 → 정책 → 권고)
     ANALYZE_NHI = "ANALYZE_NHI"
+    #: GitHub 조직의 App installation 인벤토리 읽기 전용 수집
+    COLLECT_GITHUB_DATA = "COLLECT_GITHUB_DATA"
     #: 접근 가능 저장소의 Secret 스캔
     SCAN_SECRETS = "SCAN_SECRETS"
     #: 정책 판정 결과 정리 (정책 카탈로그·임계값 포함)
@@ -94,20 +97,59 @@ class NHIAgentRequest(BaseModel):
     signals: Optional[Dict[str, Any]] = None
 
 
+class GitHubInventoryAgentRequest(BaseModel):
+    """조직 GitHub App 인벤토리 수집 Agent 요청.
+
+    기존 단건 ``NHIAgentRequest`` 계약을 변경하지 않고 별도 모드로 둔다.
+    GitHub token은 본문으로 받지 않고 서버의 ``GITHUB_INVENTORY_TOKEN``만 사용한다.
+    """
+
+    organization: str = Field(
+        ...,
+        min_length=1,
+        max_length=39,
+        pattern=r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$",
+    )
+    goal: str = "GitHub 조직의 NHI를 수집하고 권한·범위·정책 위험을 분석한다."
+    model_config = {"extra": "forbid"}
+
+    # 동기 요청에서 전건 분석·정책 평가까지 수행하므로 응답/CPU 상한을 보수적으로 둔다.
+    inventory_limit: int = Field(default=100, ge=1, le=500)
+    analyze: bool = True
+    allow_secret_scan: bool = False
+    allow_policy_evaluation: bool = True
+    scan_repository_limit: int = Field(default=3, ge=1, le=20)
+    signals: Optional[Dict[str, Any]] = None
+    signals_by_nhi_id: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+
+
+AgentRequest = Union[NHIAgentRequest, GitHubInventoryAgentRequest]
+
+
 @dataclass
 class NHIAgentState:
     """Agent 의 실행 과정과 결과 전체."""
 
-    request: NHIAgentRequest
+    request: AgentRequest
     status: AgentStatus = AgentStatus.PENDING
     plan: List[AgentAction] = field(default_factory=list)
     current_step: int = 0
     replan_count: int = 0
+    replanned_after_collection: bool = False
+    replanned_after_analysis: bool = False
+    replanned_after_secret_scan: bool = False
+    replan_notes: List[str] = field(default_factory=list)
     #: NHI 통합 분석 결과 (ANALYZE_NHI 실행 후 채워진다)
     analysis: Optional[NHIAnalysis] = None
+    github_collection_result: Optional[Dict[str, Any]] = None
+    collected_inventory: List[GitHubNHIInput] = field(default_factory=list)
+    inventory_analyses: List[NHIAnalysis] = field(default_factory=list)
     secret_scan_result: Optional[Dict[str, Any]] = None
+    #: Secret scan에서 새로 발견한 NHI 분석. 원문 Secret 없이 마스킹된 분석만 보관한다.
+    discovered_analyses: List[NHIAnalysis] = field(default_factory=list)
     policy_evaluation_result: Optional[Dict[str, Any]] = None
     error_message: Optional[str] = None
+    error_status_code: Optional[int] = None
 
     def has_action(self, action_type: AgentActionType) -> bool:
         """같은 작업이 이미 계획에 있는지 — 재계획 시 중복 추가 방지용."""
@@ -120,16 +162,33 @@ class NHIAgentState:
         *,
         created_by: ActionOrigin = ActionOrigin.REPLANNER,
     ) -> Optional[AgentAction]:
-        """계획 마지막에 작업을 추가한다. 이미 있으면 아무것도 하지 않는다."""
+        """작업을 종료 단계 앞에 추가한다. 이미 있으면 아무것도 하지 않는다.
+
+        Replanner가 ``COMPLETE``를 붙인 뒤 후속 검사를 발견할 수도 있다. 이때 단순히
+        맨 뒤에 append하면 실행기가 COMPLETE에서 멈춰 후속 작업은 영원히 실행되지
+        않으므로, 아직 실행되지 않은 COMPLETE 바로 앞에 삽입한다.
+        """
         if self.has_action(action_type):
             return None
         action = AgentAction(
-            step=len(self.plan) + 1,
+            step=0,
             action_type=action_type,
             reason=reason,
             created_by=created_by,
         )
-        self.plan.append(action)
+        pending_complete_index = next(
+            (
+                index
+                for index, planned in enumerate(self.plan)
+                if planned.action_type is AgentActionType.COMPLETE
+                and not planned.completed
+                and not planned.failed
+            ),
+            len(self.plan),
+        )
+        self.plan.insert(pending_complete_index, action)
+        for step, planned in enumerate(self.plan, start=1):
+            planned.step = step
         return action
 
     def next_pending_action(self) -> Optional[AgentAction]:
@@ -139,15 +198,48 @@ class NHIAgentState:
         return None
 
     def to_dict(self) -> Dict[str, Any]:
+        request_payload = self.request.model_dump(mode="json")
+        for key in ("signals", "signals_by_nhi_id"):
+            if key in request_payload:
+                request_payload[key] = sanitize_security_value(request_payload[key])
+
+        plan = []
+        for action in self.plan:
+            serialized = action.to_dict()
+            result = serialized.get("result")
+            if isinstance(result, dict):
+                # 상세 목록은 top-level github_collection/inventory_analyses에 한 번만 둔다.
+                if action.action_type is AgentActionType.COLLECT_GITHUB_DATA:
+                    serialized["result"] = {
+                        key: value for key, value in result.items() if key != "inventory"
+                    }
+                elif (
+                    action.action_type is AgentActionType.ANALYZE_NHI
+                    and self.github_collection_result is not None
+                ):
+                    serialized["result"] = {
+                        key: value for key, value in result.items() if key != "analyses"
+                    }
+            plan.append(serialized)
+
         return {
             "goal": self.request.goal,
             "status": self.status.value,
             "current_step": self.current_step,
             "replan_count": self.replan_count,
-            "plan": [action.to_dict() for action in self.plan],
+            "replan_notes": list(self.replan_notes),
+            "plan": plan,
             "nhi_analysis": self.analysis.to_dict() if self.analysis else None,
+            "github_collection": self.github_collection_result,
+            "inventory_analyses": [
+                analysis.to_dict() for analysis in self.inventory_analyses
+            ],
             "secret_scan": self.secret_scan_result,
+            "discovered_secret_analyses": [
+                analysis.to_dict() for analysis in self.discovered_analyses
+            ],
             "policy_evaluation": self.policy_evaluation_result,
             "error_message": self.error_message,
-            "request": self.request.model_dump(mode="json"),
+            "error_status_code": self.error_status_code,
+            "request": request_payload,
         }

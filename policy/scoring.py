@@ -180,26 +180,46 @@ class RiskScorer:
         return self._factor("exposure_location", score, reasons)
 
     def _exposure_access_scope(self, ctx: EvaluationContext) -> RiskFactor:
-        """인벤토리 입력 — 접근 가능한 자원 범위로 노출 면적을 평가한다.
+        """인벤토리 입력 — 접근 가능한 저장소/서비스 자원 범위로 노출 면적을 평가한다.
 
         점수 계산은 provider 와 무관하게 동일하다 — `resource_label` 은 사유
-        문구에만 쓰이고 어떤 분기 조건에도 영향을 주지 않는다. 유일한 예외는
-        `total == 0` 인 경우인데, "조회 성공 + 0개"(실제로 접근 가능한 자원이
-        없다고 확인됨)와 "조회 실패"(개수를 알 수 없음)를 구분해야 하기
-        때문이다 — `accessible_resources_verification_attempted` 가 False 인
-        provider(GitHub)는 이 분기와 무관하게 항상 기존 "미확인" 처리를 받는다.
+        문구에만 쓰이고 어떤 분기 조건에도 영향을 주지 않는다. `total == 0` 인
+        경우는 세 가지로 갈린다: (1) GitHub App 조직 전체 설치(`repository_selection
+        == "all"`)라 개별 저장소 수를 애초에 알려주지 않는 경우, (2) "조회
+        성공 + 0개"(실제로 접근 가능한 자원이 없다고 확인됨), (3) "조회
+        실패/미시도"(개수를 알 수 없음) — `accessible_resources_verification_attempted`
+        가 False 인 provider(GitHub PAT)는 (1)에 해당하지 않는 한 항상 (3)
+        "미확인" 처리를 받는다.
         """
         reasons: List[str] = []
         repositories = ctx.accessible_repositories
-        total = len(repositories)
+        resources = ctx.accessible_resources
+        inventory = repositories or resources
+        total = len(inventory)
         threshold = ctx.config.broad_repository_access_threshold
         provider = (ctx.profile.provider or "").strip().lower()
         resource_label = _EXPOSURE_RESOURCE_LABELS.get(provider, "자원")
+        repository_selection = str(
+            (ctx.signals.extra or {}).get("repository_selection") or ""
+        ).lower()
+        repository_inventory_complete = (
+            (ctx.signals.extra or {}).get("repository_inventory_complete") is True
+        )
 
         private = sum(1 for repo in repositories if _is_private_resource(provider, repo))
-        sensitive = sum(1 for repo in repositories if repo.get("is_sensitive") is True)
+        # 민감 자원 집계는 GitHub/Slack 전용 `repositories` 뿐 아니라 provider 중립
+        # `resources`(Microsoft/Google 등 SaaS)에도 적용되게 `inventory` 전체를 본다.
+        sensitive = sum(1 for repo in inventory if repo.get("is_sensitive") is True)
 
-        if total == 0:
+        if total == 0 and repository_selection == "all":
+            # GitHub App 조직 전체 설치 — 개별 저장소 수는 API 가 아예 안 준다.
+            # "미확인"이 아니라 "광범위 접근이 확정적"으로 취급한다.
+            score = 14
+            reasons.append(
+                f"조직의 모든 {resource_label} 접근 범위(selection=all), "
+                f"개별 {resource_label} 수는 미확인"
+            )
+        elif total == 0:
             if (
                 ctx.accessible_resources_verification_attempted
                 and ctx.accessible_resources_error is None
@@ -222,12 +242,19 @@ class RiskScorer:
             score = 4
             reasons.append(f"단일 {resource_label}에만 접근 가능")
 
-        if private:
+        if repositories and private:
             score += 3
             reasons.append(f"비공개 {resource_label} {private}개 접근 가능")
         if sensitive:
             score += 3
             reasons.append(f"민감 {resource_label} {sensitive}개 접근 가능")
+        # `repository_selection`/`repository_inventory_complete` 는 GitHub 전용
+        # 신호다(Slack 은 채널 목록을 페이지네이션으로 항상 전부 수집하므로 이
+        # 개념이 없다) — `repositories` 는 Slack 채널도 담으므로 provider 로
+        # 반드시 좁혀야 Slack에 "저장소" 문구가 잘못 노출되지 않는다.
+        if provider == "github" and (repositories or repository_selection):
+            if not repository_inventory_complete:
+                reasons.append("저장소 이름 인벤토리가 불완전해 전체 범위를 확정할 수 없음")
 
         return self._factor("exposure_location", score, reasons)
 
@@ -367,14 +394,42 @@ class RiskScorer:
                 score += 2
                 reasons.append(f"{days}일간 미사용 상태로 방치")
 
-        if ctx.signals.token_used_after_revocation is True:
+        usage = ctx.usage_analysis
+        used_after_revocation = (
+            usage.used_after_revocation
+            if usage is not None
+            else ctx.signals.token_used_after_revocation
+        )
+        replay_suspected = (
+            usage.replay_suspected
+            if usage is not None
+            else ctx.signals.token_replay_suspected
+        )
+        sender_constrained = (
+            usage.sender_constrained
+            if usage is not None
+            else ctx.signals.sender_constrained
+        )
+
+        if used_after_revocation is True:
             score += 7
             reasons.append("폐기 이후에도 호출 기록 존재")
 
-        declared = set(ctx.declared_permissions)
-        observed = set(ctx.observed_permissions)
-        if declared and observed - declared:
-            over = ", ".join(sorted(p.value for p in observed - declared))
+        if replay_suspected is True:
+            score += 10
+            reasons.append("탈취 token 또는 DPoP proof 재사용 의심")
+
+        if sender_constrained is False:
+            score += 2
+            reasons.append("sender-constrained token 미적용")
+
+        unexpected = (
+            set(usage.unexpected_permissions)
+            if usage is not None
+            else set(ctx.observed_permissions) - set(ctx.declared_permissions)
+        )
+        if unexpected:
+            over = ", ".join(sorted(p.value for p in unexpected))
             score += 5
             reasons.append(f"승인 범위를 넘는 행위 관측: {over}")
 

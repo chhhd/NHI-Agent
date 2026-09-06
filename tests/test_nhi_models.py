@@ -4,18 +4,18 @@ from core.nhi_models import (
     NHIProfile,
     PermissionLevel,
     PermissionProfile,
+    PermissionUsageEvent,
+    PermissionUsageResult,
+    PermissionUsageScenarioMatch,
     PolicyEvaluation,
     RecommendedAction,
     RiskAssessment,
     RiskLevel,
-    ScenarioMatch,
-    SecurityEvent,
-    UsageAnalysisResult,
 )
 
 
 def test_usage_and_event_models_serialize_reused_enums():
-    usage = UsageAnalysisResult(
+    usage = PermissionUsageResult(
         granted_permissions=[PermissionLevel.READ, PermissionLevel.WRITE],
         used_permissions=[PermissionLevel.READ],
         unused_permissions=[PermissionLevel.WRITE],
@@ -24,7 +24,7 @@ def test_usage_and_event_models_serialize_reused_enums():
         excessive_permission=True,
         evidence=["audit log"],
     )
-    event = SecurityEvent(
+    event = PermissionUsageEvent(
         event_id="event-1",
         nhi_id="nhi-1",
         event_type="resource_access",
@@ -33,7 +33,7 @@ def test_usage_and_event_models_serialize_reused_enums():
         event_risk=RiskLevel.HIGH,
         evidence=["audit log"],
     )
-    scenario = ScenarioMatch(
+    scenario = PermissionUsageScenarioMatch(
         scenario_id="scenario-1",
         scenario_name="excessive write access",
         severity=RiskLevel.HIGH,
@@ -62,7 +62,7 @@ def test_nhi_analysis_new_fields_are_backward_compatible():
         policy=PolicyEvaluation(),
     )
 
-    assert isinstance(analysis.usage_analysis, UsageAnalysisResult)
+    assert isinstance(analysis.permission_usage, PermissionUsageResult)
     assert analysis.events == []
-    assert analysis.scenario_matches == []
+    assert analysis.permission_scenario_matches == []
     assert analysis.to_dict()["events"] == []

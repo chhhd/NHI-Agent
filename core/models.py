@@ -71,6 +71,9 @@ class CredentialStatus:
     #: 둘을 구분할 방법이 없다. None = 조회를 시도하지 않았거나 성공함(빈 결과
     #: 포함), 문자열 = 조회를 시도했으나 실패한 사유.
     accessible_resources_error: Optional[str] = None
+    # 빈 목록이 실제로 "접근 가능한 리소스 없음"인지, 수집 실패/상한 때문인지 구분한다.
+    resource_inventory_complete: Optional[bool] = None
+    resource_inventory_note: Optional[str] = None
     checked_at: str = field(default_factory=_utcnow)
     error: Optional[str] = None
 

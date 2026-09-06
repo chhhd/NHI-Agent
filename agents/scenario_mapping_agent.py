@@ -6,7 +6,12 @@ import json
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-from core.nhi_models import RecommendedAction, RiskLevel, ScenarioMatch, SecurityEvent
+from core.nhi_models import (
+    PermissionUsageEvent,
+    PermissionUsageScenarioMatch,
+    RecommendedAction,
+    RiskLevel,
+)
 
 
 class ScenarioMappingAgent:
@@ -26,14 +31,14 @@ class ScenarioMappingAgent:
             raise ValueError("Scenario catalog must contain a 'scenarios' list.")
         return [scenario for scenario in scenarios if isinstance(scenario, dict)]
 
-    def map(self, events: Iterable[SecurityEvent]) -> List[ScenarioMatch]:
+    def map(self, events: Iterable[PermissionUsageEvent]) -> List[PermissionUsageScenarioMatch]:
         """Return one match per catalog scenario whose events are all present."""
         event_list = list(events or [])
-        events_by_type: Dict[str, List[SecurityEvent]] = {}
+        events_by_type: Dict[str, List[PermissionUsageEvent]] = {}
         for event in event_list:
             events_by_type.setdefault(event.event_type, []).append(event)
 
-        matches: List[ScenarioMatch] = []
+        matches: List[PermissionUsageScenarioMatch] = []
         seen_scenarios = set()
         for scenario in self.load_catalog():
             scenario_id = str(scenario.get("scenario_id") or "")
@@ -52,7 +57,7 @@ class ScenarioMappingAgent:
             recommended_action = RecommendedAction(str(scenario["recommended_action"]))
             name = str(scenario.get("name") or scenario_id)
             matches.append(
-                ScenarioMatch(
+                PermissionUsageScenarioMatch(
                     scenario_id=scenario_id,
                     scenario_name=name,
                     severity=severity,
@@ -68,6 +73,6 @@ class ScenarioMappingAgent:
             seen_scenarios.add(scenario_id)
         return matches
 
-    def analyze(self, events: Iterable[SecurityEvent]) -> List[ScenarioMatch]:
+    def analyze(self, events: Iterable[PermissionUsageEvent]) -> List[PermissionUsageScenarioMatch]:
         """Alias using the repository's conventional Agent method name."""
         return self.map(events)

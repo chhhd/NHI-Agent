@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from agents.inventory_adapter import build_credential_record
 from agents.pipeline import NHIAnalysisPipeline
 from agents.scope_translation_agent import ScopeTranslationAgent
 from core.inventory_models import GitHubNHIInput, GitHubNHIType, RepositoryInfo
@@ -91,6 +92,27 @@ def test_missing_inventory_permissions_remain_unknown(pipeline):
     return
     assert analysis.permissions.permissions  # 비워두지 않는다
     assert any("가정" in reason for reason in analysis.risk.reasons)
+
+
+def test_inventory_account_metadata_cannot_override_canonical_identity(pipeline):
+    nhi = GitHubNHIInput(
+        nhi_id="canonical-installation-7",
+        nhi_name="canonical-deploy-app",
+        nhi_type=GitHubNHIType.GITHUB_APP,
+        account={"id": "spoofed", "name": "spoofed", "type": "user"},
+        raw_permissions={"metadata": "read"},
+    )
+
+    credential = build_credential_record(nhi)
+    analysis = pipeline.analyze_github_nhi(nhi)
+
+    assert credential.credential_detail["account"] == {
+        "id": "canonical-installation-7",
+        "name": "canonical-deploy-app",
+        "type": "bot",
+    }
+    assert analysis.profile.account["id"] == "canonical-installation-7"
+    assert analysis.profile.account["name"] == "canonical-deploy-app"
 
 
 # ---------------------------------------------------------------------------

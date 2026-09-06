@@ -1,9 +1,9 @@
 from agents.scenario_mapping_agent import ScenarioMappingAgent
-from core.nhi_models import PermissionLevel, RiskLevel, SecurityEvent
+from core.nhi_models import PermissionLevel, RiskLevel, PermissionUsageEvent
 
 
 def _event(event_id, event_type):
-    return SecurityEvent(
+    return PermissionUsageEvent(
         event_id=event_id,
         nhi_id="nhi-test",
         event_type=event_type,

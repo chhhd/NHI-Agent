@@ -1,5 +1,5 @@
 from agents.recommendation_agent import RecommendationAgent
-from core.nhi_models import RecommendedAction, ScenarioMatch
+from core.nhi_models import RecommendedAction, PermissionUsageScenarioMatch
 from policy.decision_engine import DecisionEngine
 from policy.rules import evaluate_policies
 from policy.scoring import RiskScorer
@@ -15,7 +15,7 @@ def _recommendations():
 
 
 def _scenario(scenario_id, name="Scenario evidence"):
-    return ScenarioMatch(
+    return PermissionUsageScenarioMatch(
         scenario_id=scenario_id,
         scenario_name=name,
         matched_reason="required event evidence is present",

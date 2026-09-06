@@ -17,13 +17,13 @@ from typing import List, Optional, Set
 from core.nhi_models import (
     NHIType,
     PermissionLevel,
+    PermissionUsageScenarioMatch,
     PolicyEvaluation,
     PolicyOutcome,
     RecommendedAction,
     Recommendation,
     RiskAssessment,
     RiskLevel,
-    ScenarioMatch,
     parse_dt,
 )
 from policy.rules import EvaluationContext, is_inactive_nhi
@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 #: 즉시 폐기가 필요한 강제 Critical 규칙
 _REVOCATION_RULES = {
     "REVOKED_TOKEN_STILL_USED",
+    "TOKEN_REPLAY_SUSPECTED",
     "TERMINATED_AGENT_ACTIVE_TOKEN",
     "READ_ONLY_NHI_PERFORMS_MUTATION",
 }
@@ -66,7 +67,7 @@ class RecommendationAgent:
         ctx: EvaluationContext,
         risk: RiskAssessment,
         policy: PolicyEvaluation,
-        scenario_matches: Optional[List[ScenarioMatch]] = None,
+        scenario_matches: Optional[List[PermissionUsageScenarioMatch]] = None,
     ) -> List[Recommendation]:
         target = f"{ctx.profile.nhi_name} ({ctx.profile.credential_fingerprint[:23]})"
         rules: Set[str] = {r["rule_id"] for r in risk.forced_rules}
@@ -166,7 +167,7 @@ class RecommendationAgent:
     @staticmethod
     def _apply_scenario_recommendations(
         recommendations: List[Recommendation],
-        scenario_matches: List[ScenarioMatch],
+        scenario_matches: List[PermissionUsageScenarioMatch],
         target: str,
     ) -> None:
         """Merge catalog scenario actions into the existing recommendations."""
@@ -199,6 +200,11 @@ class RecommendationAgent:
     @staticmethod
     def _revocation_reason(ctx: EvaluationContext, rules: Set[str]) -> Optional[str]:
         hit = rules & _REVOCATION_RULES
+        if "TOKEN_REPLAY_SUSPECTED" in hit:
+            return (
+                "탈취 token 또는 proof 재사용이 의심됩니다. Token을 즉시 폐기하고 "
+                "해당 Agent key를 교체한 뒤 감사 로그의 출처·행위를 조사해야 합니다."
+            )
         if "REVOKED_TOKEN_STILL_USED" in hit:
             return "폐기 처리된 Token 이 계속 호출되고 있다. 즉시 완전 폐기하고 사용처를 추적해야 한다."
         if "TERMINATED_AGENT_ACTIVE_TOKEN" in hit:
@@ -261,9 +267,15 @@ class RecommendationAgent:
         if PermissionLevel.DELETE in permissions:
             return "삭제 권한이 포함되어 있다. 실제 필요 여부를 확인하고 제거해야 한다."
 
-        observed = set(ctx.observed_permissions)
-        if observed and permissions - observed:
-            unused = ", ".join(sorted(p.value for p in permissions - observed))
+        # 부분 감사 로그만 보고 미사용 권한이라고 단정하지 않는다. Usage Agent가
+        # 승인 기준과 분석 기간의 로그가 모두 완전하다고 검증한 결과만 사용한다.
+        unused_permissions = (
+            ctx.usage_analysis.unused_permissions
+            if ctx.usage_analysis is not None
+            else []
+        )
+        if unused_permissions:
+            unused = ", ".join(sorted(p.value for p in unused_permissions))
             return f"부여됐지만 실제로 사용되지 않는 권한이 있다: {unused}"
         return None
 

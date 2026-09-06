@@ -14,15 +14,18 @@ from __future__ import annotations
 
 import logging
 import hmac
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
-from agent_runtime.models import NHIAgentRequest
+from agent_runtime.models import GitHubInventoryAgentRequest, NHIAgentRequest
 from agent_runtime.orchestrator import run_nhi_agent
+from agent_runtime.tools import build_tool_registry
 from agents.pipeline import NHIAnalysisPipeline, finding_from_dict
 from agents.github_inventory_service import (
     analyze_github_app_nhi_from_connector,
@@ -43,17 +46,32 @@ from connectors.aws_connector import AWSConnector
 from connectors.github_app_connector import GitHubAppConnector
 from connectors.github_connector import GitHubConnector
 from connectors.github_webhook import GitHubWebhookHandler, WebhookVerificationError
+from connectors.google_workspace_connector import GoogleWorkspaceConnector
+from connectors.microsoft_graph_connector import MicrosoftGraphConnector
 from connectors.slack_connector import SlackConnector
-from core.inventory_models import GitHubNHIInput
+from core.agent_access_models import (
+    AgentAccessOutcome,
+    AgentAccessProfile,
+    AgentApiObservation,
+)
+from core.inventory_models import GitHubNHIInput, SaaSNHIInput
 from core.models import ScanResult, ScanTrigger, SecretFinding
-from core.nhi_models import AnalysisSignals, NHIAnalysisReport
+from core.nhi_models import AnalysisSignals, NHIAnalysisReport, NHIType
+from core.observation_models import CredentialObservation, Evidence
 from core.action_models import ActionStatus
 from core.config import get_settings
-from normalization import observation_from_finding, observation_from_inventory
+from normalization import (
+    UsageEventAdapter,
+    observation_from_finding,
+    observation_from_inventory,
+    observation_from_saas_inventory,
+)
 from processing import ActionService, persist_analysis, persist_report
 from rescan.credential_verifier import CredentialVerifier
 from rescan.revalidator import Revalidator
 from scanner.scan_service import SecretScanService
+from security.dpop import InMemoryReplayCache, RuntimeTokenService, TokenBindingError
+from security.redaction import sanitize_security_text, sanitize_security_value
 from storage import Storage, get_default_storage
 from backend.models.entities import (
     ConnectorRecord,
@@ -65,6 +83,8 @@ from backend.services.demo_workspace import (
     clear_demo_workspace,
     seed_demo_workspace,
 )
+from backend.services.analysis_history import AnalysisHistoryService
+from backend.services.agent_access_evaluator import AgentAccessEvaluator
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -72,9 +92,10 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="NHI Risk Analysis Agent API",
     description=(
-        "GitHub/Slack 연동 · Secret 탐지 · NHI 위험 분석 · Agent 실행을 제공한다."
+        "회사 AI Agent의 NHI/API 접근 범위 분석 · 위장/범위 초과 호출 판정 · "
+        "GitHub/Slack/Microsoft 365/Google Workspace 연동 · Secret 탐지를 제공한다."
     ),
-    version="0.5.0",
+    version="0.10.0",
 )
 
 # ---------------------------------------------------------------------------
@@ -118,6 +139,7 @@ def _store_result(result: ScanResult) -> None:
 scan_service = SecretScanService()
 #: NHI 분석 / 위험 점수화 파이프라인 (스캔 경로·인벤토리 경로 공용)
 nhi_pipeline = NHIAnalysisPipeline()
+agent_access_evaluator = AgentAccessEvaluator()
 webhook_handler = GitHubWebhookHandler(
     scan_service=scan_service,
     on_result=_store_result,
@@ -154,7 +176,9 @@ class RescanRequest(BaseModel):
 
 
 class SlackVerifyRequest(BaseModel):
-    token: str = Field(..., description="검증할 Slack Token")
+    """서버에 설정된 Slack Connector 검증 요청. 원문 Token 입력은 금지한다."""
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class NHIAnalyzeRequest(BaseModel):
@@ -182,6 +206,55 @@ class InventoryAnalyzeRequest(BaseModel):
     nhi: GitHubNHIInput
     #: 코드·인벤토리에 없는 외부 사실 (agent_status, observed_actions, exception_id ...)
     signals: Optional[Dict[str, Any]] = None
+    #: 공급자 Audit API 또는 합성 로그에서 받은 원본 이벤트. Token 원문은 넣지 않는다.
+    usage_events: List[Dict[str, Any]] = Field(default_factory=list, max_length=10000)
+    usage_data_complete: bool = False
+    usage_source: str = Field(default="audit_log", min_length=1, max_length=100)
+    usage_principal_aliases: List[str] = Field(default_factory=list, max_length=20)
+
+
+class SaaSInventoryAnalyzeRequest(BaseModel):
+    """공급자 중립 SaaS NHI 분석 요청."""
+
+    nhi: SaaSNHIInput
+    signals: Optional[Dict[str, Any]] = None
+    usage_events: List[Dict[str, Any]] = Field(default_factory=list, max_length=10000)
+    usage_data_complete: bool = False
+    usage_source: str = Field(default="audit_log", min_length=1, max_length=100)
+    usage_principal_aliases: List[str] = Field(default_factory=list, max_length=20)
+
+
+class UsageEventNormalizeRequest(BaseModel):
+    """공급자별 Audit Log를 공통 UsageEvent와 AnalysisSignals로 변환한다."""
+
+    nhi_id: str = Field(..., min_length=1, max_length=300)
+    principal_aliases: List[str] = Field(default_factory=list, max_length=20)
+    provider: str = Field(default="generic", min_length=1, max_length=100)
+    source: str = Field(default="audit_log", min_length=1, max_length=100)
+    declared_permissions: List[str] = Field(default_factory=list, max_length=100)
+    events: List[Dict[str, Any]] = Field(default_factory=list, max_length=10000)
+    data_complete: bool = False
+
+
+class MicrosoftDiscoveryRequest(BaseModel):
+    limit: int = Field(default=25, ge=1, le=100)
+    analyze: bool = True
+
+
+class GoogleDiscoveryRequest(BaseModel):
+    max_events: int = Field(default=200, ge=1, le=1000)
+    start_time: Optional[str] = Field(
+        default=None,
+        description="RFC3339 시작 시각. 생략하면 Google Reports API 기본 보존 범위를 사용한다.",
+    )
+    analyze: bool = True
+
+
+class RuntimeTokenIssueRequest(BaseModel):
+    """연구 경로에서 관리자 요청의 Agent ID에 DPoP-bound 단기 token을 발급한다."""
+
+    agent_id: str = Field(..., min_length=1, max_length=200)
+    scopes: List[str] = Field(default_factory=lambda: ["runtime:invoke"])
 
 
 class CredentialVerifyRequest(BaseModel):
@@ -243,6 +316,221 @@ def _require_admin_key(provided: Optional[str]) -> None:
         raise HTTPException(status_code=401, detail="올바른 관리자 API Key 가 필요합니다.")
 
 
+_runtime_replay_cache = InMemoryReplayCache()
+
+
+def _runtime_token_service() -> RuntimeTokenService:
+    settings = get_settings().runtime_security
+    return RuntimeTokenService(
+        signing_key=settings.token_signing_key,
+        issuer=settings.issuer,
+        audience=settings.audience,
+        token_ttl_seconds=settings.token_ttl_seconds,
+        proof_max_age_seconds=settings.dpop_proof_max_age_seconds,
+        clock_skew_seconds=settings.dpop_clock_skew_seconds,
+        replay_cache=_runtime_replay_cache,
+    )
+
+
+def _runtime_htu(request: Request) -> str:
+    """X-Forwarded-*를 신뢰하지 않고 설정된 public origin 또는 실제 URL을 사용한다."""
+    public_base = get_settings().runtime_security.public_base_url.strip()
+    if public_base:
+        return f"{public_base.rstrip('/')}{request.url.path}"
+    return str(request.url).split("#", 1)[0].split("?", 1)[0]
+
+
+def _single_runtime_header(
+    request: Request, name: str, provided: Optional[str]
+) -> Optional[str]:
+    values = request.headers.getlist(name)
+    if len(values) > 1:
+        raise TokenBindingError(
+            "duplicate_security_header", f"{name} header는 하나만 허용됩니다."
+        )
+    return provided
+
+
+def _runtime_source_context(request: Request) -> Dict[str, Any]:
+    return {
+        "source_ip": request.client.host if request.client else None,
+        "user_agent": request.headers.get("user-agent", "")[:300],
+        "forwarded_headers_trusted": False,
+    }
+
+
+def _runtime_audit(
+    *,
+    request: Request,
+    decision: str,
+    reason: str,
+    agent_id: Optional[str] = None,
+    detail: Optional[Dict[str, Any]] = None,
+) -> str:
+    safe_detail = {
+        "decision": decision,
+        "reason": reason,
+        "method": request.method,
+        "path": request.url.path,
+        **_runtime_source_context(request),
+        **(detail or {}),
+    }
+    event_id = storage.append_audit_event(
+        f"RUNTIME_ACCESS_{decision}",
+        actor=agent_id or "unauthenticated-agent",
+        target=request.url.path,
+        detail=safe_detail,
+    )
+    replay_suspected = bool(safe_detail.get("token_replay_suspected"))
+    signals = {
+        "token_replay_suspected": replay_suspected,
+        "sender_constrained": safe_detail.get("sender_constrained"),
+        "token_binding_method": safe_detail.get("token_binding_method"),
+        "request_source_ip": safe_detail.get("source_ip"),
+        "request_user_agent": safe_detail.get("user_agent"),
+        "observed_actions": [f"{request.method} {request.url.path}"],
+    }
+    storage.save_observation(
+        CredentialObservation(
+            source_type="runtime_dpop_gateway",
+            source_event_id=event_id,
+            provider="internal_runtime",
+            raw_type="DPOP_BOUND_ACCESS_TOKEN",
+            fingerprint=f"nhi:runtime:{agent_id or 'unknown'}",
+            masked_value="dpop-bound-token",
+            evidence=[
+                Evidence(
+                    source="runtime_gateway",
+                    field="access_decision",
+                    value={"decision": decision, "reason": reason},
+                    confidence=1.0,
+                )
+            ],
+            raw_metadata={
+                "agent_id": agent_id,
+                "analysis_signals": signals,
+                **safe_detail,
+            },
+        )
+    )
+    return event_id
+
+
+def _persist_runtime_replay_analysis(
+    *,
+    trigger_event_id: str,
+    agent_id: str,
+    request: Request,
+    detail: Dict[str, Any],
+) -> None:
+    """차단 이벤트를 기존 NHI 위험 엔진에 자동 입력한다.
+
+    인증 차단은 분석 저장 실패와 무관하게 유지되어야 하므로 실패는 기록만 하고
+    호출자에게 내부 오류를 노출하지 않는다.
+    """
+    source = _runtime_source_context(request)
+    signals = AnalysisSignals(
+        agent_name=agent_id,
+        agent_status="active",
+        observed_actions=[f"{request.method} {request.url.path}"],
+        token_replay_suspected=True,
+        sender_constrained=True,
+        token_binding_method="DPoP",
+        request_source_ip=source.get("source_ip"),
+        request_user_agent=source.get("user_agent"),
+    )
+    inventory = SaaSNHIInput(
+        provider="runtime",
+        nhi_id=agent_id,
+        nhi_name=agent_id,
+        nhi_type=NHIType.AI_AGENT_CREDENTIAL,
+        active=True,
+        raw_scopes=[
+            str(scope)
+            for scope in detail.get("scopes", [])
+            if isinstance(scope, str) and scope
+        ],
+        connected_services=["internal_api_gateway"],
+        account={
+            "token_binding_method": "DPoP",
+            "binding_jkt": detail.get("binding_jkt"),
+        },
+    )
+    try:
+        analysis = nhi_pipeline.analyze_saas_nhi(inventory, signals=signals)
+        persistence = persist_analysis(storage, analysis, input_revision=trigger_event_id)
+        storage.append_audit_event(
+            "RUNTIME_REPLAY_ANALYZED",
+            actor="nhi-risk-engine",
+            target=agent_id,
+            detail={
+                "trigger_event_id": trigger_event_id,
+                "risk_level": analysis.risk.level.value,
+                "risk_score": analysis.risk.score,
+                "forced_rules": [
+                    item["rule_id"] for item in analysis.risk.forced_rules
+                ],
+                **persistence,
+            },
+        )
+    except Exception:
+        logger.exception("runtime replay incident 분석 저장 실패 (agent_id=%s)", agent_id)
+
+
+def _runtime_deny_response(
+    exc: TokenBindingError,
+    *,
+    request: Request,
+    stage: str,
+    agent_id: Optional[str] = None,
+) -> JSONResponse:
+    agent_id = agent_id or exc.context.get("agent_id")
+    replay_suspected = exc.code in {
+        "dpop_proof_replay",
+        "sender_key_mismatch",
+        "dpop_token_hash_mismatch",
+    }
+    event_id = _runtime_audit(
+        request=request,
+        decision="DENY",
+        reason=exc.code,
+        agent_id=agent_id,
+        detail={
+            "stage": stage,
+            "token_replay_suspected": replay_suspected,
+            "sender_constrained": True if agent_id else None,
+            "token_binding_method": "DPoP",
+            **{
+                key: value
+                for key, value in exc.context.items()
+                if key in {"token_jti", "binding_jkt", "proof_jkt", "proof_jti"}
+            },
+        },
+    )
+    if replay_suspected and agent_id:
+        _persist_runtime_replay_analysis(
+            trigger_event_id=event_id,
+            agent_id=agent_id,
+            request=request,
+            detail=exc.context,
+        )
+    status_code = exc.status_code
+    if stage == "token_issuance" and status_code == 401:
+        status_code = 400
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "decision": "DENY",
+            "authenticated_as": None,
+            "reason": exc.code,
+            "message": exc.message,
+            "audit_event_id": event_id,
+            "source_context": _runtime_source_context(request),
+        },
+        headers={"WWW-Authenticate": 'DPoP error="invalid_dpop_proof"'},
+    )
+
+
 def _seal_findings(findings: Sequence[SecretFinding]) -> None:
     material_store = _secret_material_store()
     if material_store is None:
@@ -289,16 +577,121 @@ def service_info() -> Dict[str, Any]:
             "scan": "POST /scans",
             "nhi_analysis_from_scan": "POST /nhi/analyze",
             "nhi_analysis_from_inventory": "POST /nhi/inventory/analyze",
-            "agent": "POST /agent/nhi/run",
+            "saas_discovery": "POST /integrations/{github|microsoft|google}/discover",
+            "agent_access_profiles": "PUT|GET /agent-access/profiles",
+            "agent_access_evaluation": "POST /agent-access/evaluate",
+            "agent_access_decisions": "GET /agent-access/decisions",
+            "research_dpop_token": "POST /runtime/tokens/issue",
+            "research_protected_runtime": "GET|POST /runtime/protected",
+            "analysis_orchestrator": "POST /agent/nhi/run",
             "dashboard": "GET /dashboard/",
+            "competition_dashboard": "GET /competition/",
             "docs": "GET /docs",
         },
+        "operational_limitations": [
+            "실제 차단은 사내 API Gateway가 /agent-access/evaluate 결과를 적용해야 함",
+            "IdP/RBAC 및 공급자별 전체 인벤토리 동기화는 아직 미구현",
+            "/runtime/*는 DPoP 연구 검증용이며 회사 Agent Registry를 대체하지 않음",
+        ],
     }
 
 
 @app.get("/health")
 def health() -> Dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/runtime/tokens/issue")
+def issue_runtime_token(
+    body: RuntimeTokenIssueRequest,
+    request: Request,
+    dpop: Optional[str] = Header(default=None, alias="DPoP"),
+    x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
+) -> JSONResponse:
+    """검증된 DPoP public key에 바인딩된 단기 AI Agent token을 발급한다.
+
+    이 프로젝트에는 별도 IdP/계정 DB가 없으므로 관리자 key가 Agent 승인을 대신한다.
+    운영 환경에서는 이 발급 경계를 조직 IdP 또는 workload identity provider로 교체한다.
+    """
+    _require_admin_key(x_nhi_admin_key)
+    try:
+        token = _runtime_token_service().issue_token(
+            agent_id=body.agent_id,
+            scopes=body.scopes,
+            dpop_proof=_single_runtime_header(request, "DPoP", dpop),
+            method=request.method,
+            htu=_runtime_htu(request),
+        )
+    except TokenBindingError as exc:
+        return _runtime_deny_response(exc, request=request, stage="token_issuance")
+
+    event_id = _runtime_audit(
+        request=request,
+        decision="ALLOW",
+        reason="dpop_bound_token_issued",
+        agent_id=body.agent_id,
+        detail={
+            "stage": "token_issuance",
+            "token_type": token["token_type"],
+            "token_jti": token["token_jti"],
+            "proof_jti": token["proof_jti"],
+            "binding_jkt": token["cnf"]["jkt"],
+            "sender_constrained": True,
+            "token_binding_method": "DPoP",
+        },
+    )
+    response_body = {
+        key: value for key, value in token.items() if key not in {"proof_jti", "token_jti"}
+    }
+    response_body["audit_event_id"] = event_id
+    return JSONResponse(
+        content=response_body,
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
+
+
+@app.get("/runtime/protected")
+@app.post("/runtime/protected")
+def runtime_protected_resource(
+    request: Request,
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    dpop: Optional[str] = Header(default=None, alias="DPoP"),
+) -> Any:
+    """token 문자열뿐 아니라 Agent private key 보유까지 증명해야 하는 보호 API."""
+    try:
+        principal = _runtime_token_service().authorize(
+            authorization=_single_runtime_header(request, "Authorization", authorization),
+            dpop_proof=_single_runtime_header(request, "DPoP", dpop),
+            method=request.method,
+            htu=_runtime_htu(request),
+        )
+    except TokenBindingError as exc:
+        return _runtime_deny_response(exc, request=request, stage="resource_access")
+
+    event_id = _runtime_audit(
+        request=request,
+        decision="ALLOW",
+        reason="dpop_proof_verified",
+        agent_id=principal.agent_id,
+        detail={
+            "stage": "resource_access",
+            "token_jti": principal.token_id,
+            "proof_jti": principal.proof_jti,
+            "binding_jkt": principal.binding_jkt,
+            "sender_constrained": True,
+            "token_binding_method": "DPoP",
+        },
+    )
+    return {
+        "decision": "ALLOW",
+        "authenticated_as": principal.agent_id,
+        "token_type": "DPoP",
+        "binding_method": "DPoP-ES256",
+        "scopes": list(principal.scopes),
+        "token_expires_at": principal.expires_at,
+        "audit_event_id": event_id,
+        "source_context": _runtime_source_context(request),
+    }
 
 
 @app.post("/repositories", status_code=201)
@@ -500,6 +893,33 @@ def analyze_nhi(body: NHIAnalyzeRequest) -> Dict[str, Any]:
     return payload
 
 
+@app.get("/nhi/{nhi_id}/history/compare")
+def compare_nhi_analysis_history(
+    nhi_id: str,
+    base_analysis_id: Optional[str] = None,
+    target_analysis_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """동일 NHI의 두 분석을 비교해 위험·정책·권한·권고 변화를 반환한다."""
+    try:
+        return AnalysisHistoryService(storage).compare(
+            nhi_id,
+            base_analysis_id=base_analysis_id,
+            target_analysis_id=target_analysis_id,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=exc.args[0]) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/nhi/{nhi_id}/history")
+def get_nhi_analysis_history(nhi_id: str, limit: int = 100) -> Dict[str, Any]:
+    """NHI에 연결된 분석 결정 이력을 최신순으로 조회한다."""
+    return AnalysisHistoryService(storage).list_history(
+        nhi_id, limit=min(max(limit, 1), 500)
+    )
+
+
 @app.get("/nhi/{owner}/{repo}")
 def get_nhi_analysis(
     owner: str, repo: str, repository_public: Optional[bool] = None
@@ -539,6 +959,43 @@ def get_blast_radius(owner: str, repo: str) -> Dict[str, Any]:
     }
 
 
+def _signals_from_usage_events(
+    *,
+    nhi_id: str,
+    provider: str,
+    raw_signals: Optional[Dict[str, Any]],
+    records: List[Dict[str, Any]],
+    data_complete: bool,
+    source: str,
+    principal_aliases: Sequence[str] = (),
+    declared_permissions: Sequence[str] = (),
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Audit Log를 NHI 분석 신호로 병합하고 수집 완전성 근거를 만든다."""
+    adapter = UsageEventAdapter()
+    adaptation = adapter.adapt(records, provider=provider, source=source)
+    # 파싱 실패가 한 건이라도 있으면 요청자가 complete=true라고 했더라도 실제
+    # 분석 범위는 불완전하다. 실패를 무시한 채 '미사용'을 확정하지 않는다.
+    effective_complete = data_complete and not adaptation.failures
+    derived = adapter.to_signals(
+        adaptation.events,
+        principal_ids=[nhi_id, *principal_aliases],
+        declared_permissions=declared_permissions,
+        data_complete=effective_complete,
+    )
+    merged = adapter.merge_into_signals(
+        AnalysisSignals.from_dict(raw_signals), derived
+    )
+    summary = {
+        **adaptation.summary(),
+        "matched_event_count": derived.extra["usage_event_count"],
+        "requested_data_complete": data_complete,
+        "effective_data_complete": effective_complete,
+        "principal_count": 1 + len(principal_aliases),
+        "source": sanitize_security_text(source),
+    }
+    return merged.to_dict(), summary
+
+
 @app.post("/nhi/inventory/analyze")
 def analyze_inventory_nhi(body: InventoryAnalyzeRequest) -> Dict[str, Any]:
     """GitHub NHI 정보를 직접 받아 분석한다.
@@ -549,11 +1006,25 @@ def analyze_inventory_nhi(body: InventoryAnalyzeRequest) -> Dict[str, Any]:
     """
     observation = observation_from_inventory(body.nhi)
     storage.save_observation(observation)
-    analysis = nhi_pipeline.analyze_github_nhi(body.nhi, signals=body.signals)
+    usage_ingestion = None
+    signals = body.signals
+    if body.usage_events or body.usage_data_complete:
+        signals, usage_ingestion = _signals_from_usage_events(
+            nhi_id=body.nhi.nhi_id,
+            provider="github",
+            raw_signals=body.signals,
+            records=body.usage_events,
+            data_complete=body.usage_data_complete,
+            source=body.usage_source,
+            principal_aliases=body.usage_principal_aliases,
+        )
+    analysis = nhi_pipeline.analyze_github_nhi(body.nhi, signals=signals)
     payload = analysis.to_dict()
     payload["persistence"] = persist_analysis(
         storage, analysis, input_revision=observation.source_event_id
     )
+    if usage_ingestion is not None:
+        payload["usage_ingestion"] = usage_ingestion
     return payload
 
 
@@ -662,6 +1133,49 @@ def analyze_aws_inventory_from_api() -> Dict[str, Any]:
     return payload
 
 
+@app.post("/nhi/inventory/saas/analyze")
+def analyze_saas_inventory_nhi(body: SaaSInventoryAnalyzeRequest) -> Dict[str, Any]:
+    """Microsoft/Google 등 공급자 중립 SaaS NHI를 기존 정책 엔진으로 분석한다."""
+    observation = observation_from_saas_inventory(body.nhi)
+    storage.save_observation(observation)
+    usage_ingestion = None
+    signals = body.signals
+    if body.usage_events or body.usage_data_complete:
+        signals, usage_ingestion = _signals_from_usage_events(
+            nhi_id=body.nhi.nhi_id,
+            provider=body.nhi.provider,
+            raw_signals=body.signals,
+            records=body.usage_events,
+            data_complete=body.usage_data_complete,
+            source=body.usage_source,
+            principal_aliases=body.usage_principal_aliases,
+        )
+    analysis = nhi_pipeline.analyze_saas_nhi(body.nhi, signals=signals)
+    payload = analysis.to_dict()
+    payload["persistence"] = persist_analysis(
+        storage, analysis, input_revision=observation.source_event_id
+    )
+    if usage_ingestion is not None:
+        payload["usage_ingestion"] = usage_ingestion
+    return payload
+
+
+@app.post("/nhi/usage/normalize")
+def normalize_usage_events(body: UsageEventNormalizeRequest) -> Dict[str, Any]:
+    """원본 감사 이벤트를 NHI 파이프라인 입력용 AnalysisSignals로 정규화한다."""
+    signals, summary = _signals_from_usage_events(
+        nhi_id=body.nhi_id,
+        provider=body.provider,
+        raw_signals=None,
+        records=body.events,
+        data_complete=body.data_complete,
+        source=body.source,
+        principal_aliases=body.principal_aliases,
+        declared_permissions=body.declared_permissions,
+    )
+    return {**summary, "signals": signals}
+
+
 @app.post("/nhi/scopes/translate")
 def translate_scopes(body: ScopeTranslateRequest) -> Dict[str, Any]:
     """서비스별 Scope → 공통 권한(Read/Write/Delete/Admin) 변환."""
@@ -672,11 +1186,144 @@ def translate_scopes(body: ScopeTranslateRequest) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Agent 실행 — 목표를 받아 계획을 세우고 도구를 고른다
+# 회사 AI Agent 접근 기준선 / 위장·범위 초과 API 호출 판정
+# ---------------------------------------------------------------------------
+def _load_agent_access_profile(agent_id: str) -> Optional[AgentAccessProfile]:
+    data = storage.get_agent_access_profile(agent_id)
+    if data is None:
+        return None
+    try:
+        return AgentAccessProfile.model_validate(data)
+    except ValueError as exc:
+        logger.exception("저장된 Agent 접근 기준선 복원 실패 (agent_id=%s)", agent_id)
+        raise HTTPException(status_code=500, detail="저장된 Agent 접근 기준선이 올바르지 않습니다.") from exc
+
+
+@app.get("/agent-access/rules")
+def list_agent_access_rules() -> Dict[str, Any]:
+    """위장·권한 초과·정보 접근 판정 규칙 카탈로그."""
+    rules = agent_access_evaluator.rule_catalog()
+    return {"count": len(rules), "rules": rules}
+
+
+@app.put("/agent-access/profiles/{agent_id}")
+def upsert_agent_access_profile(
+    agent_id: str,
+    body: AgentAccessProfile,
+    x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
+) -> Dict[str, Any]:
+    """회사에서 승인한 Agent ↔ NHI ↔ 권한·자원 기준선을 등록·갱신한다."""
+    _require_admin_key(x_nhi_admin_key)
+    if agent_id != body.agent_id:
+        raise HTTPException(status_code=409, detail="URL과 본문의 agent_id가 다릅니다.")
+    existing = storage.get_agent_access_profile(agent_id)
+    now = datetime.now(timezone.utc).isoformat()
+    profile = body.model_copy(
+        update={
+            "created_at": (
+                str(existing.get("created_at"))
+                if isinstance(existing, dict) and existing.get("created_at")
+                else now
+            ),
+            "updated_at": now,
+        },
+        deep=True,
+    )
+    payload = profile.model_dump(mode="json")
+    payload["metadata"] = sanitize_security_value(payload.get("metadata") or {})
+    storage.upsert_agent_access_profile(agent_id, payload)
+    storage.append_audit_event(
+        "AGENT_ACCESS_PROFILE_UPSERTED",
+        actor="admin-api",
+        target=agent_id,
+        detail={
+            "grant_count": len(profile.grants),
+            "inventory_complete": profile.inventory_complete,
+            "require_sender_constraint": profile.require_sender_constraint,
+        },
+    )
+    return payload
+
+
+@app.get("/agent-access/profiles")
+def list_agent_access_profiles(
+    limit: int = 100,
+    x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
+) -> Dict[str, Any]:
+    """등록된 회사 AI Agent 접근 기준선을 조회한다."""
+    _require_admin_key(x_nhi_admin_key)
+    profiles = storage.list_agent_access_profiles(limit=min(max(limit, 1), 500))
+    return {"count": len(profiles), "profiles": profiles}
+
+
+@app.get("/agent-access/profiles/{agent_id}/scope")
+def get_agent_access_scope(
+    agent_id: str,
+    x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
+) -> Dict[str, Any]:
+    """Agent가 어떤 NHI로 어떤 권한·자원까지 접근 가능한지 요약한다."""
+    _require_admin_key(x_nhi_admin_key)
+    profile = _load_agent_access_profile(agent_id)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="Agent 접근 기준선을 찾을 수 없습니다.")
+    return agent_access_evaluator.summarize_scope(profile)
+
+
+@app.post("/agent-access/evaluate")
+def evaluate_agent_api_access(
+    body: AgentApiObservation,
+    x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
+) -> Dict[str, Any]:
+    """Gateway/Audit Log 호출을 승인 기준선과 비교해 ALLOW/REVIEW/DENY한다.
+
+    악의적 의도 자체를 추측하지 않는다. 인증 주체 불일치, Token/proof 재사용,
+    승인 NHI·Credential·권한·자원 초과처럼 검증 가능한 사실만 판정한다.
+    """
+    _require_admin_key(x_nhi_admin_key)
+    profile = _load_agent_access_profile(body.claimed_agent_id)
+    decision = agent_access_evaluator.evaluate(profile, body)
+    payload = decision.model_dump(mode="json")
+    storage.save_agent_access_decision(payload)
+    storage.append_audit_event(
+        "AGENT_API_ACCESS_EVALUATED",
+        actor=body.authenticated_agent_id or "unverified-agent",
+        target=body.claimed_agent_id,
+        detail={
+            "decision_id": decision.decision_id,
+            "event_id": decision.event_id,
+            "outcome": decision.outcome.value,
+            "overall_severity": (
+                decision.overall_severity.value if decision.overall_severity else None
+            ),
+            "rule_ids": [finding.rule_id for finding in decision.findings],
+        },
+    )
+    return payload
+
+
+@app.get("/agent-access/decisions")
+def list_agent_access_decisions(
+    agent_id: Optional[str] = None,
+    outcome: Optional[AgentAccessOutcome] = None,
+    limit: int = 100,
+    x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
+) -> Dict[str, Any]:
+    """Agent API 접근 판정 이력. outcome=DENY로 위장·범위 초과 후보만 조회 가능."""
+    _require_admin_key(x_nhi_admin_key)
+    decisions = storage.list_agent_access_decisions(
+        agent_id=agent_id,
+        outcome=outcome.value if outcome else None,
+        limit=min(max(limit, 1), 500),
+    )
+    return {"count": len(decisions), "decisions": decisions}
+
+
+# ---------------------------------------------------------------------------
+# 분석 Orchestrator — 목표를 받아 계획을 세우고 보안 도구를 고른다
 # ---------------------------------------------------------------------------
 @app.post("/agent/nhi/run")
-def run_agent(body: NHIAgentRequest) -> Dict[str, Any]:
-    """NHI 분석 Agent 실행.
+def run_analysis_orchestrator(body: NHIAgentRequest) -> Dict[str, Any]:
+    """NHI 분석 Orchestrator 실행.
 
     기본 분석을 먼저 수행하고, 그 결과를 보고 추가 도구(저장소 Secret 스캔 /
     정책 판정 정리)를 실행할지 정한다. 위험 등급이 낮으면 허용됐더라도 스캔하지 않는다.
@@ -875,6 +1522,16 @@ def register_github_connector(body: ConnectorCreateRequest) -> Dict[str, Any]:
 @app.post("/connectors/slack", status_code=201)
 def register_slack_connector(body: ConnectorCreateRequest) -> Dict[str, Any]:
     return _register_connector("slack", body)
+
+
+@app.post("/connectors/microsoft", status_code=201)
+def register_microsoft_connector(body: ConnectorCreateRequest) -> Dict[str, Any]:
+    return _register_connector("microsoft", body)
+
+
+@app.post("/connectors/google", status_code=201)
+def register_google_connector(body: ConnectorCreateRequest) -> Dict[str, Any]:
+    return _register_connector("google_workspace", body)
 
 
 @app.get("/connectors/status")
@@ -1153,29 +1810,301 @@ def summary_report(format: str = "json") -> Any:
 
 
 # ---------------------------------------------------------------------------
+# GitHub / Microsoft 365 / Google Workspace NHI Discovery
+# ---------------------------------------------------------------------------
+def _github_agent_run_summary(
+    state,
+    *,
+    persistence_succeeded: int,
+    persistence_failures: Sequence[Dict[str, str]],
+) -> Dict[str, Any]:
+    """민감하거나 큰 원문 없이 GitHub 수집 Agent 실행을 감사 가능한 형태로 요약한다."""
+    collection = state.github_collection_result or {}
+    scan = state.secret_scan_result or {}
+    analyses = state.inventory_analyses
+    inventory = state.collected_inventory
+    repository_complete = sum(
+        1 for item in inventory if item.repository_inventory_complete
+    )
+    security_event_count = sum(len(item.security_events) for item in analyses)
+    scenario_count = sum(len(item.scenario_matches) for item in analyses)
+    forced_critical_count = sum(
+        1
+        for analysis in analyses
+        for scenario in analysis.scenario_matches
+        if scenario.forced_critical
+    )
+    plan = [
+        {
+            "step": action.step,
+            "action_type": action.action_type.value,
+            "created_by": action.created_by.value,
+            "completed": action.completed,
+            "failed": action.failed,
+            "reason": sanitize_security_text(action.reason),
+            "error_message": (
+                sanitize_security_text(action.error_message)
+                if action.error_message
+                else None
+            ),
+        }
+        for action in state.plan
+    ]
+    return {
+        "kind": "github_inventory_agent_run",
+        "organization": getattr(state.request, "organization", "unknown"),
+        "status": state.status.value,
+        "replan_count": state.replan_count,
+        "replan_notes": [sanitize_security_text(note) for note in state.replan_notes],
+        "plan": plan,
+        "collection": {
+            "count": collection.get("count", len(inventory)),
+            "total_count": collection.get("total_count"),
+            "pages_fetched": collection.get("pages_fetched", 0),
+            "inventory_complete": collection.get("inventory_complete") is True,
+            "retrieval_truncated": collection.get("truncated") is True,
+            "failure_count": len(collection.get("failures") or []),
+            "coverage_note": sanitize_security_text(collection.get("coverage_note")),
+        },
+        "repository_coverage": {
+            "complete_count": repository_complete,
+            "incomplete_count": len(inventory) - repository_complete,
+            "note": (
+                "미수집 저장소 범위는 0개 접근이 아니라 UNKNOWN으로 해석한다."
+            ),
+        },
+        "analysis": {
+            "count": len(analyses),
+            "usage_complete_count": sum(
+                1 for item in analyses if item.usage_analysis.data_complete
+            ),
+            "event_count": security_event_count,
+            "scenario_count": scenario_count,
+            "forced_critical_count": forced_critical_count,
+        },
+        "secret_scan": {
+            "scan_executed": scan.get("scan_executed"),
+            "scan_complete": scan.get("scan_complete") is True,
+            "planned": scan.get("repository_count_planned", 0),
+            "scanned": scan.get("repository_count_scanned", 0),
+            "failed": scan.get("repository_count_failed", 0),
+            "skipped": scan.get("repository_count_skipped", 0),
+            "finding_count": scan.get("finding_count"),
+            "reason": sanitize_security_text(scan.get("reason")),
+        },
+        "persistence": {
+            "succeeded": persistence_succeeded,
+            "failed": len(persistence_failures),
+            "complete": not persistence_failures,
+            "failures": list(persistence_failures),
+        },
+    }
+
+
+@app.post("/integrations/github/discover")
+def discover_github_nhi(
+    body: GitHubInventoryAgentRequest,
+    x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
+) -> Dict[str, Any]:
+    """조직의 GitHub App installation을 수집하고 선택적으로 전건 분석한다.
+
+    서버 설정의 수집 전용 ``GITHUB_INVENTORY_TOKEN``만 사용한다. 조직 계정은
+    installation 대상일 뿐 보안 Owner가 아니므로 Owner로 자동 지정하지 않는다.
+    """
+    _require_admin_key(x_nhi_admin_key)
+    registry = build_tool_registry(
+        collection_connector_factory=GitHubConnector.for_inventory,
+        connector_factory=GitHubConnector,
+    )
+    state = run_nhi_agent(body, registry=registry)
+    if state.status.value == "FAILED":
+        raise HTTPException(
+            status_code=state.error_status_code or 502,
+            detail=state.error_message or "GitHub 조직 인벤토리 Agent 실행 실패",
+        )
+
+    payload = state.to_dict()
+    analyses_by_nhi_id = {
+        analysis.profile.nhi_id: analysis for analysis in state.inventory_analyses
+    }
+    observation_ids: List[str] = []
+    persistence: List[Dict[str, Any]] = []
+    persistence_failures: List[Dict[str, str]] = []
+    for item in state.collected_inventory:
+        try:
+            observation = observation_from_inventory(item)
+            observation_ids.append(storage.save_observation(observation))
+        except Exception as exc:  # 실행 전체를 성공처럼 숨기지 않고 item 단위로 보고한다.
+            logger.exception("GitHub inventory observation 저장 실패: %s", item.nhi_id)
+            persistence_failures.append(
+                {
+                    "nhi_id": item.nhi_id,
+                    "stage": "observation",
+                    "error": type(exc).__name__,
+                }
+            )
+            continue
+        analysis = analyses_by_nhi_id.get(f"github:{item.nhi_id}")
+        if analysis is None:
+            if body.analyze:
+                persistence_failures.append(
+                    {
+                        "nhi_id": item.nhi_id,
+                        "stage": "analysis",
+                        "error": "AnalysisMissing",
+                    }
+                )
+            continue
+        try:
+            saved = persist_analysis(
+                storage, analysis, input_revision=observation.source_event_id
+            )
+            persistence.append({"nhi_id": item.nhi_id, **saved})
+        except Exception as exc:
+            logger.exception("GitHub inventory analysis 저장 실패: %s", item.nhi_id)
+            persistence_failures.append(
+                {
+                    "nhi_id": item.nhi_id,
+                    "stage": "analysis",
+                    "error": type(exc).__name__,
+                }
+            )
+    run_summary = _github_agent_run_summary(
+        state,
+        persistence_succeeded=len(persistence),
+        persistence_failures=persistence_failures,
+    )
+    audit_event_id = storage.append_audit_event(
+        "GITHUB_INVENTORY_AGENT_COMPLETED",
+        actor="github-inventory-agent",
+        target=body.organization,
+        detail=run_summary,
+    )
+    payload["observation_ids"] = observation_ids
+    payload["persistence"] = persistence
+    payload["persistence_failures"] = persistence_failures
+    payload["run_summary"] = run_summary
+    payload["audit_event_id"] = audit_event_id
+    return payload
+
+
+def _persist_discovered_inventory(
+    items: Sequence[SaaSNHIInput], *, analyze: bool
+) -> Dict[str, Any]:
+    inventory: List[Dict[str, Any]] = []
+    analyses: List[Dict[str, Any]] = []
+    observation_ids: List[str] = []
+    for item in items:
+        observation = observation_from_saas_inventory(item)
+        observation_ids.append(storage.save_observation(observation))
+        inventory.append(item.model_dump(mode="json"))
+        if analyze:
+            analysis = nhi_pipeline.analyze_saas_nhi(item)
+            payload = analysis.to_dict()
+            payload["persistence"] = persist_analysis(
+                storage, analysis, input_revision=observation.source_event_id
+            )
+            analyses.append(payload)
+    return {
+        "count": len(inventory),
+        "inventory": inventory,
+        "analyzed": analyze,
+        "analyses": analyses,
+        "observation_ids": observation_ids,
+    }
+
+
+@app.post("/integrations/microsoft/discover")
+def discover_microsoft_nhi(
+    body: MicrosoftDiscoveryRequest,
+    x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
+) -> Dict[str, Any]:
+    """Microsoft Graph에서 service principal과 OAuth/API 권한을 읽기 전용 수집한다."""
+    _require_admin_key(x_nhi_admin_key)
+    try:
+        with MicrosoftGraphConnector() as connector:
+            items = connector.discover_service_principals(limit=body.limit)
+    except ConnectorError as exc:
+        raise _http_error(exc)
+    payload = _persist_discovered_inventory(items, analyze=body.analyze)
+    payload["inventory_complete"] = False
+    payload["coverage_note"] = (
+        f"Microsoft Graph service principal 최대 {body.limit}건과 조회 가능한 권한·Owner 기준이며, "
+        "전사 전체 인벤토리 snapshot으로 단정하지 않습니다."
+    )
+    return payload
+
+
+@app.post("/integrations/google/discover")
+def discover_google_nhi(
+    body: GoogleDiscoveryRequest,
+    x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
+) -> Dict[str, Any]:
+    """Google Workspace OAuth Token 감사 이벤트를 Client ID별로 읽기 전용 수집한다."""
+    _require_admin_key(x_nhi_admin_key)
+    try:
+        with GoogleWorkspaceConnector() as connector:
+            items = connector.discover_oauth_clients(
+                max_events=body.max_events,
+                start_time=body.start_time,
+            )
+    except ConnectorError as exc:
+        raise _http_error(exc)
+    payload = _persist_discovered_inventory(items, analyze=body.analyze)
+    payload["coverage_note"] = (
+        "Google Admin Reports API 보존 기간 안에서 관측된 OAuth 이벤트 기준이며 "
+        "전체 현재 토큰 인벤토리로 단정하지 않습니다."
+    )
+    return payload
+
+
+# ---------------------------------------------------------------------------
 # Slack
 # ---------------------------------------------------------------------------
 @app.post("/integrations/slack/verify")
-def verify_slack_token(body: SlackVerifyRequest) -> Dict[str, Any]:
-    """Slack Token 유효성 / Scope / 접근 가능 채널 조회."""
+def verify_slack_token(
+    body: SlackVerifyRequest,
+    x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
+) -> Dict[str, Any]:
+    """서버에 설정된 Slack Token의 유효성·Scope·접근 가능 채널을 조회한다.
+
+    Token을 요청 body로 받으면 access log/APM에 원문이 남을 수 있으므로 허용하지 않는다.
+    """
+    _require_admin_key(x_nhi_admin_key)
+    token = get_settings().slack.bot_token
+    if not token:
+        raise HTTPException(status_code=503, detail="SLACK_BOT_TOKEN이 설정되지 않았습니다.")
     try:
-        with SlackConnector(body.token) as slack:
-            status = slack.validate_credential(body.token)
+        with SlackConnector(token) as slack:
+            status = slack.validate_credential()
             payload = status.to_dict()
             if status.active:
-                payload["bot"] = slack.get_bot_info(token=body.token)
-                payload["app"] = slack.get_app_info(token=body.token)
-                payload["workspace"] = slack.get_workspace_info(token=body.token)
+                payload["bot"] = slack.get_bot_info()
+                payload["app"] = slack.get_app_info()
+                payload["workspace"] = slack.get_workspace_info()
     except ConnectorError as exc:
         raise _http_error(exc)
     return payload
 
 
 @app.get("/integrations/slack/channels")
-def slack_channels(token: Optional[str] = None) -> Dict[str, Any]:
+def slack_channels(
+    request: Request,
+    x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
+) -> Dict[str, Any]:
+    """서버에 설정된 Slack Token으로 접근 가능한 채널을 조회한다."""
+    _require_admin_key(x_nhi_admin_key)
+    if request.query_params:
+        raise HTTPException(
+            status_code=400,
+            detail="Slack Token 또는 설정값을 query parameter로 전달할 수 없습니다.",
+        )
+    token = get_settings().slack.bot_token
+    if not token:
+        raise HTTPException(status_code=503, detail="SLACK_BOT_TOKEN이 설정되지 않았습니다.")
     try:
         with SlackConnector(token) as slack:
-            channels = slack.list_channels(token=token)
+            channels = slack.list_channels()
     except ConnectorError as exc:
         raise _http_error(exc)
     return {"count": len(channels), "channels": channels}
@@ -1226,6 +2155,15 @@ def _handle_webhook_safely(event_type: str, payload: Dict[str, Any], delivery_id
 
 
 # 정적 Dashboard 는 API route 등록 뒤에 mount 해 `/dashboard/summary` 를 가리지 않는다.
+_competition_dashboard_dir = (
+    Path(__file__).resolve().parents[1] / "frontend" / "competition_dashboard"
+)
+app.mount(
+    "/competition",
+    StaticFiles(directory=str(_competition_dashboard_dir), html=True),
+    name="competition-dashboard",
+)
+
 _dashboard_dir = Path(__file__).resolve().parents[1] / "frontend" / "dashboard"
 app.mount(
     "/dashboard",

@@ -102,4 +102,11 @@ class PolicyEvidenceAgent:
             else:
                 # 조회에 성공했고 실제로 0개임이 확인된 경우.
                 evidence.append(f"조회 결과 접근 가능한 {resource_label} 없음 (확인됨)")
+        if ctx.usage_analysis is not None:
+            evidence.append(
+                "Usage 분석 완료 "
+                f"(보안 이벤트 {len(ctx.security_events)}건, "
+                f"시나리오 일치 {len(ctx.scenario_matches or [])}건, "
+                f"데이터 완전성={ctx.usage_analysis.data_complete})"
+            )
         return evidence

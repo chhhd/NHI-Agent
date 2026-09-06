@@ -19,17 +19,17 @@ def test_pipeline_stores_usage_events_and_scenarios_before_existing_assessments(
 
     analysis = NHIAnalysisPipeline().analyze_finding(finding, signals=signals)
 
-    assert analysis.usage_analysis.days_since_last_used == 120
-    assert analysis.usage_analysis.usage_status == "stale"
+    assert analysis.permission_usage.days_since_last_used == 120
+    assert analysis.permission_usage.usage_status == "stale"
     assert analysis.events
-    assert analysis.scenario_matches
+    assert analysis.permission_scenario_matches
     assert {event.event_type for event in analysis.events} >= {
         "HIGH_RISK_SCOPE_GRANTED",
         "STALE_PERMISSION",
     }
-    assert "SCN_001" in {match.scenario_id for match in analysis.scenario_matches}
+    assert "SCN_001" in {match.scenario_id for match in analysis.permission_scenario_matches}
     scenario = next(
-        match for match in analysis.scenario_matches if match.scenario_id == "SCN_001"
+        match for match in analysis.permission_scenario_matches if match.scenario_id == "SCN_001"
     )
     disable_recommendations = [
         recommendation
@@ -48,9 +48,9 @@ def test_pipeline_stores_usage_events_and_scenarios_before_existing_assessments(
 def test_github_inventory_entry_point_uses_the_same_new_analysis_stages(high_risk_nhi):
     analysis = NHIAnalysisPipeline().analyze_github_nhi(high_risk_nhi)
 
-    assert analysis.usage_analysis is not None
+    assert analysis.permission_usage is not None
     assert isinstance(analysis.events, list)
-    assert isinstance(analysis.scenario_matches, list)
+    assert isinstance(analysis.permission_scenario_matches, list)
     assert analysis.risk is not None
     assert analysis.policy is not None
     assert analysis.recommendations

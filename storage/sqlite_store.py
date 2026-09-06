@@ -115,6 +115,30 @@ CREATE TABLE IF NOT EXISTS credential_nhi_bindings (
     PRIMARY KEY (fingerprint, nhi_id)
 );
 
+CREATE TABLE IF NOT EXISTS agent_access_profiles (
+    agent_id    TEXT PRIMARY KEY,
+    status      TEXT NOT NULL,
+    owner       TEXT,
+    updated_at  TEXT NOT NULL,
+    data        TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS agent_access_decisions (
+    decision_id TEXT PRIMARY KEY,
+    event_id    TEXT NOT NULL,
+    agent_id    TEXT NOT NULL,
+    outcome     TEXT NOT NULL,
+    severity    TEXT,
+    occurred_at TEXT NOT NULL,
+    data        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_access_decisions_agent
+    ON agent_access_decisions(agent_id, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_access_decisions_outcome
+    ON agent_access_decisions(outcome, occurred_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_access_decisions_event
+    ON agent_access_decisions(agent_id, event_id);
+
 CREATE TABLE IF NOT EXISTS analysis_runs (
     analysis_id     TEXT PRIMARY KEY,
     repository      TEXT,
@@ -722,6 +746,25 @@ class SQLiteStorage(Storage):
             rows = self._conn.execute(sql, args).fetchall()
         return [json.loads(row["data"]) for row in rows]
 
+    def list_nhi_analyses(
+        self, nhi_id: str, *, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Credential↔NHI binding을 기준으로 분석 이력을 최신순 조회한다."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT DISTINCT ar.data, ar.analyzed_at
+                FROM analysis_runs ar
+                JOIN credential_nhi_bindings binding
+                  ON binding.fingerprint = ar.fingerprint
+                WHERE binding.nhi_id=?
+                ORDER BY ar.analyzed_at DESC
+                LIMIT ?
+                """,
+                (nhi_id, limit),
+            ).fetchall()
+        return [json.loads(row["data"]) for row in rows]
+
     # -- 조치 요청 ------------------------------------------------------
     def create_action(self, action: ActionRequest) -> ActionRequest:
         payload = action.to_dict()
@@ -1210,6 +1253,102 @@ class SQLiteStorage(Storage):
         result["recent_analyses"] = [json.loads(item["data"]) for item in analyses]
         return result
 
+    # -- 회사 AI Agent 접근 기준선 / API 호출 판정 ----------------------
+    def upsert_agent_access_profile(
+        self, agent_id: str, data: Dict[str, Any]
+    ) -> None:
+        payload = dict(data)
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO agent_access_profiles
+                    (agent_id, status, owner, updated_at, data)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(agent_id) DO UPDATE SET
+                    status=excluded.status,
+                    owner=excluded.owner,
+                    updated_at=excluded.updated_at,
+                    data=excluded.data
+                """,
+                (
+                    agent_id,
+                    str(payload.get("status") or "UNKNOWN"),
+                    payload.get("owner"),
+                    str(payload.get("updated_at") or datetime.now(timezone.utc).isoformat()),
+                    json.dumps(payload, ensure_ascii=False),
+                ),
+            )
+            self._conn.commit()
+
+    def get_agent_access_profile(self, agent_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT data FROM agent_access_profiles WHERE agent_id=?", (agent_id,)
+            ).fetchone()
+        return json.loads(row["data"]) if row is not None else None
+
+    def list_agent_access_profiles(self, *, limit: int = 100) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT data FROM agent_access_profiles
+                ORDER BY updated_at DESC LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [json.loads(row["data"]) for row in rows]
+
+    def save_agent_access_decision(self, data: Dict[str, Any]) -> str:
+        payload = dict(data)
+        decision_id = str(payload["decision_id"])
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO agent_access_decisions
+                    (decision_id, event_id, agent_id, outcome, severity, occurred_at, data)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    decision_id,
+                    str(payload["event_id"]),
+                    str(payload["agent_id"]),
+                    str(payload["outcome"]),
+                    payload.get("overall_severity"),
+                    str(payload.get("evaluated_at") or datetime.now(timezone.utc).isoformat()),
+                    json.dumps(payload, ensure_ascii=False),
+                ),
+            )
+            self._conn.commit()
+        return decision_id
+
+    def list_agent_access_decisions(
+        self,
+        *,
+        agent_id: Optional[str] = None,
+        outcome: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        clauses: List[str] = []
+        values: List[Any] = []
+        if agent_id:
+            clauses.append("agent_id=?")
+            values.append(agent_id)
+        if outcome:
+            clauses.append("outcome=?")
+            values.append(outcome)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        values.append(limit)
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT data FROM agent_access_decisions
+                """
+                + where
+                + " ORDER BY occurred_at DESC LIMIT ?",
+                tuple(values),
+            ).fetchall()
+        return [json.loads(row["data"]) for row in rows]
+
     def dashboard_summary(self) -> Dict[str, Any]:
         with self._lock:
             project_count = self._conn.execute(
@@ -1220,6 +1359,21 @@ class SQLiteStorage(Storage):
             ).fetchone()["count"]
             credential_count = self._conn.execute(
                 "SELECT COUNT(DISTINCT fingerprint) AS count FROM finding_records"
+            ).fetchone()["count"]
+            agent_profile_count = self._conn.execute(
+                "SELECT COUNT(*) AS count FROM agent_access_profiles"
+            ).fetchone()["count"]
+            denied_agent_access_count = self._conn.execute(
+                """
+                SELECT COUNT(*) AS count FROM agent_access_decisions
+                WHERE outcome='DENY'
+                """
+            ).fetchone()["count"]
+            review_agent_access_count = self._conn.execute(
+                """
+                SELECT COUNT(*) AS count FROM agent_access_decisions
+                WHERE outcome='REVIEW'
+                """
             ).fetchone()["count"]
             risk_rows = self._conn.execute(
                 """
@@ -1277,6 +1431,9 @@ class SQLiteStorage(Storage):
             "project_count": project_count,
             "nhi_count": nhi_count,
             "credential_count": credential_count,
+            "agent_access_profile_count": agent_profile_count,
+            "denied_agent_access_count": denied_agent_access_count,
+            "review_agent_access_count": review_agent_access_count,
             "critical_high_findings": (
                 risk_distribution.get("CRITICAL", 0) + risk_distribution.get("HIGH", 0)
             ),

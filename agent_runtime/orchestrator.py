@@ -13,14 +13,20 @@ import logging
 from typing import Dict, Optional
 
 from agent_runtime.models import (
+    AgentRequest,
     AgentActionType,
     AgentStatus,
     NHIAgentRequest,
     NHIAgentState,
 )
 from agent_runtime.planner import create_agent_plan
-from agent_runtime.replanner import replan_after_analysis
+from agent_runtime.replanner import (
+    replan_after_analysis,
+    replan_after_collection,
+    replan_after_secret_scan,
+)
 from agent_runtime.tools import AGENT_TOOL_REGISTRY, AgentTool
+from connectors.base_connector import ConnectorError
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +35,7 @@ MAX_STEPS = 20
 
 
 def run_nhi_agent(
-    request: NHIAgentRequest,
+    request: AgentRequest,
     *,
     registry: Optional[Dict[AgentActionType, AgentTool]] = None,
 ) -> NHIAgentState:
@@ -71,10 +77,20 @@ def run_nhi_agent(
 
             # 기본 분석 직후 한 번만 재계획한다.
             if (
+                action.action_type is AgentActionType.COLLECT_GITHUB_DATA
+                and not state.replanned_after_collection
+            ):
+                replan_after_collection(state)
+            elif (
                 action.action_type is AgentActionType.ANALYZE_NHI
-                and state.replan_count == 0
+                and not state.replanned_after_analysis
             ):
                 replan_after_analysis(state)
+            elif (
+                action.action_type is AgentActionType.SCAN_SECRETS
+                and not state.replanned_after_secret_scan
+            ):
+                replan_after_secret_scan(state)
         else:
             state.status = AgentStatus.FAILED
             state.error_message = f"실행 단계 상한({MAX_STEPS})을 초과했습니다."
@@ -82,6 +98,10 @@ def run_nhi_agent(
     except Exception as error:
         state.status = AgentStatus.FAILED
         state.error_message = str(error)
-        logger.exception("Agent 실행 실패 (nhi=%s)", request.nhi.nhi_id)
+        if isinstance(error, ConnectorError):
+            state.error_status_code = error.status_code or 502
+        target = getattr(getattr(request, "nhi", None), "nhi_id", None)
+        target = target or getattr(request, "organization", "unknown")
+        logger.exception("Agent 실행 실패 (target=%s)", target)
 
     return state

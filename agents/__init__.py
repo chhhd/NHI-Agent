@@ -17,6 +17,7 @@ from agents.policy_evidence_agent import PolicyEvidenceAgent
 from agents.recommendation_agent import RecommendationAgent
 from agents.risk_scoring_agent import RiskScoringAgent
 from agents.scope_translation_agent import ScopeTranslationAgent, expand_permissions
+from agents.usage_analysis_agent import UsageAnalysisAgent
 
 __all__ = [
     "ContextAnalysisAgent",
@@ -26,6 +27,7 @@ __all__ = [
     "RecommendationAgent",
     "RiskScoringAgent",
     "ScopeTranslationAgent",
+    "UsageAnalysisAgent",
     "build_context",
     "build_profile",
     "build_signals",

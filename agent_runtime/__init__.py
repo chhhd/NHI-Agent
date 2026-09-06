@@ -17,16 +17,22 @@ from agent_runtime.models import (
     AgentAction,
     AgentActionType,
     AgentStatus,
+    GitHubInventoryAgentRequest,
     NHIAgentRequest,
     NHIAgentState,
 )
 from agent_runtime.orchestrator import run_nhi_agent
 from agent_runtime.planner import create_agent_plan
-from agent_runtime.replanner import replan_after_analysis
+from agent_runtime.replanner import (
+    replan_after_analysis,
+    replan_after_collection,
+    replan_after_secret_scan,
+)
 from agent_runtime.tools import (
     AGENT_TOOL_REGISTRY,
     AgentTool,
     AnalyzeNHITool,
+    CollectGitHubDataTool,
     PolicyEvaluationTool,
     SecretScanTool,
     build_tool_registry,
@@ -40,6 +46,8 @@ __all__ = [
     "AgentStatus",
     "AgentTool",
     "AnalyzeNHITool",
+    "CollectGitHubDataTool",
+    "GitHubInventoryAgentRequest",
     "NHIAgentRequest",
     "NHIAgentState",
     "PolicyEvaluationTool",
@@ -47,5 +55,7 @@ __all__ = [
     "build_tool_registry",
     "create_agent_plan",
     "replan_after_analysis",
+    "replan_after_collection",
+    "replan_after_secret_scan",
     "run_nhi_agent",
 ]

@@ -172,6 +172,32 @@ CREATE TABLE IF NOT EXISTS activities (
     metadata JSONB NOT NULL DEFAULT '{}'
 );
 
+-- 회사 AI Agent와 NHI/API 계정의 승인된 연결·접근 범위 기준선
+CREATE TABLE IF NOT EXISTS agent_access_profiles (
+    agent_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    owner TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    data JSONB NOT NULL
+);
+
+-- Gateway/Audit Log 호출을 기준선과 비교한 위장·범위 초과 판정 이력
+CREATE TABLE IF NOT EXISTS agent_access_decisions (
+    decision_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    severity TEXT,
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    data JSONB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_access_decisions_agent
+    ON agent_access_decisions(agent_id, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_agent_access_decisions_outcome
+    ON agent_access_decisions(outcome, occurred_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_access_decisions_event
+    ON agent_access_decisions(agent_id, event_id);
+
 CREATE TABLE IF NOT EXISTS risk_assessments (
     assessment_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     finding_id UUID REFERENCES findings(finding_id) ON DELETE CASCADE,

@@ -68,10 +68,12 @@ def test_safe_channels_returns_none_error_on_success():
         return httpx.Response(200, json={"ok": True, "channels": []})
 
     connector = SlackConnector("xoxb-token", client=_client(handler))
-    channels, error = connector._safe_channels("xoxb-token")
+    channels, error, complete, note = connector._safe_channels("xoxb-token")
 
     assert channels == []
     assert error is None
+    assert complete is False
+    assert note is not None
 
 
 def test_safe_channels_returns_failure_reason_on_missing_scope():
@@ -79,11 +81,13 @@ def test_safe_channels_returns_failure_reason_on_missing_scope():
         return httpx.Response(200, json={"ok": False, "error": "missing_scope"})
 
     connector = SlackConnector("xoxb-token", client=_client(handler))
-    channels, error = connector._safe_channels("xoxb-token")
+    channels, error, complete, note = connector._safe_channels("xoxb-token")
 
     assert channels == []
     assert error is not None
     assert "missing_scope" in error
+    assert complete is False
+    assert note is not None
 
 
 def test_validate_credential_propagates_channel_fetch_error():

@@ -116,6 +116,13 @@ class Storage(abc.ABC):
     ) -> List[Dict[str, Any]]:
         ...
 
+    @abc.abstractmethod
+    def list_nhi_analyses(
+        self, nhi_id: str, *, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """NHI에 연결된 분석 스냅샷을 최신순으로 반환한다."""
+        ...
+
     # -- 조치 요청 ------------------------------------------------------
     @abc.abstractmethod
     def create_action(self, action: ActionRequest) -> ActionRequest:
@@ -215,6 +222,37 @@ class Storage(abc.ABC):
 
     @abc.abstractmethod
     def get_nhi_record(self, nhi_id: str) -> Optional[Dict[str, Any]]:
+        ...
+
+    # -- 회사 AI Agent 접근 기준선 / API 호출 판정 ----------------------
+    @abc.abstractmethod
+    def upsert_agent_access_profile(
+        self, agent_id: str, data: Dict[str, Any]
+    ) -> None:
+        """Agent ↔ NHI ↔ 권한·자원 승인 기준선을 저장한다."""
+        ...
+
+    @abc.abstractmethod
+    def get_agent_access_profile(self, agent_id: str) -> Optional[Dict[str, Any]]:
+        ...
+
+    @abc.abstractmethod
+    def list_agent_access_profiles(self, *, limit: int = 100) -> List[Dict[str, Any]]:
+        ...
+
+    @abc.abstractmethod
+    def save_agent_access_decision(self, data: Dict[str, Any]) -> str:
+        """위장·권한/자원 초과 판정 결과를 영속화한다."""
+        ...
+
+    @abc.abstractmethod
+    def list_agent_access_decisions(
+        self,
+        *,
+        agent_id: Optional[str] = None,
+        outcome: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
         ...
 
     @abc.abstractmethod

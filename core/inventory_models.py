@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -72,7 +72,19 @@ class GitHubNHIInput(BaseModel):
     #: True = 검증 성공, False = 검증 시도했으나 실패 — 폐기로 단정하지 않고
     #: "상태 불명"으로 보수적으로 평가한다(`agents/inventory_adapter.py` 참고).
     credential_verified: Optional[bool] = None
+    #: GitHub API가 돌려준 설치 대상 계정. 보안 책임자(owner)와는 다른 개념이다.
+    account: Dict[str, Any] = Field(default_factory=dict)
     repositories: List[RepositoryInfo] = Field(default_factory=list)
+    #: all / selected. 조직 설치 목록 API는 선택 방식만 주고 저장소 이름은 주지 않는다.
+    repository_selection: Optional[str] = None
+    #: repositories 목록이 실제 접근 저장소 전체를 포함하는지 여부.
+    repository_inventory_complete: bool = True
+    #: 페이지 제한/항목 파싱 실패 없이 조직 App 설치 목록 전체를 수집했는지 여부.
+    inventory_is_complete: bool = True
+    collection_source: str = "manual_inventory"
+    collection_evidence: List[str] = Field(default_factory=list)
+    subscribed_events: List[str] = Field(default_factory=list)
+    suspended_at: Optional[datetime] = None
     #: GitHub App 권한 (자원: 수준). 예: {"contents": "write", "administration": "write"}
     raw_permissions: Dict[str, str] = Field(default_factory=dict)
     #: Classic PAT / OAuth Token 의 평면 Scope. 예: ["repo", "workflow", "admin:repo_hook"]
@@ -102,3 +114,36 @@ class GitHubNHIInput(BaseModel):
             if resource and resource.strip() and level and level.strip().lower() != "none"
         ]
         return scopes
+
+
+class SaaSAccessResource(BaseModel):
+    """SaaS NHI가 접근하는 공급자 중립 자원."""
+
+    name: str
+    resource_type: str = "service"
+    is_sensitive: bool = False
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class SaaSNHIInput(BaseModel):
+    """Microsoft/Google 등 SaaS API에서 발견한 NHI 표준 입력.
+
+    공급자 응답 원문이나 Credential 값은 담지 않는다. 분석에 필요한 식별자,
+    Scope, Owner, 접근 자원과 시간 정보만 보관한다.
+    """
+
+    provider: str = Field(..., min_length=1, examples=["microsoft"])
+    nhi_id: str = Field(..., min_length=1)
+    nhi_name: str = Field(..., min_length=1)
+    nhi_type: NHIType = NHIType.GENERIC_SERVICE_ACCOUNT
+    owner: Optional[str] = None
+    environment: Environment = Environment.UNKNOWN
+    active: Optional[bool] = None
+    raw_scopes: List[str] = Field(default_factory=list)
+    resources: List[SaaSAccessResource] = Field(default_factory=list)
+    connected_services: List[str] = Field(default_factory=list)
+    account: Dict[str, Any] = Field(default_factory=dict)
+    last_used_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+    last_rotated_at: Optional[datetime] = None

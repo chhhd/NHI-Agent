@@ -5,8 +5,8 @@ from core.nhi_models import (
     PermissionLevel,
     PermissionProfile,
     RiskLevel,
-    SecurityEvent,
-    UsageAnalysisResult,
+    PermissionUsageEvent,
+    PermissionUsageResult,
 )
 
 
@@ -14,7 +14,7 @@ def _extract(granted, *, used=None, unused=None, status="active", owner="team", 
     return EventExtractionAgent().extract(
         NHIProfile(nhi_id="nhi-test", nhi_name="test-bot", owner=owner),
         PermissionProfile(permissions=granted),
-        UsageAnalysisResult(
+        PermissionUsageResult(
             granted_permissions=granted,
             used_permissions=used or [],
             unused_permissions=unused or [],
@@ -108,7 +108,7 @@ def test_shared_projects_without_permissions_have_unknown_access_level():
 
 
 def test_security_event_serializes_unknown_access_level_as_null():
-    event = SecurityEvent(
+    event = PermissionUsageEvent(
         event_id="event-1",
         nhi_id="nhi-1",
         event_type="OWNER_MISSING",

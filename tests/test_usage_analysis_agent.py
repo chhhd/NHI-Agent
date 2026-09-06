@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from agents.usage_analysis_agent import UsageAnalysisAgent
+from agents.usage_analysis_agent import PermissionUsageAgent
 from core.nhi_models import AnalysisSignals, PermissionLevel, PermissionProfile
 
 
@@ -18,7 +18,7 @@ def _signals(days_ago=None, actions=None):
 
 
 def test_all_granted_permissions_used_has_no_unused_permissions():
-    result = UsageAnalysisAgent().analyze(
+    result = PermissionUsageAgent().analyze(
         _permissions(PermissionLevel.READ, PermissionLevel.WRITE),
         _signals(actions=["READ", "WRITE"]),
     )
@@ -28,7 +28,7 @@ def test_all_granted_permissions_used_has_no_unused_permissions():
 
 
 def test_unused_admin_permission_is_excessive():
-    result = UsageAnalysisAgent().analyze(
+    result = PermissionUsageAgent().analyze(
         _permissions(PermissionLevel.READ, PermissionLevel.ADMIN),
         _signals(actions=["READ"]),
     )
@@ -38,7 +38,7 @@ def test_unused_admin_permission_is_excessive():
 
 
 def test_120_days_without_use_is_stale():
-    result = UsageAnalysisAgent().analyze(
+    result = PermissionUsageAgent().analyze(
         _permissions(PermissionLevel.READ), _signals(days_ago=120)
     )
 
@@ -47,7 +47,7 @@ def test_120_days_without_use_is_stale():
 
 
 def test_200_days_without_use_is_orphaned_candidate():
-    result = UsageAnalysisAgent().analyze(
+    result = PermissionUsageAgent().analyze(
         _permissions(PermissionLevel.READ), _signals(days_ago=200)
     )
 
@@ -56,7 +56,7 @@ def test_200_days_without_use_is_orphaned_candidate():
 
 
 def test_missing_last_used_at_is_unknown():
-    result = UsageAnalysisAgent().analyze(
+    result = PermissionUsageAgent().analyze(
         _permissions(PermissionLevel.READ), _signals(actions=["READ"])
     )
 

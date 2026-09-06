@@ -13,9 +13,9 @@ from core.nhi_models import (
     PERMISSION_RANK,
     PermissionLevel,
     PermissionProfile,
+    PermissionUsageEvent,
+    PermissionUsageResult,
     RiskLevel,
-    SecurityEvent,
-    UsageAnalysisResult,
 )
 
 
@@ -26,15 +26,15 @@ class EventExtractionAgent:
         self,
         profile: NHIProfile,
         permissions: PermissionProfile,
-        usage_analysis: UsageAnalysisResult,
+        usage_analysis: PermissionUsageResult,
         signals: Optional[AnalysisSignals] = None,
         context: Optional[ContextInsight] = None,
         blast_radius: Optional[BlastRadiusReport] = None,
-    ) -> List[SecurityEvent]:
+    ) -> List[PermissionUsageEvent]:
         """Extract currently provable event types without scoring or scenarios."""
         del context  # Reserved for future context-specific evidence; no inference here.
         signals = signals or AnalysisSignals()
-        events: List[SecurityEvent] = []
+        events: List[PermissionUsageEvent] = []
         emitted: Set[str] = set()
         granted = self._permissions(permissions.permissions)
         unused = self._permissions(usage_analysis.unused_permissions)
@@ -52,7 +52,7 @@ class EventExtractionAgent:
                 return
             emitted.add(event_type)
             events.append(
-                SecurityEvent(
+                PermissionUsageEvent(
                     event_id=f"{profile.nhi_id}:{event_type}",
                     nhi_id=profile.nhi_id,
                     event_type=event_type,
