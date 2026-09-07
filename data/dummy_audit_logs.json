@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "synthetic": true,
+  "events": [
+    {
+      "nhi_id": "nhi-recent",
+      "timestamp": "2026-08-28T09:00:00+00:00",
+      "action": "read",
+      "resource_type": "repository",
+      "resource_id": "repo-1",
+      "provider": "mock",
+      "metadata": {
+        "synthetic": true
+      }
+    },
+    {
+      "nhi_id": "nhi-recent",
+      "timestamp": "2026-08-29T10:00:00+00:00",
+      "action": "write",
+      "resource_type": "repository",
+      "resource_id": "repo-2",
+      "provider": "mock",
+      "metadata": {
+        "synthetic": true
+      }
+    },
+    {
+      "nhi_id": "nhi-unexpected-write",
+      "timestamp": "2026-08-30T11:00:00+00:00",
+      "action": "write",
+      "resource_type": "repository",
+      "resource_id": "repo-read-only",
+      "provider": "mock",
+      "metadata": {
+        "synthetic": true
+      }
+    },
+    {
+      "nhi_id": "nhi-stale",
+      "timestamp": "2026-04-01T08:00:00+00:00",
+      "action": "read",
+      "resource_type": "document",
+      "resource_id": "internal-doc-1",
+      "provider": "mock",
+      "metadata": {
+        "synthetic": true
+      }
+    },
+    {
+      "nhi_id": "nhi-shared-token",
+      "timestamp": "2026-08-27T07:00:00+00:00",
+      "action": "read",
+      "resource_type": "repository",
+      "resource_id": "project-a",
+      "provider": "mock",
+      "metadata": {
+        "synthetic": true
+      }
+    },
+    {
+      "nhi_id": "nhi-shared-token",
+      "timestamp": "2026-08-29T07:30:00+00:00",
+      "action": "write",
+      "resource_type": "repository",
+      "resource_id": "project-b",
+      "provider": "mock",
+      "metadata": {
+        "synthetic": true
+      }
+    }
+  ]
+}

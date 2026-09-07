@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "scenarios": [
+    {
+      "scenario_id": "SCN_001",
+      "name": "장기 미사용 고권한 NHI",
+      "required_events": [
+        "HIGH_RISK_SCOPE_GRANTED",
+        "STALE_PERMISSION"
+      ],
+      "severity": "HIGH",
+      "risk_addition": 20,
+      "recommended_action": "DISABLE_INACTIVE_NHI",
+      "description": "고권한을 보유한 NHI가 장기간 사용되지 않아 탈취 또는 방치된 자격 증명의 오남용 가능성이 있는 상태입니다."
+    },
+    {
+      "scenario_id": "SCN_002",
+      "name": "소유자 불명 고권한 NHI",
+      "required_events": [
+        "OWNER_MISSING",
+        "HIGH_RISK_SCOPE_GRANTED"
+      ],
+      "severity": "CRITICAL",
+      "risk_addition": 25,
+      "recommended_action": "ASSIGN_OWNER",
+      "description": "명확한 책임자가 없는 NHI가 관리자 또는 삭제 권한을 보유해 승인과 사고 대응의 책임 경계가 불분명한 상태입니다."
+    },
+    {
+      "scenario_id": "SCN_003",
+      "name": "실제 사용보다 과도한 고권한",
+      "required_events": [
+        "UNUSED_HIGH_PRIVILEGE"
+      ],
+      "severity": "HIGH",
+      "risk_addition": 15,
+      "recommended_action": "SCOPE_REDUCTION",
+      "description": "부여된 관리자 또는 삭제 권한이 실제 사용 기록에서 필요하지 않은 것으로 관측되어 최소 권한 원칙에 위배되는 상태입니다."
+    },
+    {
+      "scenario_id": "SCN_004",
+      "name": "승인 권한을 초과한 변경 행위",
+      "required_events": [
+        "UNAUTHORIZED_MUTATION"
+      ],
+      "severity": "CRITICAL",
+      "risk_addition": 30,
+      "recommended_action": "TOKEN_REVOCATION",
+      "description": "읽기 전용으로 승인된 NHI에서 쓰기·삭제·관리자 수준의 변경 행위가 관측된 상태입니다."
+    },
+    {
+      "scenario_id": "SCN_005",
+      "name": "다중 프로젝트 공유 Credential",
+      "required_events": [
+        "TOKEN_SHARED_ACROSS_PROJECTS"
+      ],
+      "severity": "HIGH",
+      "risk_addition": 20,
+      "recommended_action": "SPLIT_TOKEN_PER_PROJECT",
+      "description": "동일 Credential이 둘 이상의 프로젝트에서 사용되어 탈취 시 영향 범위가 여러 프로젝트로 확장될 수 있는 상태입니다."
+    }
+  ]
+}

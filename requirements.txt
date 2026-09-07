@@ -21,8 +21,9 @@ boto3>=1.34,<2.0
 # 선택 의존성. 없으면 core/config.py 가 OS 환경변수만 읽는다.
 python-dotenv>=1.0,<2.0
 
-# --- Secret material 필드 암호화 (AES-256-GCM) ---
-cryptography>=43.0,<47.0
+# --- Secret material 필드 암호화 (AES-256-GCM) / DPoP·GitHub App 서명 ---
+# 50.0.0 미만은 2026년 공개 보안 권고의 영향을 받으므로 허용하지 않는다.
+cryptography>=50.0,<51.0
 
 # --- PostgreSQL 운영 Database ---
 psycopg[binary]>=3.2,<4.0
