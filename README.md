@@ -31,9 +31,9 @@ GitHub·Slack 등에서 사용되는 **NHI(Non-Human Identity)** 의 보안 위�
                             ▼
              Blast Radius        연결 서비스·자원·외부 전송·교차 프로젝트
                             ▼
-             Policy Engine       정책 6종 위반 판정
+             Policy Engine       정책 8종 위반 판정
                             ▼
-             Risk Scoring        100점 만점 7영역 + 강제 Critical 6종
+             Risk Scoring        100점 만점 7영역 + 강제 Critical 7종
                             ▼
              Decision Engine     자동 조치 / 사람 검토 / 예외 승인
                             ▼
@@ -93,7 +93,7 @@ agents/                  NHI 분석 Agent
 └─ heuristics.py               경로·변수명·주석 신호 추출 공용 유틸
 
 policy/
-├─ rules.py              정책 6종 + 강제 Critical 6종 + EvaluationContext + PolicyConfig
+├─ rules.py              정책 8종 + 강제 Critical 7종 + EvaluationContext + PolicyConfig
 ├─ scoring.py            평가 영역 7개 배점 및 등급 산정
 └─ decision_engine.py    자동 조치 / 사람 검토 / 예외 승인 판단
 
@@ -685,8 +685,8 @@ PostgreSQL 등으로 교체하려면 `storage/base.py` 의 `Storage` 인터페�
 - Regex + Entropy Secret 탐지, 마스킹, Fingerprint, 중복 병합, 재스캔 판정
 - 탐지된 토큰의 외부 API 재검증 (읽기 전용)
 - NHI 식별 / 문맥 분석 / Scope 정규화 / Blast Radius / 관계 그래프
-- 규칙 기반 위험 점수(7영역 100점) + 강제 Critical 6종
-- 정책 엔진 6종 + 조치 결정(자동/검토/예외) + 조치 권고 9종
+- 규칙 기반 위험 점수(7영역 100점) + 강제 Critical 7종
+- 정책 엔진 8종 + 조치 결정(자동/검토/예외) + 조치 권고 9종
 - NHI 인벤토리 직접 입력 경로 (스캔 결과 없이 분석)
 - Agent 실행 계층 (Planner / Tool Registry / 조건부 Replanner / Orchestrator)
 - SQLite 영속화, PostgreSQL 운영 스키마, FastAPI + Dashboard/Swagger, 테스트 159개
