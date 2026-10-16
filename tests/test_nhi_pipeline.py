@@ -42,6 +42,94 @@ def test_pipeline_output_matches_required_schema():
     assert data["recommended_action"] == RecommendedAction.TOKEN_ROTATION.value
 
 
+def test_pipeline_populates_replay_snapshot_for_change_preview():
+    """Change Preview가 가정 상태를 재구성할 수 있도록 입력이 보존되는지 확인한다."""
+    finding = make_finding(
+        raw_scopes=["channels:history", "chat:write"],
+        credential_active=True,
+        credential_revoked=False,
+        account={"team": "Customer Support Team", "user": "customer-support-bot"},
+        resources=[{"name": "general"}],
+    )
+    signals = AnalysisSignals(
+        repository="acme/support",
+        repository_public=True,
+        owner="Customer Support Team",
+        created_at="2020-01-01T00:00:00Z",
+    )
+    analysis = NHIAnalysisPipeline().analyze_finding(finding, signals=signals)
+    snapshot = analysis.to_dict()["replay_snapshot"]
+
+    assert snapshot["signals"]["repository"] == "acme/support"
+    assert snapshot["signals"]["owner"] == "Customer Support Team"
+    assert snapshot["finding"]["raw_scopes"] == ["channels:history", "chat:write"]
+    assert snapshot["finding"]["credential_active"] is True
+    assert "_raw_value" not in snapshot["finding"]
+
+
+def test_pipeline_redacts_untrusted_signal_values_in_replay_snapshot():
+    """`signals`의 신뢰할 수 없는 값(감사 로그 등)이 그대로 저장되지 않아야 한다."""
+    secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    finding = make_finding(credential_active=True)
+    signals = AnalysisSignals(
+        repository="acme/support",
+        observed_actions=[f"GET /v1/items?access_token={secret}"],
+        request_user_agent=f"curl Authorization: Bearer {secret}",
+    )
+    analysis = NHIAnalysisPipeline().analyze_finding(finding, signals=signals)
+    snapshot = analysis.to_dict()["replay_snapshot"]
+
+    import json
+
+    assert secret not in json.dumps(snapshot, ensure_ascii=False)
+
+
+def test_pipeline_preserves_long_signal_field_names_in_replay_snapshot():
+    """회귀 테스트 — `token_used_after_revocation`처럼 20자 이상인
+    `AnalysisSignals` 필드명이 값처럼 마스킹돼 사라지면 안 된다. 이 필드들은
+    Change Preview 재계산이 강제 Critical 판정을 재현하는 데 직접 쓰인다
+    (`backend/security/redaction.py::sanitize_security_value(preserve_top_level_keys=True)`).
+    """
+    finding = make_finding(credential_active=True)
+    signals = AnalysisSignals(
+        repository="acme/support",
+        owner="platform-team",
+        token_used_after_revocation=True,
+        token_replay_suspected=True,
+        token_binding_method="DPoP",
+        declared_permissions=["READ"],
+        exception_expires_at="2026-12-31T00:00:00Z",
+    )
+    analysis = NHIAnalysisPipeline().analyze_finding(finding, signals=signals)
+    snapshot_signals = analysis.to_dict()["replay_snapshot"]["signals"]
+
+    for field_name, expected in (
+        ("token_used_after_revocation", True),
+        ("token_replay_suspected", True),
+        ("token_binding_method", "DPoP"),
+        ("declared_permissions", ["READ"]),
+        ("exception_expires_at", "2026-12-31T00:00:00Z"),
+    ):
+        assert field_name in snapshot_signals, f"{field_name} 키가 마스킹돼 사라짐"
+        assert snapshot_signals[field_name] == expected
+
+
+def test_pipeline_still_redacts_nested_dynamic_keys_in_replay_snapshot():
+    """최상위 필드명만 보존된다 — `extra`처럼 호출부가 정의하지 않은 동적
+    키는 depth가 올라가면 여전히 정리돼야 한다(기존 보안 범위 유지)."""
+    secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+    finding = make_finding(credential_active=True)
+    signals = AnalysisSignals(
+        repository="acme/support",
+        extra={"some_externally_named_long_header_field": secret},
+    )
+    analysis = NHIAnalysisPipeline().analyze_finding(finding, signals=signals)
+    snapshot_signals = analysis.to_dict()["replay_snapshot"]["signals"]
+
+    assert "some_externally_named_long_header_field" not in snapshot_signals["extra"]
+    assert secret not in str(snapshot_signals["extra"])
+
+
 def test_pipeline_analyzes_scan_result_dict_from_team1():
     """탐지 계층의 `ScanResult.to_dict()` 를 그대로 입력으로 받을 수 있어야 한다."""
     content = "\n".join(

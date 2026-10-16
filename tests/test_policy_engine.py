@@ -140,6 +140,50 @@ def test_admin_scope_policy_can_be_allowlisted():
     assert "ADMIN_SCOPE_RESTRICTED" not in {v.policy_id for v in evaluate_policies(ctx_allowed)}
 
 
+def test_broad_oauth_scope_violation_and_allowlist():
+    """SaaS 연동 Agent 가 전사 범위(mail.read.all 등) Scope 를 승인받으면 위반이다."""
+    finding = make_finding(
+        secret_type="NOTION_INTEGRATION_TOKEN", provider="notion",
+        raw_scopes=["mail.read.all", "channels:history"],
+    )
+    ctx = build_ctx(finding=finding)
+    assert "BROAD_OAUTH_SCOPE" in {v.policy_id for v in evaluate_policies(ctx)}
+
+    allowed = PolicyConfig(admin_scope_allowed_types=(DiscoveryAgent().analyze(finding).nhi_type,))
+    ctx_allowed = build_ctx(finding=finding, config=allowed)
+    assert "BROAD_OAUTH_SCOPE" not in {v.policy_id for v in evaluate_policies(ctx_allowed)}
+
+
+def test_broad_oauth_scope_not_triggered_for_narrow_scopes():
+    ctx = build_ctx(finding=make_finding(raw_scopes=["channels:history"]))
+    assert "BROAD_OAUTH_SCOPE" not in {v.policy_id for v in evaluate_policies(ctx)}
+
+
+def test_excessive_data_exposure_violation():
+    """집계용 데이터 API 가 민감 데이터에서 대량/원본 추출 행위를 보이면 위반이다."""
+    ctx = build_ctx(
+        finding=make_finding(
+            secret_type="STRIPE_SECRET_KEY", provider="stripe",
+            file_path="src/billing/client.py", line="STRIPE_SECRET_KEY = 'sk_live_****'",
+        ),
+        signals=AnalysisSignals(observed_actions=["export_csv_all_customers"]),
+    )
+    violations = {v.policy_id: v for v in evaluate_policies(ctx)}
+    assert "EXCESSIVE_DATA_EXPOSURE" in violations
+    assert violations["EXCESSIVE_DATA_EXPOSURE"].severity is RiskLevel.HIGH
+
+
+def test_excessive_data_exposure_not_triggered_without_bulk_action():
+    ctx = build_ctx(
+        finding=make_finding(
+            secret_type="STRIPE_SECRET_KEY", provider="stripe",
+            file_path="src/billing/client.py", line="STRIPE_SECRET_KEY = 'sk_live_****'",
+        ),
+        signals=AnalysisSignals(observed_actions=["get_customer_summary"]),
+    )
+    assert "EXCESSIVE_DATA_EXPOSURE" not in {v.policy_id for v in evaluate_policies(ctx)}
+
+
 def test_exempted_policy_is_skipped():
     ctx = build_ctx(
         finding=make_finding(file_path="src/app.py"),
@@ -235,6 +279,34 @@ def test_forced_critical_read_only_nhi_performs_mutation():
         observed_permissions=[PermissionLevel.WRITE],
     )
     assert "READ_ONLY_NHI_PERFORMS_MUTATION" in {
+        r["rule_id"] for r in evaluate_forced_critical(ctx)
+    }
+
+
+def test_forced_critical_iam_privilege_self_escalation():
+    """진단(read-only) NHI 가 같은 세션에서 IAM 정책·그룹 변경 API 를 호출하면 강제 Critical 이다."""
+    ctx = build_ctx(
+        finding=make_finding(raw_scopes=["iam:list"], credential_active=True),
+        signals=AnalysisSignals(
+            declared_permissions=["READ"],
+            observed_actions=["ListPolicy", "UpdatePolicy", "AddUserToGroup"],
+        ),
+        declared_permissions=[PermissionLevel.READ],
+    )
+    assert "IAM_PRIVILEGE_SELF_ESCALATION" in {
+        r["rule_id"] for r in evaluate_forced_critical(ctx)
+    }
+
+
+def test_forced_critical_iam_privilege_self_escalation_not_triggered_without_escalation_action():
+    ctx = build_ctx(
+        finding=make_finding(raw_scopes=["iam:list"], credential_active=True),
+        signals=AnalysisSignals(
+            declared_permissions=["READ"], observed_actions=["ListPolicy", "GetPolicy"]
+        ),
+        declared_permissions=[PermissionLevel.READ],
+    )
+    assert "IAM_PRIVILEGE_SELF_ESCALATION" not in {
         r["rule_id"] for r in evaluate_forced_critical(ctx)
     }
 

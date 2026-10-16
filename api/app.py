@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import logging
 import hmac
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 from typing import Any, Dict, List, Optional, Sequence, Set
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
@@ -34,7 +36,8 @@ from agents.github_inventory_service import (
 from agents.slack_inventory_service import analyze_slack_nhi_from_connector
 from agents.aws_inventory_service import analyze_aws_nhi_from_connector
 from agents.inventory_adapter import _slack_channel_records
-from agents.dry_run_service import build_dry_run_result
+from agents.dry_run_service import build_dry_run_response, get_latest_analysis_snapshot
+from backend.services.nhi_lifecycle import event_type_for_transition
 from agents.scope_translation_agent import ScopeTranslationAgent
 from connectors.base_connector import (
     AuthenticationError,
@@ -50,14 +53,25 @@ from connectors.github_webhook import GitHubWebhookHandler, WebhookVerificationE
 from connectors.google_workspace_connector import GoogleWorkspaceConnector
 from connectors.microsoft_graph_connector import MicrosoftGraphConnector
 from connectors.slack_connector import SlackConnector
+from core.destruction_models import DestructionEvidence
 from core.agent_access_models import (
+    AgentAccessDecision,
     AgentAccessOutcome,
     AgentAccessProfile,
     AgentApiObservation,
+    NHIAccessContext,
 )
 from core.inventory_models import GitHubNHIInput, SaaSNHIInput
 from core.models import ScanResult, ScanTrigger, SecretFinding
-from core.nhi_models import AnalysisSignals, NHIAnalysisReport, NHIType, RecommendedAction
+from core.nhi_lifecycle_models import NHILifecycleStatus
+from core.nhi_models import (
+    AnalysisSignals,
+    NHIAnalysisReport,
+    NHIType,
+    PermissionLevel,
+    RecommendedAction,
+    days_since,
+)
 from core.observation_models import CredentialObservation, Evidence
 from core.action_models import ActionStatus
 from core.approval_models import ApprovalRequest, ApprovalStatus
@@ -72,7 +86,8 @@ from processing import ActionService, persist_analysis, persist_report
 from rescan.credential_verifier import CredentialVerifier
 from rescan.revalidator import Revalidator
 from scanner.scan_service import SecretScanService
-from security.dpop import InMemoryReplayCache, RuntimeTokenService, TokenBindingError
+from security.dpop import RuntimeTokenService, TokenBindingError
+from security.replay_store import StorageReplayCache
 from security.redaction import sanitize_security_text, sanitize_security_value
 from storage import Storage, get_default_storage
 from backend.models.entities import (
@@ -87,6 +102,22 @@ from backend.services.demo_workspace import (
 )
 from backend.services.analysis_history import AnalysisHistoryService
 from backend.services.agent_access_evaluator import AgentAccessEvaluator
+from backend.services.access_enforcement import (
+    AccessControlMode,
+    EnforcementAction,
+    EnforcementRecommendation,
+    build_fail_closed_decision,
+    recommend_enforcement,
+)
+from backend.services.usage_rate import DEFAULT_TRACKER as _CALL_RATE_TRACKER
+from backend.services.change_control_service import ChangeControlService
+from core.change_control_models import (
+    ChangeError,
+    ChangeExecutionError,
+    ChangeNotAllowed,
+    SeparationOfDutiesError,
+    StateConflict,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -142,6 +173,7 @@ scan_service = SecretScanService()
 #: NHI 분석 / 위험 점수화 파이프라인 (스캔 경로·인벤토리 경로 공용)
 nhi_pipeline = NHIAnalysisPipeline()
 agent_access_evaluator = AgentAccessEvaluator()
+change_control_service = ChangeControlService(storage)
 webhook_handler = GitHubWebhookHandler(
     scan_service=scan_service,
     on_result=_store_result,
@@ -298,6 +330,32 @@ class FindingStatusUpdateRequest(BaseModel):
     assigned_to: Optional[str] = None
 
 
+class NHILifecycleUpdateRequest(BaseModel):
+    """NHI 생명주기 상태 수동 전이 요청.
+
+    `status`가 `NHILifecycleStatus`(4종)로 한정돼 있어 `PERMISSION_CHANGED`는
+    애초에 값으로 들어올 수 없다 — 권한 변경은 상태가 아니라 Timeline
+    이벤트이므로 이 엔드포인트가 아니라 조치 승인 흐름에서만 기록된다.
+
+    `destruction_evidence`는 `DECOMMISSIONED` 전이에서만 의미가 있고
+    선택 사항이다 — 기존 호출부가 이 필드 없이 호출해도 그대로 동작한다
+    (하위 호환). 전달되면 `core.destruction_models.DestructionEvidence`로
+    검증한다(`method`/`performed_by`/`verified_by`/`verification_check`/
+    `verification_result` 필수, 수행자≠검증자). 이 증적은 우리 내부 관리
+    상태를 "파기"로 바꾸는 근거일 뿐 — `method=SECRET_MATERIAL_DELETED`는
+    우리가 보관 중인 암호문만 지웠다는 뜻이고, 실제 Provider(GitHub/Slack/
+    AWS 등) 측 Credential이 아직 유효한지는 이 필드가 보증하지 않는다
+    (`method=PROVIDER_REVOKED`만 Provider 측 폐기를 주장한다. 이 프로젝트는
+    Provider API를 직접 호출해 그 주장을 검증하지 않는다 — 그건 여전히
+    사람이 확인해야 한다).
+    """
+
+    status: NHILifecycleStatus
+    actor: str = Field(..., min_length=1)
+    note: str = ""
+    destruction_evidence: Optional[Dict[str, Any]] = None
+
+
 def _secret_material_store():
     settings = get_settings().secret_storage
     if not settings.master_key:
@@ -323,7 +381,11 @@ def _require_admin_key(provided: Optional[str]) -> None:
         raise HTTPException(status_code=401, detail="올바른 관리자 API Key 가 필요합니다.")
 
 
-_runtime_replay_cache = InMemoryReplayCache()
+#: DPoP proof jti 재전송 방지 — SQLite(storage)에 영속화해 다중 워커·프로세스
+#: 재시작 사이에서도 단일 사용을 보장한다(`security/replay_store.py`).
+#: `InMemoryReplayCache`는 단일 프로세스 테스트/스크립트용으로 계속 남겨둔다
+#: (`RuntimeTokenService(replay_cache=...)`로 명시적으로 넘기면 여전히 쓸 수 있다).
+_runtime_replay_cache = StorageReplayCache(storage)
 
 
 def _runtime_token_service() -> RuntimeTokenService:
@@ -596,9 +658,13 @@ def service_info() -> Dict[str, Any]:
             "docs": "GET /docs",
         },
         "operational_limitations": [
-            "실제 차단은 사내 API Gateway가 /agent-access/evaluate 결과를 적용해야 함",
+            "/runtime/protected는 이 서버가 직접 서빙하므로 실제로 차단되지만, "
+            "GitHub/Slack/AWS 등 외부 provider API 앞에는 별도 egress 프록시/API "
+            "Gateway가 /agent-access/evaluate 결과를 적용해야 실제 차단이 된다",
             "IdP/RBAC 및 공급자별 전체 인벤토리 동기화는 아직 미구현",
             "/runtime/*는 DPoP 연구 검증용이며 회사 Agent Registry를 대체하지 않음",
+            "조치 승인 후 실제 Credential 폐기/회전/권한 축소 실행과 "
+            "NHI 생명주기 자동 전이는 아직 없음(수동 PATCH만 가능)",
         ],
     }
 
@@ -657,6 +723,78 @@ def issue_runtime_token(
     )
 
 
+def _runtime_access_observation(request: Request, principal: Any) -> AgentApiObservation:
+    """DPoP로 증명된 사실 + 실제 HTTP 요청만으로 `AgentApiObservation`을 만든다.
+
+    요청자가 "나는 어떤 NHI/리소스에 접근한다"고 주장할 수 있는 입력 필드가
+    이 엔드포인트에는 애초에 없다(요청 바디를 받지 않음) — `nhi_id`는 DPoP가
+    증명한 `principal.agent_id`로부터, `resource`/`action`은 서버가 실제로
+    받은 HTTP 메서드·경로에서 결정론적으로 파생한다. 어떤 값도 클라이언트가
+    보낸 자유 입력에서 가져오지 않는다.
+    """
+    method = request.method.upper()
+    path = request.url.path
+    return AgentApiObservation(
+        event_id=str(uuid4()),
+        claimed_agent_id=principal.agent_id,
+        authenticated_agent_id=principal.agent_id,
+        provider="runtime",
+        nhi_id=f"runtime:{principal.agent_id}",
+        credential_fingerprint=f"jkt:{principal.binding_jkt}",
+        action=f"{method} {path}",
+        permission=PermissionLevel.READ if method == "GET" else PermissionLevel.WRITE,
+        resource=path,
+        resource_sensitive=False,
+        sender_constrained=True,
+        binding_method="DPoP",
+        sender_proof_valid=True,
+        source_ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent", "")[:300],
+    )
+
+
+def _runtime_access_control_deny_response(
+    *, request: Request, principal: Any, evaluation: AgentAccessEvaluation
+) -> JSONResponse:
+    """Agent Access 평가가 BLOCK을 권고했을 때의 응답 — DPoP 자체 실패(401/400,
+    `_runtime_deny_response`)와는 다른 계층의 실패(403, 인가 거부)다.
+    """
+    decision = evaluation.decision
+    blocking_rule_ids = [f.rule_id for f in decision.findings if f.blocking]
+    reason = blocking_rule_ids[0] if blocking_rule_ids else (
+        decision.findings[0].rule_id if decision.findings else "access_denied"
+    )
+    event_id = _runtime_audit(
+        request=request,
+        decision="DENY",
+        reason=reason,
+        agent_id=principal.agent_id,
+        detail={
+            "stage": "resource_access",
+            "token_jti": principal.token_id,
+            "proof_jti": principal.proof_jti,
+            "binding_jkt": principal.binding_jkt,
+            "sender_constrained": True,
+            "token_binding_method": "DPoP",
+            "agent_access_decision_id": decision.decision_id,
+            "agent_access_outcome": decision.outcome.value,
+            "rule_ids": blocking_rule_ids or [f.rule_id for f in decision.findings],
+        },
+    )
+    return JSONResponse(
+        status_code=403,
+        content={
+            "decision": "DENY",
+            "authenticated_as": principal.agent_id,
+            "reason": reason,
+            "message": evaluation.recommendation.reason,
+            "agent_access_decision_id": decision.decision_id,
+            "audit_event_id": event_id,
+            "source_context": _runtime_source_context(request),
+        },
+    )
+
+
 @app.get("/runtime/protected")
 @app.post("/runtime/protected")
 def runtime_protected_resource(
@@ -664,7 +802,19 @@ def runtime_protected_resource(
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     dpop: Optional[str] = Header(default=None, alias="DPoP"),
 ) -> Any:
-    """token 문자열뿐 아니라 Agent private key 보유까지 증명해야 하는 보호 API."""
+    """token 문자열뿐 아니라 Agent private key 보유까지 증명해야 하는 보호 API.
+
+    DPoP 검증(인증)에 성공해도 그것만으로 ALLOW하지 않는다 — 이어서 Agent
+    Access Evaluator(인가)를 통과해야 한다. 등록되지 않은 Agent, 승인되지
+    않은 NHI/자원/작업, `REVIEW` 판정, 평가 실패는 모두 기본 차단(BLOCK)
+    한다(`backend/services/access_enforcement.py`). NHI/자원 식별은 요청자가
+    주장한 값이 아니라 DPoP로 증명된 `agent_id`와 실제 HTTP 메서드·경로에서만
+    만든다(`_runtime_access_observation()`) — 이 엔드포인트는 요청 바디
+    자체를 받지 않으므로 호출자가 그 값을 주장할 방법이 구조적으로 없다.
+
+    DPoP 자체 검증 실패(401/400, `TokenBindingError`)는 기존과 완전히
+    동일하게 처리한다 — 이 변경은 그 경로 이후에만 추가된다.
+    """
     try:
         principal = _runtime_token_service().authorize(
             authorization=_single_runtime_header(request, "Authorization", authorization),
@@ -675,10 +825,19 @@ def runtime_protected_resource(
     except TokenBindingError as exc:
         return _runtime_deny_response(exc, request=request, stage="resource_access")
 
+    observation = _runtime_access_observation(request, principal)
+    evaluation = _evaluate_agent_access(observation)
+    payload = _persist_agent_access_evaluation(evaluation)
+
+    if evaluation.recommendation.action is EnforcementAction.BLOCK:
+        return _runtime_access_control_deny_response(
+            request=request, principal=principal, evaluation=evaluation
+        )
+
     event_id = _runtime_audit(
         request=request,
         decision="ALLOW",
-        reason="dpop_proof_verified",
+        reason="dpop_proof_verified_and_access_allowed",
         agent_id=principal.agent_id,
         detail={
             "stage": "resource_access",
@@ -687,6 +846,7 @@ def runtime_protected_resource(
             "binding_jkt": principal.binding_jkt,
             "sender_constrained": True,
             "token_binding_method": "DPoP",
+            "agent_access_decision_id": payload["decision_id"],
         },
     )
     return {
@@ -697,6 +857,7 @@ def runtime_protected_resource(
         "scopes": list(principal.scopes),
         "token_expires_at": principal.expires_at,
         "audit_event_id": event_id,
+        "agent_access_decision_id": payload["decision_id"],
         "source_context": _runtime_source_context(request),
     }
 
@@ -925,6 +1086,326 @@ def get_nhi_analysis_history(nhi_id: str, limit: int = 100) -> Dict[str, Any]:
     return AnalysisHistoryService(storage).list_history(
         nhi_id, limit=min(max(limit, 1), 500)
     )
+
+
+@app.patch("/nhi/{nhi_id}/lifecycle")
+def update_nhi_lifecycle(
+    nhi_id: str,
+    body: NHILifecycleUpdateRequest,
+    x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
+) -> Dict[str, Any]:
+    """NHI 생명주기 상태를 수동으로 전이한다.
+
+    관리적 상태만 바꾼다 — 실제 Credential 폐기/회전/권한 변경은 전혀
+    수행하지 않는다(`core/nhi_lifecycle_models.py` 참고). 민감한 조치이므로
+    `X-NHI-Admin-Key`가 필요하고, 결과는 `AUDIT` 이벤트로 남는다. 허용되지
+    않은 전이(예: `REGISTERED` → `DECOMMISSIONED`)는 409로 거부한다.
+
+    경로가 `/nhi/{nhi_id}/{suffix}` 형태인 다른 2단 경로(`/nhi/{owner}/{repo}`
+    등 스캔 기반 엔드포인트)와 겹치지 않도록, 그 경로들보다 먼저 등록한다
+    (Starlette는 먼저 등록된 라우트를 우선 매칭한다).
+    """
+    _require_admin_key(x_nhi_admin_key)
+    record = storage.get_nhi_record(nhi_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="NHI 를 찾을 수 없습니다.")
+
+    state = storage.get_nhi_lifecycle_state(nhi_id)
+    if state is None:
+        # 이 기능 도입 이전부터 있던 NHI — 먼저 REGISTERED로 보정한다.
+        state = storage.initialize_nhi_lifecycle(
+            nhi_id,
+            actor=body.actor,
+            note="PATCH /nhi/{id}/lifecycle 처리 전 생명주기 최초 초기화",
+        )
+    current = NHILifecycleStatus(state["status"])
+
+    if current == body.status:
+        return {
+            "nhi_id": nhi_id,
+            "status": current.value,
+            "updated_at": state["updated_at"],
+            "changed": False,
+        }
+
+    evidence: Optional[DestructionEvidence] = None
+    if body.destruction_evidence is not None:
+        try:
+            evidence = DestructionEvidence.from_dict(
+                body.destruction_evidence, default_performer=body.actor
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+
+    try:
+        event_type = event_type_for_transition(current, body.status)
+        result = storage.update_nhi_lifecycle_status(
+            nhi_id,
+            body.status,
+            event_type=event_type,
+            actor=body.actor,
+            note=body.note,
+            destruction_evidence=evidence,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+    storage.append_audit_event(
+        "NHI_LIFECYCLE_STATUS_CHANGED",
+        actor=body.actor,
+        target=nhi_id,
+        detail={
+            "from_status": current.value,
+            "to_status": body.status.value,
+            "event_type": event_type.value,
+            "note": body.note,
+        },
+    )
+    return {**result, "changed": True}
+
+
+@app.get("/nhi/{nhi_id}/timeline")
+def get_nhi_timeline(nhi_id: str, limit: int = 200) -> Dict[str, Any]:
+    """NHI의 생명주기 이벤트와 분석 스냅샷 이력을 시간순(최신 먼저)으로 합친다.
+
+    기존 `AnalysisHistoryService.list_history()`(분석 결정 이력)는 그대로
+    재사용한다 — 여기서 새로 하는 일은 그 결과와 생명주기 이력을
+    `type`(`lifecycle_event`/`analysis_snapshot`)으로 구분해 하나의 시간순
+    목록으로 합치는 것뿐이다.
+    """
+    record = storage.get_nhi_record(nhi_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="NHI 를 찾을 수 없습니다.")
+
+    limit = min(max(limit, 1), 1000)
+    lifecycle_events = storage.get_nhi_lifecycle_history(nhi_id, limit=limit)
+    analysis_history = AnalysisHistoryService(storage).list_history(nhi_id, limit=limit)
+
+    timeline: List[Dict[str, Any]] = []
+    for event in lifecycle_events:
+        timeline.append(
+            {
+                "type": "lifecycle_event",
+                "occurred_at": event["occurred_at"],
+                "event_type": event["event_type"],
+                "from_status": event["from_status"],
+                "to_status": event["to_status"],
+                "changes_status": event["from_status"] != event["to_status"],
+                "actor": event["actor"],
+                "note": event["note"],
+                "detail": event["detail"],
+            }
+        )
+    for analysis in analysis_history["analyses"]:
+        timeline.append(
+            {
+                "type": "analysis_snapshot",
+                "occurred_at": analysis.get("analyzed_at"),
+                "analysis_id": analysis.get("analysis_id"),
+                "risk_score": analysis.get("risk_score"),
+                "risk_level": analysis.get("risk_level"),
+                "policy_outcome": analysis.get("policy_outcome"),
+                "recommended_action": analysis.get("recommended_action"),
+            }
+        )
+
+    # 두 출처의 시각 형식(ISO8601)이 같으므로 문자열 비교만으로 시간순이
+    # 보장된다. 최신 항목이 위로 오도록 내림차순으로 보여준다(다른 목록
+    # API — /analyses, /agent-access/decisions 등 — 과 동일한 관례).
+    timeline.sort(key=lambda item: item.get("occurred_at") or "", reverse=True)
+
+    lifecycle_state = storage.get_nhi_lifecycle_state(nhi_id)
+    return {
+        "nhi_id": nhi_id,
+        "lifecycle_status": lifecycle_state["status"] if lifecycle_state else None,
+        "count": len(timeline),
+        "timeline": timeline,
+    }
+
+
+class ChangeProposeRequest(BaseModel):
+    """변경 제안 — 조치는 받지 않는다. 최신 분석의 `recommended_action`을
+    `build_change_preview()`로 재계산해 자동으로 정한다(요청자가 임의의
+    조치를 지정할 수 없다 — Change Preview 엔진과 항상 같은 조치를 보게 한다).
+    """
+
+    requested_by: str = Field(..., min_length=1)
+    reason: str = ""
+    idempotency_key: str = Field(..., min_length=1)
+    impact_acknowledged: bool = False
+
+
+class ChangeApproveRequest(BaseModel):
+    approved_by: str = Field(..., min_length=1)
+
+
+class ChangeActorRequest(BaseModel):
+    actor: str = Field(..., min_length=1)
+    reason: str = ""
+
+
+def _change_control_error_response(exc: ChangeError):
+    if isinstance(exc, SeparationOfDutiesError):
+        raise HTTPException(status_code=403, detail=str(exc))
+    if isinstance(exc, StateConflict):
+        raise HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, ChangeNotAllowed):
+        raise HTTPException(status_code=422, detail=str(exc))
+    if isinstance(exc, ChangeExecutionError):
+        raise HTTPException(status_code=502, detail=str(exc))
+    raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/nhi/{nhi_id}/changes")
+def propose_change(
+    nhi_id: str,
+    body: ChangeProposeRequest,
+    x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
+) -> Dict[str, Any]:
+    """최신 분석의 추천 조치를 Change Preview로 재계산해 승인 요청을 만든다.
+
+    실제 Credential/권한은 전혀 바꾸지 않는다 — `agents/dry_run_service.py::
+    build_change_preview()`를 그대로 재사용한 결과만 들어간다. `idempotency_key`가
+    이미 쓰인 적 있으면 새로 만들지 않고 기존 요청을 그대로 반환한다. 경로가
+    `/nhi/{nhi_id}/{suffix}` 형태라 `/nhi/{owner}/{repo}`보다 먼저 등록한다
+    (`/nhi/{nhi_id}/lifecycle` 과 같은 이유).
+    """
+    _require_admin_key(x_nhi_admin_key)
+    try:
+        change = change_control_service.propose(
+            nhi_id,
+            requested_by=body.requested_by,
+            reason=body.reason,
+            idempotency_key=body.idempotency_key,
+            impact_acknowledged=body.impact_acknowledged,
+        )
+    except ChangeError as exc:
+        _change_control_error_response(exc)
+    return change.to_dict()
+
+
+@app.get("/nhi/{nhi_id}/changes")
+def list_nhi_changes(
+    nhi_id: str,
+    status: Optional[str] = None,
+    limit: int = 100,
+) -> Dict[str, Any]:
+    changes = change_control_service.list(nhi_id=nhi_id, limit=min(max(limit, 1), 500))
+    if status:
+        changes = [c for c in changes if c.status.value == status]
+    return {"nhi_id": nhi_id, "count": len(changes), "changes": [c.to_dict() for c in changes]}
+
+
+@app.get("/changes/{change_id}")
+def get_change(change_id: str) -> Dict[str, Any]:
+    try:
+        return change_control_service.get(change_id).to_dict()
+    except KeyError:
+        raise HTTPException(status_code=404, detail="변경 요청을 찾을 수 없습니다.")
+
+
+@app.post("/changes/{change_id}/approve")
+def approve_change(
+    change_id: str,
+    body: ChangeApproveRequest,
+    x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
+) -> Dict[str, Any]:
+    """요청자와 다른 사람만 승인할 수 있다(직무 분리) — 같으면 403."""
+    _require_admin_key(x_nhi_admin_key)
+    try:
+        change = change_control_service.approve(change_id, approved_by=body.approved_by)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="변경 요청을 찾을 수 없습니다.")
+    except ChangeError as exc:
+        _change_control_error_response(exc)
+    storage.append_audit_event(
+        "CHANGE_REQUEST_APPROVED",
+        actor=body.approved_by,
+        target=change_id,
+        detail={"nhi_id": change.nhi_id, "change_type": change.change_type.value, "tier": change.tier.value},
+    )
+    return change.to_dict()
+
+
+@app.post("/changes/{change_id}/reject")
+def reject_change(
+    change_id: str,
+    body: ChangeActorRequest,
+    x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
+) -> Dict[str, Any]:
+    _require_admin_key(x_nhi_admin_key)
+    try:
+        change = change_control_service.reject(change_id, actor=body.actor, reason=body.reason)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="변경 요청을 찾을 수 없습니다.")
+    except ChangeError as exc:
+        _change_control_error_response(exc)
+    storage.append_audit_event(
+        "CHANGE_REQUEST_REJECTED", actor=body.actor, target=change_id,
+        detail={"nhi_id": change.nhi_id, "reason": body.reason},
+    )
+    return change.to_dict()
+
+
+@app.post("/changes/{change_id}/apply")
+def apply_change(
+    change_id: str,
+    body: ChangeActorRequest,
+    x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
+) -> Dict[str, Any]:
+    """승인된 변경만 적용한다 — 승인 없이는 422/409로 거부된다.
+
+    실제로 바뀌는 건 NHI Lifecycle 상태뿐이다(`InventoryStateExecutor`).
+    응답의 `executor_result.provider_call`은 항상 `"not_configured"`다 —
+    실제 GitHub/Slack/AWS Provider를 호출하지 않았다는 뜻이며, 이 필드로
+    "내부 상태 변경"과 "실제 Provider 적용"을 API 응답에서 명확히 구분한다.
+    """
+    _require_admin_key(x_nhi_admin_key)
+    try:
+        change = change_control_service.apply(change_id, actor=body.actor)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="변경 요청을 찾을 수 없습니다.")
+    except ChangeError as exc:
+        _change_control_error_response(exc)
+    storage.append_audit_event(
+        "CHANGE_REQUEST_APPLIED",
+        actor=body.actor,
+        target=change_id,
+        detail={
+            "nhi_id": change.nhi_id,
+            "change_type": change.change_type.value,
+            "status": change.status.value,
+            "executor_result": change.executor_result,
+        },
+    )
+    return change.to_dict()
+
+
+@app.post("/changes/{change_id}/rollback")
+def rollback_change(
+    change_id: str,
+    body: ChangeActorRequest,
+    x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
+) -> Dict[str, Any]:
+    """적용된 변경을 유효 기간 내에만 되돌린다 — 기간이 지나면 409로 거부된다."""
+    _require_admin_key(x_nhi_admin_key)
+    try:
+        change = change_control_service.rollback(change_id, actor=body.actor)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="변경 요청을 찾을 수 없습니다.")
+    except ChangeError as exc:
+        _change_control_error_response(exc)
+    storage.append_audit_event(
+        "CHANGE_REQUEST_ROLLED_BACK",
+        actor=body.actor,
+        target=change_id,
+        detail={
+            "nhi_id": change.nhi_id,
+            "change_type": change.change_type.value,
+            "executor_result": change.executor_result,
+        },
+    )
+    return change.to_dict()
 
 
 @app.get("/nhi/{owner}/{repo}")
@@ -1285,6 +1766,153 @@ def get_agent_access_scope(
     return agent_access_evaluator.summarize_scope(profile)
 
 
+#: Credential 폐기 신호를 실시간 접근 평가에 신뢰할 수 있는 최대 기간(일).
+#: 이보다 오래된 분석은 "확인됨"이 아니라 미확인(None)으로 되돌린다 — 오래된
+#: 정보를 최신 상태처럼 써서 활성/비활성을 잘못 단정하지 않기 위함이다.
+#: 운영 환경의 재분석 주기에 맞춰 조정한다.
+_CREDENTIAL_SIGNAL_MAX_AGE_DAYS = 7
+
+
+def _latest_credential_revoked_signal(nhi_id: str) -> Optional[bool]:
+    """최신 분석에서 확인된 Credential 폐기 여부.
+
+    `True`일 때만 "폐기가 확인됨"을 뜻한다. 분석 자체가 없거나, 너무
+    오래됐거나(`_CREDENTIAL_SIGNAL_MAX_AGE_DAYS` 초과), 재현 입력에 값이
+    없으면 전부 `None`(미확인)으로 처리한다 — Gateway가 보낸 값은 여기서
+    전혀 쓰지 않는다. 저장소의 최신 분석(`get_latest_analysis_snapshot()`,
+    Change Preview가 이미 쓰는 조회)만 본다.
+    """
+    snapshot = get_latest_analysis_snapshot(storage, nhi_id)
+    if snapshot is None:
+        return None
+    age_days = days_since(snapshot.get("analyzed_at"))
+    if age_days is None or age_days > _CREDENTIAL_SIGNAL_MAX_AGE_DAYS:
+        return None
+    finding = (snapshot.get("replay_snapshot") or {}).get("finding") or {}
+    revoked = finding.get("credential_revoked")
+    return revoked if isinstance(revoked, bool) else None
+
+
+def _build_nhi_access_context(nhi_id: str) -> NHIAccessContext:
+    """서버 저장소만 조회해 `NHIAccessContext`를 만든다.
+
+    `AgentApiObservation`(Gateway가 보낸 요청 본문)의 어떤 필드도 여기서
+    참조하지 않는다 — 호출 주체가 "내 NHI는 ACTIVE"라고 자가 신고하게 두면
+    이 통제 자체가 무력화되기 때문이다.
+    """
+    lifecycle_state = storage.get_nhi_lifecycle_state(nhi_id)
+    lifecycle_status = (
+        NHILifecycleStatus(lifecycle_state["status"]) if lifecycle_state else None
+    )
+    return NHIAccessContext(
+        lifecycle_status=lifecycle_status,
+        credential_known_revoked=_latest_credential_revoked_signal(nhi_id),
+    )
+
+
+@dataclass
+class AgentAccessEvaluation:
+    """`_evaluate_agent_access()` 결과 — 판정 + 집행 권고 + 감사용 부가정보.
+
+    `/agent-access/evaluate`와 `/runtime/protected`가 공유한다. `evaluate()`가
+    내부적으로 실패하면 `decision`은 `build_fail_closed_decision()`의 결과이고
+    `lifecycle_status`/`credential_known_revoked`는 조회 자체가 실패했으니
+    `None`이다.
+    """
+
+    decision: AgentAccessDecision
+    recommendation: EnforcementRecommendation
+    lifecycle_status: Optional[NHILifecycleStatus]
+    credential_known_revoked: Optional[bool]
+    audit_event_type: str
+
+
+def _evaluate_agent_access(body: AgentApiObservation) -> AgentAccessEvaluation:
+    """Agent 접근 평가의 단일 진입점 — profile/NHI 컨텍스트 조회 → 판정 →
+    집행 권고 계산까지 한 번에 처리한다.
+
+    `/agent-access/evaluate`(Gateway/감사 로그 연동)와 `/runtime/protected`
+    (DPoP 통과 후 인가 단계)가 이 함수를 공유한다 — 평가 로직이 두 곳에
+    따로 구현돼 어긋나지 않도록 한다. NHI 생명주기/Credential 상태는
+    `_build_nhi_access_context()`가 서버 저장소에서만 조회하므로, `body`
+    (호출 주체가 보낸 값)로 자가 신고할 수 없다.
+
+    평가 로직 내부에서 예외가 나면(예: 저장소 조회 실패) 호출부에 전파하지
+    않고 fail-closed 결정(`build_fail_closed_decision()`, outcome=DENY)으로
+    대체한다 — 어느 호출부든 "평가기 장애 시 기본 차단"을 따로 구현할
+    필요가 없다.
+
+    집행 모드(`NHI_CONTROL_MODE` — enforce/monitor/human_in_the_loop)는
+    `recommend_enforcement()`에 그대로 넘긴다. `monitor`/`human_in_the_loop`는
+    REVIEW(확정 못한 요청)에만 영향을 준다 — `decision.outcome`이 DENY면
+    (비활성 Lifecycle, 폐기 확인된 Credential, 평가 실패 포함) 모드와 무관하게
+    항상 BLOCK이다(`backend/services/access_enforcement.py::enforcement_action_for()`
+    의 불변식). 호출률은 `body`(호출 주체 자가 신고)가 아니라
+    `backend/services/usage_rate.py`가 서버에서 직접 측정한 값만 쓴다.
+    """
+    profile = _load_agent_access_profile(body.claimed_agent_id)
+    call_rate_ratio = _CALL_RATE_TRACKER.observe(body.nhi_id).ratio
+    mode = AccessControlMode.from_str(get_settings().access_control.mode)
+
+    try:
+        nhi_context = _build_nhi_access_context(body.nhi_id)
+        decision = agent_access_evaluator.evaluate(
+            profile, body, nhi_context=nhi_context, call_rate_ratio=call_rate_ratio
+        )
+        lifecycle_status = nhi_context.lifecycle_status
+        credential_known_revoked = nhi_context.credential_known_revoked
+        audit_event_type = "AGENT_API_ACCESS_EVALUATED"
+    except Exception:
+        logger.exception(
+            "Agent Access 평가 실패 (agent_id=%s, nhi_id=%s) — fail-closed로 응답",
+            body.claimed_agent_id,
+            body.nhi_id,
+        )
+        decision = build_fail_closed_decision(body)
+        lifecycle_status = None
+        credential_known_revoked = None
+        audit_event_type = "AGENT_ACCESS_EVALUATOR_UNAVAILABLE"
+
+    recommendation = recommend_enforcement(
+        decision, credential_known_revoked=credential_known_revoked, mode=mode
+    )
+    return AgentAccessEvaluation(
+        decision=decision,
+        recommendation=recommendation,
+        lifecycle_status=lifecycle_status,
+        credential_known_revoked=credential_known_revoked,
+        audit_event_type=audit_event_type,
+    )
+
+
+def _persist_agent_access_evaluation(evaluation: AgentAccessEvaluation) -> Dict[str, Any]:
+    """평가 결과를 저장 + 감사 기록하고, API 응답 payload를 만든다."""
+    decision = evaluation.decision
+    payload = decision.model_dump(mode="json")
+    storage.save_agent_access_decision(dict(payload))
+    payload["recommended_enforcement"] = evaluation.recommendation.to_dict()
+    storage.append_audit_event(
+        evaluation.audit_event_type,
+        actor=decision.observation.authenticated_agent_id or "unverified-agent",
+        target=decision.observation.claimed_agent_id,
+        detail={
+            "decision_id": decision.decision_id,
+            "event_id": decision.event_id,
+            "outcome": decision.outcome.value,
+            "overall_severity": (
+                decision.overall_severity.value if decision.overall_severity else None
+            ),
+            "rule_ids": [finding.rule_id for finding in decision.findings],
+            "nhi_lifecycle_status": (
+                evaluation.lifecycle_status.value if evaluation.lifecycle_status else None
+            ),
+            "credential_known_revoked": evaluation.credential_known_revoked,
+            "recommended_enforcement": evaluation.recommendation.to_dict(),
+        },
+    )
+    return payload
+
+
 @app.post("/agent-access/evaluate")
 def evaluate_agent_api_access(
     body: AgentApiObservation,
@@ -1294,27 +1922,27 @@ def evaluate_agent_api_access(
 
     악의적 의도 자체를 추측하지 않는다. 인증 주체 불일치, Token/proof 재사용,
     승인 NHI·Credential·권한·자원 초과처럼 검증 가능한 사실만 판정한다.
+
+    요청 본문의 `nhi_id`를 기준으로 서버 저장소에서 NHI 생명주기 상태와
+    최신 분석의 Credential 폐기 확인 여부를 직접 조회해 판정에 반영한다
+    (`_build_nhi_access_context()`) — 이 값은 Gateway가 보낸 본문에서
+    가져오지 않는다. 응답에는 기존 필드에 더해 `recommended_enforcement`가
+    추가된다(`{action, reason, credential_state}`) — Gateway가 실제로 요청을
+    통과/차단시킬 때 이 값을 그대로 적용하면 된다. 정책은 고정이다:
+    ALLOW만 통과, REVIEW/DENY는 전부 차단(`backend/services/access_enforcement.py`
+    참고). Credential 폐기 여부가 확인되지 않은 경우는 차단 사유와 섞이지
+    않도록 `credential_state="unknown"`으로 항상 별도 표시한다.
+
+    평가 로직 내부에서 예외가 나면(예: 저장소 조회 실패) 500을 돌려주는
+    대신 fail-closed 응답(outcome=DENY, `recommended_enforcement.action=
+    BLOCK`, 전용 규칙 `EVALUATOR_UNAVAILABLE`)을 만든다 — Gateway가 5xx를
+    놓치고 기본 허용으로 처리하는 사고를 막기 위함이다. 관리자 키 검증
+    실패(401)는 기존처럼 그대로 전파된다(`_evaluate_agent_access()` 호출
+    전에 검증한다).
     """
     _require_admin_key(x_nhi_admin_key)
-    profile = _load_agent_access_profile(body.claimed_agent_id)
-    decision = agent_access_evaluator.evaluate(profile, body)
-    payload = decision.model_dump(mode="json")
-    storage.save_agent_access_decision(payload)
-    storage.append_audit_event(
-        "AGENT_API_ACCESS_EVALUATED",
-        actor=body.authenticated_agent_id or "unverified-agent",
-        target=body.claimed_agent_id,
-        detail={
-            "decision_id": decision.decision_id,
-            "event_id": decision.event_id,
-            "outcome": decision.outcome.value,
-            "overall_severity": (
-                decision.overall_severity.value if decision.overall_severity else None
-            ),
-            "rule_ids": [finding.rule_id for finding in decision.findings],
-        },
-    )
-    return payload
+    evaluation = _evaluate_agent_access(body)
+    return _persist_agent_access_evaluation(evaluation)
 
 
 @app.get("/agent-access/decisions")
@@ -1653,25 +2281,50 @@ def list_nhi_inventory(limit: int = 100, provider: Optional[str] = None) -> Dict
     return {"count": len(records), "nhi": records}
 
 
+def _attach_lifecycle_summary(record: Dict[str, Any], nhi_id: str) -> Dict[str, Any]:
+    """`record`(`storage.get_nhi_record()` 결과)에 생명주기 요약을 덧붙인다.
+
+    `lifecycle_status`는 NHI의 관리적 상태다. 기존 필드(예: `recent_analyses`
+    안의 Credential 활성/폐기 근거)는 그대로 두고 건드리지 않는다 — NHI
+    상태와 Credential 상태를 한 값으로 합치지 않고 서로 다른 자리에 남겨
+    구분을 유지한다. 이 기능 도입 이전부터 있던 NHI는 아직 초기화되지
+    않았을 수 있으므로 `None`으로 채운다(하위 호환, 오류 아님).
+    """
+    state = storage.get_nhi_lifecycle_state(nhi_id)
+    record["lifecycle_status"] = state["status"] if state else None
+    record["lifecycle_updated_at"] = state["updated_at"] if state else None
+    return record
+
+
 @app.get("/nhi/{nhi_id}")
 def get_nhi_inventory_item(nhi_id: str) -> Dict[str, Any]:
     record = storage.get_nhi_record(nhi_id)
     if record is None:
         raise HTTPException(status_code=404, detail="NHI 를 찾을 수 없습니다.")
-    return record
+    return _attach_lifecycle_summary(record, nhi_id)
 
 
 @app.post("/nhi/{nhi_id}/dry-run")
 def dry_run_nhi_action(nhi_id: str) -> Dict[str, Any]:
     """저장된 NHI 의 `recommended_action` 기준으로, 실제 변경 없이 예상 조치
-    결과만 계산한다 (기본 구조). 실제 Credential 폐기/회전/권한 축소 등
-    조치 실행과 승인 처리는 이번 단계에서 구현하지 않는다 —
-    `agents/dry_run_service.py` 참고.
+    결과만 계산한다. 실제 Credential 폐기/회전/권한 축소 등 조치 실행과
+    승인 처리는 이번 단계에서 구현하지 않는다 — `agents/dry_run_service.py`
+    참고.
+
+    기존 5개 응답 필드(`target_nhi_id`/`recommended_action`/`expected_changes`/
+    `risk_before`/`risk_after_estimate`)는 항상 그대로 채운다. 이 NHI의 최신
+    분석 스냅샷(Change Preview 재현에 필요한 입력 포함)을 찾을 수 있으면
+    `change_preview` 키를 추가로 담아, 같은 정책/위험도/영향범위 엔진을
+    가정 상태로 재실행한 before/after·calculated/estimated/unknown 구분·
+    서비스 의존성 영향을 함께 반환한다. 분석 이력이 없거나(과거 레코드 등)
+    재현 입력이 없으면 이 키 없이(또는 `applicable=False`로) 기존과 동일하게
+    동작한다.
     """
     record = storage.get_nhi_record(nhi_id)
     if record is None:
         raise HTTPException(status_code=404, detail="NHI 를 찾을 수 없습니다.")
-    return build_dry_run_result(nhi_id, record)
+    snapshot = get_latest_analysis_snapshot(storage, nhi_id)
+    return build_dry_run_response(nhi_id, record, snapshot)
 
 
 @app.post("/nhi/{nhi_id}/approval-request")

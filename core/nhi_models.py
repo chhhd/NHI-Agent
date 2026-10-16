@@ -669,6 +669,24 @@ class PermissionUsageScenarioMatch:
 
 
 @dataclass
+class ChangePreviewSnapshot:
+    """Change Preview가 가정 상태를 재구성하기 위한 최소 입력 스냅샷.
+
+    화면에 노출되는 필드가 아니라 `agents/dry_run_service.py`가 "조치를 적용하면
+    어떻게 바뀔지"를 같은 정책/위험도/영향범위 엔진으로 재실행할 때만 쓰는
+    재현(replay)용 입력이다. `AnalysisSignals.to_dict()`와 `SecretFinding`의
+    비민감 필드 일부만 담으며, 원문 Secret 값은 애초에 이 계층에 들어오지 않으므로
+    여기에도 없다.
+    """
+
+    signals: Dict[str, Any] = field(default_factory=dict)
+    finding: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"signals": dict(self.signals), "finding": dict(self.finding)}
+
+
+@dataclass
 class NHIAnalysis:
     """분석 계층 최종 산출물 — NHI 1건에 대한 전체 분석."""
 
@@ -695,6 +713,9 @@ class NHIAnalysis:
     permission_usage: PermissionUsageResult = field(default_factory=PermissionUsageResult)
     events: List[PermissionUsageEvent] = field(default_factory=list)
     permission_scenario_matches: List[PermissionUsageScenarioMatch] = field(default_factory=list)
+    #: Change Preview 재현용 입력 스냅샷 (내부용, 7장 참고). 비어 있으면(과거
+    #: 저장된 분석) Change Preview가 `estimated`/`unknown`으로 보수적 처리한다.
+    replay_snapshot: ChangePreviewSnapshot = field(default_factory=ChangePreviewSnapshot)
 
     @property
     def recommended_action(self) -> RecommendedAction:
@@ -737,6 +758,8 @@ class NHIAnalysis:
                 match.to_dict() for match in self.permission_scenario_matches
             ],
             "analyzed_at": self.analyzed_at,
+            # 화면에 표시할 필드가 아니다 — Change Preview 재현 전용(위 docstring 참고).
+            "replay_snapshot": self.replay_snapshot.to_dict(),
         }
 
 
@@ -772,4 +795,117 @@ class NHIAnalysisReport:
             "analyses": [a.to_dict() for a in self.analyses],
             "graph": self.graph,
             "generated_at": self.generated_at,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Change Preview — 조치를 적용하기 전 가정 상태 비교 (실제 변경 없음)
+# ---------------------------------------------------------------------------
+class ImpactConfidence(str, Enum):
+    """Change Preview 항목 1건의 근거 수준.
+
+    실제로 조치를 적용해 검증한 값이 아니므로 "confirmed(확인됨)"라는 표현은
+    쓰지 않는다. 같은 규칙 기반 엔진으로 재계산했는지, 재검증 없이 과거 값을
+    추정으로 유지했는지, 아예 판단할 근거가 없는지만 구분한다.
+    """
+
+    #: 가정 상태를 입력으로 같은 정책/위험도/영향범위 엔진을 재실행해 얻은 값.
+    CALCULATED = "calculated"
+    #: 재검증 없이는 알 수 없어 과거 값·휴리스틱을 그대로 쓴 값(명시적으로 표시).
+    ESTIMATED = "estimated"
+    #: 판단할 근거 자체가 없음(데이터 없음·조회 실패 등).
+    UNKNOWN = "unknown"
+
+
+@dataclass
+class ImpactItem:
+    """서비스 의존성 또는 영향받을 수 있는 작업 1건."""
+
+    name: str
+    confidence: ImpactConfidence
+    detail: str = ""
+    evidence: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "confidence": self.confidence.value,
+            "detail": self.detail,
+            "evidence": list(self.evidence),
+        }
+
+
+@dataclass
+class ChangePreviewResult:
+    """Dry-run 조치 1건의 적용 전·후 비교 (실제 Credential/권한 변경 없음).
+
+    `risk`/`policy`/`blast_radius`의 before·after는 둘 다 같은
+    `RiskScoringAgent`/`PolicyEvidenceAgent`/`BlastRadiusCalculator`를 재사용해
+    계산한다 — after는 조치가 바꾸는 입력만 가정으로 바꾼 뒤 재실행한 결과다.
+    가정에 쓸 입력 자체가 없으면(`NHIAnalysis.replay_snapshot` 미보유 등)
+    `applicable=False`로 표시하고 after 값은 before를 그대로 복사한다.
+    """
+
+    target_nhi_id: str
+    action: RecommendedAction
+    generated_at: str = field(default_factory=_utcnow)
+    #: 이 조치에 대해 가정 상태를 계산할 수 있었는가.
+    applicable: bool = True
+    not_applicable_reason: Optional[str] = None
+
+    permissions_before: PermissionProfile = field(default_factory=PermissionProfile)
+    permissions_after: PermissionProfile = field(default_factory=PermissionProfile)
+    risk_before: RiskAssessment = field(default_factory=RiskAssessment)
+    risk_after: RiskAssessment = field(default_factory=RiskAssessment)
+    policy_before: PolicyEvaluation = field(default_factory=PolicyEvaluation)
+    policy_after: PolicyEvaluation = field(default_factory=PolicyEvaluation)
+    blast_radius_before: BlastRadiusReport = field(default_factory=BlastRadiusReport)
+    blast_radius_after: BlastRadiusReport = field(default_factory=BlastRadiusReport)
+
+    #: policy_id 목록 — 가정 상태에서 해소/신규/유지된 위반.
+    resolved_violations: List[str] = field(default_factory=list)
+    new_violations: List[str] = field(default_factory=list)
+    unchanged_violations: List[str] = field(default_factory=list)
+
+    #: 이 Credential과 연결된 서비스가 받는 영향 (연결 끊김·권한 변경 등).
+    service_dependency_impact: List[ImpactItem] = field(default_factory=list)
+    #: 조치 적용 시 영향받을 수 있는 운영 작업(예: 이 Credential을 쓰는 CI Job).
+    affected_operations: List[ImpactItem] = field(default_factory=list)
+
+    #: 근거 수준별 설명 — UI는 이 셋을 그대로 "계산됨/추정/확인불가" 섹션으로 보여준다.
+    calculated_notes: List[str] = field(default_factory=list)
+    estimated_notes: List[str] = field(default_factory=list)
+    unknown_notes: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "target_nhi_id": self.target_nhi_id,
+            "recommended_action": self.action.value,
+            "generated_at": self.generated_at,
+            "applicable": self.applicable,
+            "not_applicable_reason": self.not_applicable_reason,
+            "permissions_before": self.permissions_before.to_dict(),
+            "permissions_after": self.permissions_after.to_dict(),
+            "risk_before": self.risk_before.to_dict(),
+            "risk_after": self.risk_after.to_dict(),
+            "policy_before": self.policy_before.to_dict(),
+            "policy_after": self.policy_after.to_dict(),
+            "blast_radius_before": self.blast_radius_before.to_dict(),
+            "blast_radius_after": self.blast_radius_after.to_dict(),
+            "policy_diff": {
+                "resolved_violations": list(self.resolved_violations),
+                "new_violations": list(self.new_violations),
+                "unchanged_violations": list(self.unchanged_violations),
+            },
+            "service_dependency_impact": [
+                item.to_dict() for item in self.service_dependency_impact
+            ],
+            "affected_operations": [
+                item.to_dict() for item in self.affected_operations
+            ],
+            "data_quality": {
+                "calculated_notes": list(self.calculated_notes),
+                "estimated_notes": list(self.estimated_notes),
+                "unknown_notes": list(self.unknown_notes),
+            },
         }

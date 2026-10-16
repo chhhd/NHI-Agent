@@ -13,7 +13,9 @@ from connectors.github_connector import Repository
 from backend.models.entities import ConnectorRecord, FindingRecord, FindingStatus, ProjectRecord
 from core.action_models import ActionRequest, ActionStatus
 from core.approval_models import ApprovalRequest
+from core.destruction_models import DestructionEvidence
 from core.models import ScanResult, SecretFinding
+from core.nhi_lifecycle_models import NHILifecycleEventType, NHILifecycleStatus
 from core.observation_models import CredentialObservation
 
 
@@ -247,12 +249,143 @@ class Storage(abc.ABC):
     def get_nhi_record(self, nhi_id: str) -> Optional[Dict[str, Any]]:
         ...
 
+    # -- NHI 생명주기 (NHI 상태 — Credential 활성/폐기 상태와는 별개 축) ----
+    @abc.abstractmethod
+    def get_nhi_lifecycle_state(self, nhi_id: str) -> Optional[Dict[str, Any]]:
+        """현재 생명주기 상태. 이 기능 도입 이전 NHI 등 초기화되지 않았으면 `None`."""
+        ...
+
+    @abc.abstractmethod
+    def initialize_nhi_lifecycle(
+        self,
+        nhi_id: str,
+        *,
+        actor: str,
+        note: str = "",
+        detail: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """`REGISTERED` 상태로 최초 등록한다 + `CREATED` 이벤트 기록.
+
+        이미 초기화돼 있으면 아무것도 바꾸지 않고 현재 상태를 그대로
+        반환한다(멱등) — 재분석마다 반복 호출돼도 안전하다.
+        """
+        ...
+
+    @abc.abstractmethod
+    def update_nhi_lifecycle_status(
+        self,
+        nhi_id: str,
+        status: NHILifecycleStatus,
+        *,
+        event_type: NHILifecycleEventType,
+        actor: str,
+        note: str = "",
+        detail: Optional[Dict[str, Any]] = None,
+        destruction_evidence: Optional[DestructionEvidence] = None,
+    ) -> Dict[str, Any]:
+        """실제 상태 전이 + 이력 기록을 하나의 트랜잭션으로 처리한다.
+
+        허용되지 않은 전이면 `ValueError`, 아직 초기화되지 않은 `nhi_id`면
+        `KeyError`를 던진다. `event_type`은 상태 전이를 동반하는 유형만
+        허용된다 — `PERMISSION_CHANGED`는 `record_nhi_permission_change()`를
+        쓴다.
+
+        `destruction_evidence`는 `DECOMMISSIONED` 전이에서만 의미가 있고
+        선택 사항이다(기존 호출부와의 하위 호환을 위해 기본값 없이도 전이는
+        그대로 동작한다). 전달되면 `DestructionEvidence.validate()`(수행자
+        ≠ 검증자 등)를 통과해야 하며, 통과하지 못하면 `ValueError`로
+        아무것도 쓰지 않고 거부한다. 전달되지 않으면 이력에
+        `destruction_evidence_provided: False`만 남아, 조회하는 쪽이
+        "파기를 주장했지만 증적은 없음"과 "증적까지 확인된 파기"를 구분할
+        수 있게 한다.
+        """
+        ...
+
+    @abc.abstractmethod
+    def record_nhi_permission_change(
+        self,
+        nhi_id: str,
+        *,
+        actor: str,
+        note: str = "",
+        detail: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """권한 변경 — 상태는 그대로 두고 Timeline 이벤트만 남긴다."""
+        ...
+
+    @abc.abstractmethod
+    def get_nhi_lifecycle_history(
+        self, nhi_id: str, *, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """시간순(오래된 것부터)으로 생명주기 Timeline 이벤트를 반환한다."""
+        ...
+
     # -- 회사 AI Agent 접근 기준선 / API 호출 판정 ----------------------
     @abc.abstractmethod
     def upsert_agent_access_profile(
         self, agent_id: str, data: Dict[str, Any]
     ) -> None:
         """Agent ↔ NHI ↔ 권한·자원 승인 기준선을 저장한다."""
+        ...
+
+    # -- DPoP proof 재전송(replay) 방지 — 다중 워커·프로세스 재시작 간 공유 ----
+    @abc.abstractmethod
+    def consume_replay_key(
+        self, digest: str, *, expires_at: float, now: float, max_entries: int
+    ) -> str:
+        """``digest``(원문 replay key의 SHA-256) 를 원자적으로 "처음 봄"으로 기록한다.
+
+        반환값은 세 가지뿐이다:
+
+        * ``"NEW"``       — 처음 보는 키라 기록에 성공했다. 호출부는 요청을 통과시킨다.
+        * ``"DUPLICATE"`` — 이미 유효기간 내에 기록된 키다. 호출부는 재전송으로 보고 거부한다.
+        * ``"FULL"``      — 저장 한도(``max_entries``)에 도달해 새 키를 받지 않았다.
+          호출부는 이 경우도 거부해야 한다(fail-closed) — "가득 차서 못 막았다"를
+          "통과시켰다"로 착각하면 안 된다.
+
+        같은 ``digest``로 동시에 들어온 두 호출 중 **정확히 하나만** ``"NEW"``를
+        받아야 한다 — 구현은(예: SQLite의 ``INSERT OR IGNORE`` + UNIQUE 제약) 이
+        원자성을 보장해야 한다. 만료된(``expires_at <= now``) 과거 키는 매 호출마다
+        함께 청소해도 되고 별도 배치로 해도 된다 — 다만 삭제 자체가 이 함수의
+        원자성을 깨서는 안 된다.
+        """
+        ...
+
+    @abc.abstractmethod
+    def clear_replay_keys(self) -> None:
+        """기록된 DPoP replay 키를 전부 지운다 (테스트/운영 리셋용)."""
+        ...
+
+    # -- 변경 승인(Change Control) ---------------------------------------
+    @abc.abstractmethod
+    def create_change_request(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """`idempotency_key`가 이미 있으면 기존 레코드를 그대로 반환한다(멱등)."""
+        ...
+
+    @abc.abstractmethod
+    def get_change_request(self, change_id: str) -> Optional[Dict[str, Any]]:
+        ...
+
+    @abc.abstractmethod
+    def list_change_requests(
+        self, *, nhi_id: Optional[str] = None, status: Optional[str] = None, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        ...
+
+    @abc.abstractmethod
+    def transition_change_request(
+        self,
+        change_id: str,
+        *,
+        expected_status: str,
+        new_status: str,
+        fields: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """`expected_status`일 때만 원자적으로 전이한다. 성공 여부를 반환한다 —
+
+        동시에 두 호출이 같은 `change_id`를 같은 `expected_status`에서 전이시키려
+        하면 정확히 하나만 `True`를 받아야 한다(중복 적용/중복 롤백 방지).
+        """
         ...
 
     @abc.abstractmethod

@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field, field_validator
 
+from core.nhi_lifecycle_models import NHILifecycleStatus
 from core.nhi_models import PermissionLevel, RiskLevel
 
 
@@ -87,6 +88,29 @@ class AgentAccessProfile(BaseModel):
     updated_at: str = Field(default_factory=_utcnow)
 
 
+class NHIAccessContext(BaseModel):
+    """실시간 접근 평가 시점에 조회한 대상 NHI의 생명주기·Credential 상태.
+
+    `AgentAccessEvaluator`는 storage에 직접 접근하지 않는 순수 판정기다 —
+    호출부(API 레이어)가 `storage.get_nhi_lifecycle_state()`와 최신 분석의
+    Credential 신호(예: `replay_snapshot.finding.credential_revoked`)를
+    조회해 이 구조로 채운 뒤 넘긴다.
+
+    **절대 `AgentApiObservation`(Gateway가 보낸 값)에서 가져오면 안 된다** —
+    호출 주체가 "내 NHI는 ACTIVE"라고 자가 신고하게 두면 이 통제 자체가
+    무력화된다. 이 값은 반드시 우리 쪽 저장소 조회 결과여야 한다.
+
+    두 축 모두 선택 필드다. `lifecycle_status`가 `None`이면 "조회했지만
+    아직 초기화되지 않음"(과거 NHI 등)을 뜻하고, `credential_known_revoked`는
+    `True`일 때만 "폐기가 확인됨"을 뜻한다 — `False`/`None`은 "폐기되지
+    않았다고 확정"이 아니라 "확인되지 않음"일 수 있으므로 안전 쪽으로도,
+    차단 근거로도 쓰지 않는다.
+    """
+
+    lifecycle_status: Optional[NHILifecycleStatus] = None
+    credential_known_revoked: Optional[bool] = None
+
+
 class AgentApiObservation(BaseModel):
     """API Gateway/Audit Log가 전달하는 한 번의 Agent API 호출 사실.
 
@@ -147,4 +171,5 @@ __all__ = [
     "AgentApiObservation",
     "AgentLifecycleStatus",
     "AgentThreatFinding",
+    "NHIAccessContext",
 ]

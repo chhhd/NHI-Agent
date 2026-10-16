@@ -216,6 +216,59 @@ def test_runtime_api_denies_stolen_token_and_persists_analysis_signals(monkeypat
     assert issued.status_code == 200
     assert issued.headers["cache-control"] == "no-store"
     token = issued.json()["access_token"]
+    binding_jkt = issued.json()["cnf"]["jkt"]
+
+    # /runtime/protected가 이제 DPoP 검증(인증) 뒤에 Agent Access Evaluator
+    # (인가)도 통과해야 ALLOW한다 — 등록되지 않은 Agent/NHI는 기본 차단이다.
+    # 이 Agent를 "신뢰함"으로 만들려면 (1) NHI 생명주기를 ACTIVE로, (2) Agent
+    # 접근 기준선에 이 DPoP 키(jkt)로의 grant를 등록해야 한다.
+    saas_registration = client.post(
+        "/nhi/inventory/saas/analyze",
+        json={
+            "nhi": {
+                "provider": "runtime",
+                "nhi_id": "trusted-agent-007",
+                "nhi_name": "trusted-agent-007",
+                "active": True,
+            }
+        },
+    )
+    assert saas_registration.status_code == 200
+    runtime_nhi_id = saas_registration.json()["discovery"]["nhi_id"]
+
+    activated = client.patch(
+        f"/nhi/{runtime_nhi_id}/lifecycle",
+        json={"status": "ACTIVE", "actor": "security-admin"},
+        headers={"X-NHI-Admin-Key": "test-admin-key"},
+    )
+    assert activated.status_code == 200
+
+    profile_registered = client.put(
+        f"/agent-access/profiles/trusted-agent-007",
+        json={
+            "agent_id": "trusted-agent-007",
+            "display_name": "Trusted Runtime Agent",
+            "owner": "platform-team",
+            "inventory_complete": True,
+            "require_sender_constraint": True,
+            "allowed_binding_methods": ["DPoP"],
+            "grants": [
+                {
+                    "grant_id": "trusted-agent-007-runtime-grant",
+                    "provider": "runtime",
+                    "nhi_id": runtime_nhi_id,
+                    "credential_fingerprints": [f"jkt:{binding_jkt}"],
+                    "credential_inventory_complete": True,
+                    "permissions": ["READ"],
+                    "permission_inventory_complete": True,
+                    "resources": ["/runtime/protected"],
+                    "resource_inventory_complete": True,
+                }
+            ],
+        },
+        headers={"X-NHI-Admin-Key": "test-admin-key"},
+    )
+    assert profile_registered.status_code == 200
 
     resource_url = "http://testserver/runtime/protected"
     allowed = client.get(
@@ -231,6 +284,7 @@ def test_runtime_api_denies_stolen_token_and_persists_analysis_signals(monkeypat
     assert allowed.status_code == 200
     assert allowed.json()["decision"] == "ALLOW"
     assert allowed.json()["authenticated_as"] == "trusted-agent-007"
+    assert "agent_access_decision_id" in allowed.json()
 
     denied = client.get(
         "/runtime/protected",
@@ -270,4 +324,272 @@ def test_runtime_api_denies_stolen_token_and_persists_analysis_signals(monkeypat
         item["rule_id"] for item in incident_analysis["risk_detail"]["forced_rules"]
     }
 
+    reset_settings()
+
+
+# ---------------------------------------------------------------------------
+# /runtime/protected — DPoP 통과 이후의 Agent Access 인가 계층 (엄격한 기본 차단)
+# ---------------------------------------------------------------------------
+def _setup_runtime_client(monkeypatch):
+    monkeypatch.setenv("NHI_ADMIN_API_KEY", "test-admin-key")
+    monkeypatch.setenv("NHI_RUNTIME_TOKEN_SIGNING_KEY", SIGNING_KEY)
+    monkeypatch.setenv("NHI_RUNTIME_TOKEN_ISSUER", "api-test-issuer")
+    monkeypatch.setenv("NHI_RUNTIME_TOKEN_AUDIENCE", "api-test-audience")
+    reset_settings()
+
+    from fastapi.testclient import TestClient
+    import api.app as app_module
+
+    app_module._runtime_replay_cache.clear()
+    return TestClient(app_module.app), app_module
+
+
+def _issue_runtime_token(client, agent_id: str, key, *, now: int):
+    issue_url = "http://testserver/runtime/tokens/issue"
+    issued = client.post(
+        "/runtime/tokens/issue",
+        json={"agent_id": agent_id, "scopes": ["runtime:invoke"]},
+        headers={
+            "X-NHI-Admin-Key": "test-admin-key",
+            "DPoP": _proof(key, method="POST", htu=issue_url, now=now),
+        },
+    )
+    assert issued.status_code == 200
+    return issued.json()["access_token"], issued.json()["cnf"]["jkt"]
+
+
+def _call_protected(client, agent_id: str, key, token: str, *, now: int):
+    resource_url = "http://testserver/runtime/protected"
+    return client.get(
+        "/runtime/protected",
+        headers={
+            "Authorization": f"DPoP {token}",
+            "DPoP": _proof(key, method="GET", htu=resource_url, token=token, now=now),
+            "User-Agent": f"{agent_id}/1.0",
+        },
+    )
+
+
+def test_valid_dpop_but_unregistered_agent_is_denied_by_access_control(monkeypatch):
+    """DPoP 인증은 통과해도, Agent Access Registry에 없는 Agent는 인가 단계에서 차단된다."""
+    client, app_module = _setup_runtime_client(monkeypatch)
+    key = ec.generate_private_key(ec.SECP256R1())
+    now = int(time())
+    token, _jkt = _issue_runtime_token(client, "never-registered-agent", key, now=now)
+
+    response = _call_protected(client, "never-registered-agent", key, token, now=now)
+
+    assert response.status_code == 403
+    body = response.json()
+    assert body["decision"] == "DENY"
+    assert body["reason"] == "UNREGISTERED_AGENT"
+    reset_settings()
+
+
+def test_deactivated_nhi_is_denied_even_with_valid_dpop_and_registered_agent(monkeypatch):
+    """DPoP도 통과하고 Agent도 등록돼 있지만, 연결된 NHI가 종료 상태면 차단된다."""
+    client, app_module = _setup_runtime_client(monkeypatch)
+    key = ec.generate_private_key(ec.SECP256R1())
+    now = int(time())
+    agent_id = "deactivated-nhi-agent"
+    token, jkt = _issue_runtime_token(client, agent_id, key, now=now)
+
+    saas_registration = client.post(
+        "/nhi/inventory/saas/analyze",
+        json={"nhi": {"provider": "runtime", "nhi_id": agent_id, "nhi_name": agent_id, "active": True}},
+    )
+    nhi_id = saas_registration.json()["discovery"]["nhi_id"]
+    client.patch(
+        f"/nhi/{nhi_id}/lifecycle",
+        json={"status": "DEACTIVATED", "actor": "security-admin"},
+        headers={"X-NHI-Admin-Key": "test-admin-key"},
+    )
+    client.put(
+        f"/agent-access/profiles/{agent_id}",
+        json={
+            "agent_id": agent_id,
+            "display_name": "Deactivated NHI Agent",
+            "owner": "platform-team",
+            "inventory_complete": True,
+            "require_sender_constraint": True,
+            "allowed_binding_methods": ["DPoP"],
+            "grants": [
+                {
+                    "grant_id": f"{agent_id}-grant",
+                    "provider": "runtime",
+                    "nhi_id": nhi_id,
+                    "credential_fingerprints": [f"jkt:{jkt}"],
+                    "credential_inventory_complete": True,
+                    "permissions": ["READ"],
+                    "permission_inventory_complete": True,
+                    "resources": ["/runtime/protected"],
+                    "resource_inventory_complete": True,
+                }
+            ],
+        },
+        headers={"X-NHI-Admin-Key": "test-admin-key"},
+    )
+
+    response = _call_protected(client, agent_id, key, token, now=now)
+
+    assert response.status_code == 403
+    body = response.json()
+    assert body["decision"] == "DENY"
+    assert body["reason"] == "NHI_LIFECYCLE_NOT_ACTIVE"
+    reset_settings()
+
+
+def test_evaluator_internal_failure_fails_closed_on_runtime_protected(monkeypatch):
+    """평가 로직이 내부적으로 실패해도 ALLOW로 새지 않고 기본 차단된다."""
+    client, app_module = _setup_runtime_client(monkeypatch)
+    key = ec.generate_private_key(ec.SECP256R1())
+    now = int(time())
+    agent_id = "evaluator-crash-agent"
+    token, _jkt = _issue_runtime_token(client, agent_id, key, now=now)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("storage unavailable")
+
+    monkeypatch.setattr(app_module.agent_access_evaluator, "evaluate", _boom)
+
+    response = _call_protected(client, agent_id, key, token, now=now)
+
+    assert response.status_code == 403
+    body = response.json()
+    assert body["decision"] == "DENY"
+    assert body["reason"] == "EVALUATOR_UNAVAILABLE"
+
+    audit = client.get(
+        "/agent-access/decisions",
+        params={"agent_id": agent_id},
+        headers={"X-NHI-Admin-Key": "test-admin-key"},
+    ).json()
+    assert audit["count"] == 1
+    assert audit["decisions"][0]["outcome"] == "DENY"
+    reset_settings()
+
+
+def test_token_binding_failures_are_unaffected_by_access_control_layer(monkeypatch):
+    """DPoP 자체 실패(stolen key 등)는 기존처럼 401/400이며, 새 인가 계층 이전에 멈춘다."""
+    client, app_module = _setup_runtime_client(monkeypatch)
+    trusted_key = ec.generate_private_key(ec.SECP256R1())
+    attacker_key = ec.generate_private_key(ec.SECP256R1())
+    now = int(time())
+    agent_id = "token-binding-check-agent"
+    token, _jkt = _issue_runtime_token(client, agent_id, trusted_key, now=now)
+
+    resource_url = "http://testserver/runtime/protected"
+    response = client.get(
+        "/runtime/protected",
+        headers={
+            "Authorization": f"DPoP {token}",
+            "DPoP": _proof(
+                attacker_key, method="GET", htu=resource_url, token=token, now=now
+            ),
+            "User-Agent": "attacker/1.0",
+        },
+    )
+
+    assert response.status_code == 401
+    assert response.json()["decision"] == "DENY"
+    assert response.json()["reason"] == "sender_key_mismatch"
+    reset_settings()
+
+
+# ---------------------------------------------------------------------------
+# AccessControlMode(monitor/human_in_the_loop) — /runtime/protected 가 실제로
+# 집행하는 유일한 경계이므로, 여기서 모드가 필수 보안 차단을 우회하지 못하는지
+# 끝까지(DPoP → Agent Access Evaluator → 실제 HTTP 응답) 확인한다.
+# ---------------------------------------------------------------------------
+def test_monitor_mode_does_not_affect_dpop_failure_on_runtime_protected(monkeypatch):
+    """monitor 모드여도 DPoP 자체 검증 실패는 기존과 동일하게 401 — 이 계층은 모드보다 먼저다."""
+    monkeypatch.setenv("NHI_CONTROL_MODE", "monitor")
+    client, app_module = _setup_runtime_client(monkeypatch)
+    trusted_key = ec.generate_private_key(ec.SECP256R1())
+    attacker_key = ec.generate_private_key(ec.SECP256R1())
+    now = int(time())
+    agent_id = "monitor-mode-dpop-check"
+    token, _jkt = _issue_runtime_token(client, agent_id, trusted_key, now=now)
+
+    response = _call_protected(client, agent_id, attacker_key, token, now=now)
+
+    assert response.status_code == 401
+    assert response.json()["decision"] == "DENY"
+    assert response.json()["reason"] == "sender_key_mismatch"
+    reset_settings()
+
+
+def test_monitor_mode_does_not_bypass_deactivated_nhi_on_runtime_protected(monkeypatch):
+    """monitor 모드여도 비활성 Lifecycle(DENY)은 /runtime/protected 에서 여전히 403."""
+    monkeypatch.setenv("NHI_CONTROL_MODE", "monitor")
+    client, app_module = _setup_runtime_client(monkeypatch)
+    key = ec.generate_private_key(ec.SECP256R1())
+    now = int(time())
+    agent_id = "monitor-mode-deactivated-agent"
+    token, jkt = _issue_runtime_token(client, agent_id, key, now=now)
+
+    saas_registration = client.post(
+        "/nhi/inventory/saas/analyze",
+        json={"nhi": {"provider": "runtime", "nhi_id": agent_id, "nhi_name": agent_id, "active": True}},
+    )
+    nhi_id = saas_registration.json()["discovery"]["nhi_id"]
+    client.patch(
+        f"/nhi/{nhi_id}/lifecycle",
+        json={"status": "DEACTIVATED", "actor": "security-admin"},
+        headers={"X-NHI-Admin-Key": "test-admin-key"},
+    )
+    client.put(
+        f"/agent-access/profiles/{agent_id}",
+        json={
+            "agent_id": agent_id,
+            "display_name": "Monitor Mode Deactivated Agent",
+            "owner": "platform-team",
+            "inventory_complete": True,
+            "require_sender_constraint": True,
+            "allowed_binding_methods": ["DPoP"],
+            "grants": [
+                {
+                    "grant_id": f"{agent_id}-grant",
+                    "provider": "runtime",
+                    "nhi_id": nhi_id,
+                    "credential_fingerprints": [f"jkt:{jkt}"],
+                    "credential_inventory_complete": True,
+                    "permissions": ["READ"],
+                    "permission_inventory_complete": True,
+                    "resources": ["/runtime/protected"],
+                    "resource_inventory_complete": True,
+                }
+            ],
+        },
+        headers={"X-NHI-Admin-Key": "test-admin-key"},
+    )
+
+    response = _call_protected(client, agent_id, key, token, now=now)
+
+    assert response.status_code == 403
+    body = response.json()
+    assert body["decision"] == "DENY"
+    assert body["reason"] == "NHI_LIFECYCLE_NOT_ACTIVE"
+    reset_settings()
+
+
+def test_monitor_mode_fail_closed_on_evaluator_failure_is_unaffected(monkeypatch):
+    """monitor 모드여도 평가기 내부 실패는 fail-closed(BLOCK) — 모드가 장애 상황을 완화하지 않는다."""
+    monkeypatch.setenv("NHI_CONTROL_MODE", "monitor")
+    client, app_module = _setup_runtime_client(monkeypatch)
+    key = ec.generate_private_key(ec.SECP256R1())
+    now = int(time())
+    agent_id = "monitor-mode-evaluator-crash-agent"
+    token, _jkt = _issue_runtime_token(client, agent_id, key, now=now)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("storage unavailable")
+
+    monkeypatch.setattr(app_module.agent_access_evaluator, "evaluate", _boom)
+
+    response = _call_protected(client, agent_id, key, token, now=now)
+
+    assert response.status_code == 403
+    assert response.json()["decision"] == "DENY"
+    assert response.json()["reason"] == "EVALUATOR_UNAVAILABLE"
     reset_settings()

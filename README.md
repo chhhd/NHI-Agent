@@ -41,9 +41,9 @@ API 호출과 과도한 권한·민감 자원 접근을 근거 기반으로 식�
                             ▼
              Blast Radius        연결 서비스·자원·외부 전송·교차 프로젝트
                             ▼
-             Policy Engine       정책 6종 위반 판정
+             Policy Engine       정책 8종 위반 판정
                             ▼
-             Risk Scoring        100점 만점 7영역 + 강제 Critical 7종
+             Risk Scoring        100점 만점 7영역 + 강제 Critical 8종
                             ▼
              Decision Engine     자동 조치 / 사람 검토 / 예외 승인
                             ▼
@@ -76,19 +76,29 @@ Agent 실행 계층은 이 파이프라인을 하나의 도구로 감싼 다음,
    → (허용 시) EVALUATE_POLICY → COMPLETE
 ```
 
-실행 시점의 위장·범위 초과 호출은 별도 경로에서 판정한다.
+실행 시점의 위장·범위 초과 호출은 별도 경로에서 판정하고, 그 판정을 실제 집행
+권고로까지 변환한다(3.6절).
 
 ```
 회사 Agent Registry                        API Gateway / Audit Log
 Agent → 승인 NHI → Credential                    실제 호출
      → 권한 → 허용 자원                          주장 Agent / 인증 Agent
             └──────────────────┬────────────────── NHI / 권한 / 대상 자원
+                               │  ◄── 서버 저장소 조회(Gateway 입력 신뢰 안 함)
+                               │      NHI 생명주기 상태 (3.5절) · Credential 폐기 확인
                                ▼
                     Agent Access Evaluator
-          신원 불일치 · Token replay · 권한/자원 초과
+          신원 불일치 · Token replay · 권한/자원 초과 · 비활성/파기 NHI
                                ▼
                     ALLOW / REVIEW / DENY + 이력
+                               ▼
+              집행 권고: ALLOW만 ALLOW, REVIEW/DENY/평가실패는 BLOCK
 ```
+
+이 판정·집행 권고를 **실제로 요청에 적용**(차단)하는 경계는 이 저장소가 직접
+서빙하는 `/runtime/protected` 하나뿐이다. GitHub·Slack·AWS 등 외부 provider API는
+이 시스템이 가로챌 수 없으므로, 그 경로에 실제로 적용하려면 별도 egress
+프록시/API Gateway가 같은 판정 API를 호출해야 한다(12장 "아직 없음" 참고).
 
 ---
 
@@ -153,7 +163,7 @@ agents/                  NHI 분석 Agent
 └─ heuristics.py               경로·변수명·주석 신호 추출 공용 유틸
 
 policy/
-├─ rules.py              정책 6종 + 강제 Critical 7종 + EvaluationContext + PolicyConfig
+├─ rules.py              정책 8종 + 강제 Critical 8종 + EvaluationContext + PolicyConfig
 ├─ scoring.py            평가 영역 7개 배점 및 등급 산정
 └─ decision_engine.py    자동 조치 / 사람 검토 / 예외 승인 판단
 
@@ -326,15 +336,88 @@ NHI 상세 다이얼로그에서 이어지는 흐름이며, **이 단계는 실�
 | GET | `/approvals` | 승인 요청 목록 |
 | POST | `/approvals/{approval_id}/approve` · `/reject` | 승인/거부 (기존 조치 승인과 동일하게 `X-NHI-Admin-Key` + `{actor, reason}` 필요) |
 
-`POST /nhi/{nhi_id}/dry-run` 응답은 `target_nhi_id`, `recommended_action`,
+`POST /nhi/{nhi_id}/dry-run` 응답은 기존처럼 `target_nhi_id`, `recommended_action`,
 `expected_changes`(조치 유형별 안내 문구), `risk_before`, `risk_after_estimate`(조치
-유형별 고정 감소율을 적용한 **추정치** — 정책 엔진을 재실행한 값이 아니다)다.
+유형별 고정 감소율을 적용한 **추정치** — 이 5개 필드는 항상 그대로 채워져 하위 호환을
+유지한다)를 담는다. 이 NHI에 Change Preview 재현 입력이 있는 분석이 하나라도 있으면
+`change_preview` 키가 추가된다 — 3.4절 참고.
 `POST /nhi/{nhi_id}/approval-request` 응답은 `id`, `target_nhi_id`, `recommended_action`,
 `status`(`pending`/`approved`/`rejected`), `created_at`, `decided_at`다. 승인/거부는
 `APPROVAL_GRANTED`/`APPROVAL_REJECTED` 감사 이벤트로 남는다(`GET /audit`).
 
 Dashboard의 Review queue 화면에는 기존 조치 승인 목록 아래에 "NHI 승인 요청" 목록이
 추가로 있어 pending 요청을 같은 화면에서 승인/거부할 수 있다.
+
+### 3.4 Change Preview — 조치 적용 전·후 비교 (실제 변경 없음)
+
+`POST /nhi/{nhi_id}/dry-run` 응답의 `change_preview` 섹션. 실제로 Credential/권한을
+바꾸지 않고, 조치가 바꿀 입력(권한/Owner/Agent 상태 등)만 가정한 뒤 **같은** Policy
+Engine·Risk Scoring·Blast Radius 엔진(6장)을 재실행해 before/after를 계산한다 —
+Change Preview 전용 점수·정책 로직은 없다. 이 재현에 필요한 입력(`replay_snapshot`)이
+없는 분석(이 기능 도입 이전 레코드, 데모 workspace의 합성 데이터 등)은
+`change_preview.applicable=false`로 표시될 뿐 예외를 던지지 않는다.
+
+| 조치 | 가정하는 변화 |
+| --- | --- |
+| `TOKEN_REVOCATION` | Credential 비활성·폐기 |
+| `TOKEN_ROTATION` | 같은 권한으로 재발급(수명만 초기화) |
+| `SCOPE_REDUCTION` | ADMIN/DELETE 제거, 최소 READ만 유지 |
+| `ASSIGN_OWNER` | Owner 지정("아직 미확정" 상태로 표시) |
+| `SPLIT_TOKEN_PER_PROJECT` | 공유 프로젝트 해소 |
+| `MOVE_TO_ENV_VAR` | 하드코딩 해소 |
+| `DISABLE_INACTIVE_NHI` | Agent 상태 중지 + Credential 비활성 |
+| `MONITOR` / `REQUEST_REAPPROVAL` | 변화 없음(no-op) |
+
+실제로 조치를 적용해 검증한 값이 아니므로 모든 결과 항목은 `data_quality`에서 세
+근거 수준으로 구분된다.
+
+- `calculated` — 가정 상태로 엔진을 재실행해 계산한 값
+- `estimated` — 재검증 없이는 알 수 없어 과거 값·휴리스틱을 유지한 값(`usage_analysis`/
+  보안 이벤트는 재현 입력에 없어 항상 이쪽이다 — Change Preview의 `risk_before`가 원래
+  저장된 분석의 `risk_score`와 다를 수 있는 이유)
+- `unknown` — 판단할 근거 자체가 없는 값
+
+`service_dependency_impact`(연결 서비스가 받는 영향)와 `affected_operations`(이
+Credential에 의존할 수 있는 작업)도 실제 의존 여부가 확인되지 않으면 전부
+`unknown`으로 표시하고 단정하지 않는다.
+
+### 3.5 NHI 생명주기 관리 (Lifecycle)
+
+NHI "상태"(이 신원이 조직에서 등록·운영·종료·파기 중 어느 단계인가)는
+Credential 자체의 기술적 상태(`credential_active`/`credential_revoked` — 토큰이
+유효한가)와 **다른 축**으로 완전히 분리해서 관리한다. 저장소 구조도 분리돼 있다
+— `nhi_lifecycle_state`/`nhi_lifecycle_history` 테이블은 `nhi_identities`(Credential
+쪽 데이터)와 무관하게 독립적으로 존재한다.
+
+| 현재 상태 | 전이 가능한 상태 |
+| --- | --- |
+| `REGISTERED` | `ACTIVE`, `DEACTIVATED` |
+| `ACTIVE` | `DEACTIVATED` |
+| `DEACTIVATED` | `ACTIVE`(재사용), `DECOMMISSIONED` |
+| `DECOMMISSIONED` | 없음(최종 상태) |
+
+"권한 변경"은 상태가 아니라 Timeline 이벤트(`PERMISSION_CHANGED`)로만 기록된다 —
+권한이 바뀌어도 NHI는 보통 계속 `ACTIVE`로 운영되므로 상태로 취급하면 "사용 중"
+정보가 사라진다.
+
+| Method | Path | 설명 |
+| --- | --- | --- |
+| PATCH | `/nhi/{nhi_id}/lifecycle` | 상태 수동 전이. 관리자 API Key 필요, 허용되지 않은 전이는 409, 결과는 `NHI_LIFECYCLE_STATUS_CHANGED` 감사 이벤트로 남음 |
+| GET | `/nhi/{nhi_id}/timeline` | 생명주기 이벤트(`lifecycle_event`) + 분석 이력(`analysis_snapshot`)을 시간순(최신 먼저)으로 병합 |
+
+신규 NHI가 최초로 분석·저장되면(`persist_analysis`) `REGISTERED` 상태 + `CREATED`
+이벤트가 자동 기록된다. 이 초기화는 멱등이다 — 재분석마다 반복돼도 이미 전이된
+상태(예: `ACTIVE`)를 `REGISTERED`로 되돌리거나 이벤트를 중복 생성하지 않는다.
+분석 저장 자체가 중간에 실패하면(예: 저장소 오류) 생명주기 데이터도 전혀 쓰이지
+않는다 — "분석도 없이 NHI가 등록된 것처럼" 보이는 불일치를 막기 위함이다.
+
+`GET /nhi/{nhi_id}` 응답에는 `lifecycle_status`/`lifecycle_updated_at`이 추가된다
+(이 기능 도입 이전 NHI는 `null` — 하위 호환, 오류 아님). Dashboard NHI 상세의
+"생명주기" 섹션은 NHI 상태와 Credential 상태를 나란히 표시하고, **NHI가
+`DEACTIVATED`/`DECOMMISSIONED`인데 Credential 폐기가 확인되지 않았으면** 경고
+배너로 "파기 완료로 오해하지 말고 Credential 상태를 별도로 재검증하라"고 명시한다.
+Timeline 화면은 생성·활성화·권한 변경·비활성화·파기 이벤트를 분석 이력과 함께
+시간순으로 보여준다.
 
 ### GitHub 조직 NHI Discovery
 
@@ -403,6 +486,36 @@ Slack Connector 결과는 원문 응답 대신 `GitHubNHIInput` 또는 `SaaSNHII
 Slack 검증은 원문 Token을 body/query로 받지 않는다. 서버의 `SLACK_BOT_TOKEN`과
 `X-NHI-Admin-Key`만 사용하므로 Token이 access log나 APM에 복제되는 경로를 막는다.
 
+### 3.6 실시간 접근 통제 — 판정을 실제 집행 권고로 변환
+
+`AgentAccessEvaluator`(위)는 ALLOW/REVIEW/DENY만 판정하고, 집행(실제로 이 요청을
+통과시킬지)은 `backend/services/access_enforcement.py`의 순수 함수가 맡는다. 정책은
+고정값이다.
+
+| 판정 outcome | 집행 (`recommended_enforcement.action`) |
+| --- | --- |
+| `ALLOW` | `ALLOW` |
+| `REVIEW` | **`BLOCK`**(사람이 확인하기 전까지 기본 차단) |
+| `DENY` | `BLOCK` |
+| 평가 로직 내부 오류 | `BLOCK`(전용 규칙 `EVALUATOR_UNAVAILABLE`, fail-closed) |
+
+`POST /agent-access/evaluate` 응답에는 기존 필드에 더해 `recommended_enforcement`
+(`{action, reason, credential_state}`)가 추가된다. Credential 폐기 여부가 확인되지
+않으면 차단/허용 사유와 섞이지 않도록 `credential_state="unknown"`으로 항상 별도
+표시한다. 평가 로직이 내부적으로 예외를 던지면(예: 저장소 조회 실패) 500을 돌려주는
+대신 이 fail-closed 응답을 만든다 — Gateway가 5xx를 놓치고 기본 허용으로 처리하는
+사고를 막기 위함이다.
+
+이 평가는 NHI 생명주기(3.5절)·Credential 상태와 연계된다 — 요청 본문의 `nhi_id`를
+기준으로 **서버 저장소에서** 생명주기 상태와 최신 분석(7일 이내)의 Credential 폐기
+확인 여부를 조회해 반영하며, Gateway가 보낸 값은 쓰지 않는다(자가 신고로 통제가
+무력화되는 것을 막기 위함). `DEACTIVATED`/`DECOMMISSIONED` NHI와 폐기 확인된
+Credential은 `DENY`, `REGISTERED`(등록만 되고 미활성)와 상태 자체가 확인되지 않는
+경우는 서로 다른 rule_id의 `REVIEW`로 구분된다(각각 `NHI_LIFECYCLE_NOT_ACTIVE`,
+`CREDENTIAL_KNOWN_REVOKED` / `NHI_LIFECYCLE_PENDING_ACTIVATION`,
+`NHI_LIFECYCLE_UNKNOWN`). 7일보다 오래된 분석의 Credential 신호는 미확인으로
+되돌린다 — 오래된 정보를 최신처럼 신뢰하지 않기 위함이다.
+
 ### AI Agent API token 탈취·재사용 방어 연구 (DPoP)
 
 검토한 방식과 이 연구에 대한 적합성은 다음과 같다.
@@ -436,7 +549,7 @@ fingerprint가 아니라 Agent의 EC P-256 공개키 thumbprint를 access token�
 | Method | Path | 설명 |
 | --- | --- | --- |
 | POST | `/runtime/tokens/issue` | 연구 경로에서 관리자 지정 Agent ID에 5분 DPoP-bound token 발급 |
-| GET·POST | `/runtime/protected` | Agent private key 보유까지 검증하는 보호 리소스 |
+| GET·POST | `/runtime/protected` | Agent private key 보유 + Agent Access 인가까지 검증하는 보호 리소스 (아래 "실시간 접근 통제 연동" 참고) |
 
 발급 API는 현재 연구용 계정 bootstrap 경계이므로 `X-NHI-Admin-Key`가 필요하다.
 운영에서는 이 경계를 조직 IdP 또는 SPIFFE/클라우드 Workload Identity로 교체한다.
@@ -462,6 +575,33 @@ API 실행 후 `python scripts/demo_dpop_replay.py`를 호출하면 정상 key�
 같은 공유 TTL 저장소로 교체하고, 장기 token이 필요하면 DPoP nonce 또는 조직 IdP의
 정식 sender-constrained token 발급 기능을 사용한다. Agent private key도 가능하면
 TPM/HSM/KMS처럼 내보낼 수 없는 저장소에 둔다.
+
+#### 실시간 접근 통제 연동 — `/runtime/protected`가 실제로 차단하는 유일한 경계
+
+`/runtime/protected`는 DPoP 검증(인증)에 성공해도 **그것만으로 ALLOW하지 않는다** —
+이어서 3.6절의 평가+집행 로직(인가)을 통과해야 한다. NHI/자원 식별은 요청자가
+주장한 값이 아니라 DPoP로 증명된 `agent_id`와 실제 HTTP 메서드·경로에서만 만든다
+(`nhi_id = "runtime:" + 인증된 agent_id`, `resource = 요청 경로`) — 이 엔드포인트는
+요청 바디 자체를 받지 않으므로 호출자가 그 값을 자유 입력으로 주장할 방법이
+구조적으로 없다. 등록되지 않은 Agent, 승인되지 않은 NHI/자원, `REVIEW` 판정, 평가
+실패는 모두 403으로 차단된다. DPoP 자체 검증 실패(stolen key, proof replay 등)는
+여전히 401/400이며 이 레이어보다 먼저 걸린다 — 기존 동작 무변경.
+
+이 Agent를 "신뢰함"으로 만들려면(ALLOW를 받으려면) 다음을 등록해야 한다 —
+`scripts/demo_dpop_replay.py`가 실제로 거치는 순서다.
+
+1. `POST /nhi/inventory/saas/analyze`로 `provider="runtime"`, `nhi_id=<agent_id>`
+   NHI를 등록한다(`persist_analysis`가 자동으로 `REGISTERED` 상태를 만든다).
+2. `PATCH /nhi/runtime:<agent_id>/lifecycle`로 `ACTIVE` 전이.
+3. `PUT /agent-access/profiles/<agent_id>`로 `provider="runtime"`, 해당 `nhi_id`,
+   `credential_fingerprints=["jkt:<토큰 발급 응답의 cnf.jkt>"]` grant 등록.
+
+**이 통제가 실제로 적용되는 범위는 이 저장소가 직접 서빙하는 `/runtime/protected`
+하나뿐이다.** GitHub·Slack·AWS 같은 외부 provider의 실제 API 서버는 이 시스템이
+가로챌 수 없다 — `POST /agent-access/evaluate`가 내리는 판정은 그 외부 API 호출
+앞에 별도 egress 프록시/API Gateway가 있어야 실제로 적용된다. 계약(요청/응답
+스키마, `recommended_enforcement`)은 그대로 재사용할 수 있지만, 그 프록시 자체는
+이 저장소 범위 밖이다(12장 "미구현" 참고).
 
 검사할 GitHub 저장소가 없어도 Dashboard 상단의 **데모 데이터 생성** 버튼으로
 전체 흐름을 확인할 수 있다. 이 기능은 실제 Secret이나 외부 API 호출 없이 합성
@@ -603,15 +743,17 @@ python scripts/demo_github_analysis.py --repo psf/requests --max-files 5 --run-a
 | **POST** | **`/nhi/slack/inventory/analyze`** | **Slack Bot/User Token 라이브 인벤토리 분석** |
 | **POST** | **`/nhi/aws/inventory/analyze`** | **AWS IAM Access Key 라이브 인벤토리 분석** |
 | GET | `/nhi` `?provider=` | NHI 목록, provider 필터(생략 시 전체, 미존재 provider는 빈 목록) |
-| GET | `/nhi/{nhi_id}` | NHI 상세 (`recent_analyses` 포함) |
-| **POST** | **`/nhi/{nhi_id}/dry-run`** | **recommended_action 기준 예상 변경/위험도 추정 (실행 없음, 3.3절)** |
+| GET | `/nhi/{nhi_id}` | NHI 상세 (`recent_analyses`, `lifecycle_status`/`lifecycle_updated_at` 포함) |
+| **POST** | **`/nhi/{nhi_id}/dry-run`** | **recommended_action 기준 예상 변경/위험도 추정 + Change Preview(`change_preview`, 3.4절)** |
+| **PATCH** | **`/nhi/{nhi_id}/lifecycle`** | **NHI 생명주기 상태 수동 전이 (3.5절, 관리자 API Key 필요, 허용 안 된 전이는 409)** |
+| **GET** | **`/nhi/{nhi_id}/timeline`** | **생명주기 이벤트 + 분석 이력을 시간순으로 병합 (3.5절)** |
 | **POST** | **`/nhi/{nhi_id}/approval-request`** | **승인 요청 생성 (`pending`)** |
 | **GET** | **`/approvals`** | **승인 요청 목록** |
 | **POST** | **`/approvals/{approval_id}/approve`** · **`/reject`** | **승인/거부 (관리자 API Key 필요)** |
 | POST | `/nhi/usage/normalize` | 원본 감사 이벤트 필터링·중복 제거 → 분석 신호 |
 | POST | `/nhi/scopes/translate` | Scope → 공통 권한 변환 |
 | PUT·GET | `/agent-access/profiles/{agent_id}` | 회사 Agent의 승인 NHI·권한·자원 기준선 |
-| POST | `/agent-access/evaluate` | 실제 API 호출의 위장·범위 초과 판정 |
+| **POST** | **`/agent-access/evaluate`** | **실제 API 호출의 위장·범위 초과·NHI 생명주기/Credential 판정 + 집행 권고(`recommended_enforcement`, 3.6절)** |
 | GET | `/agent-access/decisions` · `/agent-access/rules` | 판정 이력·규칙 카탈로그 |
 | **POST** | **`/agent/nhi/run`** | **분석 Orchestrator 실행 (계획 → 도구 실행 → 재계획)** |
 | **POST** | **`/integrations/github/discover`** | **GitHub 조직 App installation 수집·전건 분석** |
@@ -1049,14 +1191,20 @@ GitHub 조직 수집 실행은 원문 inventory나 token을 감사 로그에 복
   추천 조치·scenario reason), 요약 카드 (3.2절)
 - Dry-run 예상 조치 계산과 Human Approval 상태 추적/감사 로그 — **실제 Credential
   변경 실행은 아직 없음** (3.3절)
+- Change Preview — 조치가 바꿀 입력만 가정해 같은 Policy/Risk/Blast Radius 엔진을
+  재실행한 변경 전·후 비교, `calculated`/`estimated`/`unknown` 근거 구분, 서비스
+  의존성·영향 작업 표시 — **실제 변경 없음** (3.4절)
+- NHI 생명주기 관리 — `REGISTERED`/`ACTIVE`/`DEACTIVATED`/`DECOMMISSIONED` 자동
+  등록(최초 분석 시)·수동 전이 API·Timeline API/대시보드, Credential 기술적 상태와
+  분리 표시 + 불일치(예: 파기 상태인데 Credential 폐기 미확인) 경고 (3.5절)
 - GitHub 조직 App installation 수집, Microsoft 365·Google Workspace 인벤토리 수집,
   GitHub Webhook 자동 검사
 - Slack/GitLab/Notion/Hugging Face Credential 탐지·읽기 전용 검증 Connector
 - Regex + Entropy Secret 탐지, 마스킹, Fingerprint, 중복 병합, 재스캔 판정
 - 탐지된 토큰의 외부 API 재검증 (읽기 전용)
 - NHI 식별 / 문맥 분석 / Scope 정규화 / Blast Radius / 관계 그래프
-- 규칙 기반 위험 점수(7영역 100점) + 강제 Critical 7종
-- 정책 엔진 6종 + 조치 결정(자동/검토/예외) + 조치 권고 9종
+- 규칙 기반 위험 점수(7영역 100점) + 강제 Critical 8종
+- 정책 엔진 8종 + 조치 결정(자동/검토/예외) + 조치 권고 9종
 - NHI 인벤토리 직접 입력 경로 (스캔 결과 없이 분석)
 - Agent 실행 계층 (Planner / Tool Registry / 조건부 Replanner / Orchestrator)
 - GitHub 조직 App installation 자동 수집, 전건 분석, 수집·저장소·Secret Scan 완전성 구분
@@ -1064,8 +1212,12 @@ GitHub 조직 수집 실행은 원문 inventory나 token을 감사 로그에 복
   canonical Scenario Match, Secret Scan 2차 재계획
 - GitHub 자격 증명 접근 저장소 전체 페이지 순회와 수집 실패/상한 완전성 표시
 - 회사 Agent ↔ NHI ↔ Credential ↔ 권한·자원 승인 기준선과 접근 범위 요약
-- 위장 Agent, Token replay, 미승인 Credential, 권한·자원 초과 `ALLOW/REVIEW/DENY` 판정·이력
-- DPoP key-bound 단기 token 발급·API 검증·proof replay 차단 연구 경로
+- 위장 Agent, Token replay, 미승인 Credential, 권한·자원 초과 `ALLOW/REVIEW/DENY` 판정·이력,
+  NHI 생명주기·Credential 폐기 확인 연계, 판정 → 집행 권고(`recommended_enforcement`)
+  변환(REVIEW/DENY/평가 실패는 기본 차단) (3.6절)
+- DPoP key-bound 단기 token 발급·API 검증·proof replay 차단 연구 경로 +
+  `/runtime/protected`에 Agent Access 평가·집행 실제 연동(이 저장소가 직접 서빙하는
+  경계에서는 실제로 403 차단됨 — "미구현" 항목의 외부 provider 한계와 구분할 것)
 - SQLite 분석 이력/감사 영속화와 NHI별 스냅샷 비교, PostgreSQL 운영 스키마, FastAPI + Dashboard/Swagger
 - Decision Flow·분석 변화·Agent Run 시각화와 반응형 Dashboard, 자동화 테스트 (`pytest`)
 
@@ -1077,8 +1229,12 @@ GitHub 조직 수집 실행은 원문 inventory나 token을 감사 로그에 복
   저장소 이름은 조직 API 응답만으로 확정할 수 없어 불완전 범위로 표시한다.
 - Microsoft 365·Google Workspace Connector는 일부 계정·Credential·활동 근거를 수집하지만
   전 조직의 모든 Resource·행위를 완전한 snapshot으로 보장하지 않는다.
-- Agent 접근 기준선과 판정 API는 구현됐지만 실제 사내 API Gateway가 호출·차단을 적용하는
-  연동, 조직 IdP 기반 authenticated_agent_id, 자동 profile reconciliation은 아직 없다.
+- Agent 접근 기준선·판정·집행 정책(`recommended_enforcement`)은 구현됐고, 이 시스템이
+  **직접 서빙하는** `/runtime/protected`에는 실제로 적용된다(등록 안 된 Agent, 비활성/
+  파기 NHI, REVIEW, 평가 실패 모두 403). 다만 **GitHub/Slack/AWS 등 외부 provider API
+  앞단에 실제로 서는 사내 API Gateway/egress 프록시 연동은 없다** — `/agent-access/evaluate`
+  계약은 그대로 재사용할 수 있지만 그 프록시 자체를 구현하지 않았다. 조직 IdP 기반
+  `authenticated_agent_id`, 자동 profile reconciliation도 아직 없다.
 - DPoP는 탈취 Bearer Token 재사용을 막는 연구 데모와 API 검증까지 구현됐다. 운영용 key
   enrollment·IdP 연동·분산 replay 저장소는 아직 없다.
 - Project의 schedule 필드는 저장되지만 실행 Scheduler는 아직 없다. 오해를 막기 위해
@@ -1087,12 +1243,19 @@ GitHub 조직 수집 실행은 원문 inventory나 token을 감사 로그에 복
 **아직 없음**
 
 - 주 공급자 Audit Log·CMDB·IdP를 결합한 authoritative Owner/환경/사용/수명 데이터 수집
-- 실제 사내 API Gateway의 동기 enforcement 또는 비동기 로그 스트리밍 연동
+- **GitHub/Slack/AWS 등 외부 provider API 앞단의 실제 egress 프록시/API Gateway
+  동기 enforcement** — `/runtime/protected`는 이 저장소가 직접 서빙하므로 실제로
+  차단되지만, 외부 provider의 실제 서버를 가로챌 수는 없다. 계약(`POST
+  /agent-access/evaluate`, `recommended_enforcement`)은 재사용 가능하지만 그 프록시
+  자체를 구현해야 실제 차단이 된다
 - GitHub/Microsoft/Slack 인벤토리에서 AgentAccessProfile을 자동 조립·정합하는 reconciler
+- 조치 승인 시 NHI 생명주기를 자동으로 전이시키는 훅(예: TOKEN_REVOCATION 승인 →
+  `DEACTIVATED`) — 현재는 `PATCH /nhi/{nhi_id}/lifecycle`로 수동 전이만 가능
 - 대규모 조직용 비동기·페이지형 분석 job, Scheduler, 완전 snapshot reconciliation
 - 최종 사용자 로그인/RBAC, 운영용 Agent key enrollment, 분산 DPoP replay 저장소·KMS
-- 승인 후 실제 revoke/rotate/scope 축소 **실행**과 rollback·사후 검증 — Dry-run(예상 결과
-  계산)과 Human Approval(상태 추적)까지만 구현됨, 실행 엔진 연결은 다음 단계
+- 승인 후 실제 revoke/rotate/scope 축소 **실행**과 rollback·사후 검증 — Dry-run/Change
+  Preview(예상 결과 계산)와 Human Approval(상태 추적)까지만 구현됨, 실행 엔진 연결은
+  다음 단계
 - 신규 OAuth 동의 시점의 과도한 Scope 예방 경고·차단
 - LLM 기반 목표 해석과 자연어 보고서(위험 판정은 규칙 기반 유지)
 

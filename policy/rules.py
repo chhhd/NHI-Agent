@@ -54,6 +54,23 @@ class PolicyConfig:
     auto_remediation_max_score: int = 79
     #: 사람 검토가 필요한 최소 위험 점수
     human_review_min_score: int = 60
+    #: 광역(조직/전사) OAuth Scope 로 간주할 키워드 (대소문자 무시, 부분 일치)
+    #: 예: SaaS 연동 Agent 가 mail.read, files.read.all 같은 전사 범위 Scope 를 받는 경우
+    broad_oauth_scope_keywords: Sequence[str] = (
+        "read.all", "readwrite.all", "write.all", "full_access", "all_urls", "*",
+    )
+    #: 관측되면 IAM 권한 상승 시도로 간주할 행위 키워드 (감사 로그 기반)
+    #: 예: 진단(read-only) 목적 NHI 가 같은 세션에서 정책·그룹 변경 API 를 호출하는 경우
+    privilege_escalation_actions: Sequence[str] = (
+        "createpolicy", "updatepolicy", "attachpolicy", "attachuserpolicy",
+        "attachrolepolicy", "addusertogroup", "putrolepolicy", "createaccesskey",
+        "assumerole", "putuserpolicy",
+    )
+    #: 관측되면 원본/대량 데이터 추출로 간주할 행위 키워드 (감사 로그 기반)
+    #: 예: 집계 전용으로 승인된 데이터 API 가 원본 레코드를 대량으로 반환하는 경우
+    bulk_data_export_actions: Sequence[str] = (
+        "export_csv", "bulk_export", "dump_table", "download_all", "select *",
+    )
 
 
 @dataclass
@@ -332,6 +349,60 @@ def _no_active_credential_in_repository(ctx: EvaluationContext) -> Optional[Poli
     )
 
 
+def _broad_oauth_scope(ctx: EvaluationContext) -> Optional[PolicyViolation]:
+    """광역 OAuth Scope 제한 정책.
+
+    협업 SaaS 연동(Slack/Notion/메일 등)에서 토큰 탈취나 OAuth scope 과다 동의로
+    조직 전체 범위의 데이터에 접근 가능한 Scope 를 승인받는 사례를 겨냥한다.
+    """
+    keywords = tuple(k.lower() for k in ctx.config.broad_oauth_scope_keywords)
+    if not keywords:
+        return None
+    matched = [
+        scope
+        for scope in ctx.permissions.raw_scopes
+        if any(keyword in scope.lower() for keyword in keywords)
+    ]
+    if not matched:
+        return None
+    if ctx.profile.nhi_type in tuple(ctx.config.admin_scope_allowed_types):
+        return None
+    return PolicyViolation(
+        policy_id="BROAD_OAUTH_SCOPE",
+        name="광역 OAuth Scope 제한 정책",
+        detail=f"조직/전사 범위 Scope 가 승인되어 있다: {', '.join(matched[:5])}",
+        severity=RiskLevel.HIGH,
+    )
+
+
+def _excessive_data_exposure(ctx: EvaluationContext) -> Optional[PolicyViolation]:
+    """데이터 API 과다 노출 정책 (BOPLA — 속성 단위 과다 노출).
+
+    집계·통계용으로 설계된 데이터 API 가 감사 로그상 원본 레코드 대량 추출 행위를
+    보인 경우를 겨냥한다. 통계 API인데 원문 레코드가 반환되는 시나리오.
+    """
+    sensitive = ctx.context.data_sensitivity in (
+        DataSensitivity.RESTRICTED,
+        DataSensitivity.CONFIDENTIAL,
+    )
+    if not sensitive:
+        return None
+    keywords = tuple(k.lower() for k in ctx.config.bulk_data_export_actions)
+    observed = ctx.signals.observed_actions or []
+    hits = [action for action in observed if any(k in action.lower() for k in keywords)]
+    if not hits:
+        return None
+    return PolicyViolation(
+        policy_id="EXCESSIVE_DATA_EXPOSURE",
+        name="데이터 API 과다 노출 정책",
+        detail=(
+            f"{ctx.context.data_sensitivity.value} 등급 데이터에서 대량/원본 추출 행위가 "
+            f"관측됨: {', '.join(hits[:3])}"
+        ),
+        severity=RiskLevel.HIGH,
+    )
+
+
 #: 정책 ID → 판정 함수
 POLICIES: Dict[str, Callable[[EvaluationContext], Optional[PolicyViolation]]] = {
     "OWNER_REQUIRED": _owner_required,
@@ -340,6 +411,8 @@ POLICIES: Dict[str, Callable[[EvaluationContext], Optional[PolicyViolation]]] = 
     "ADMIN_SCOPE_RESTRICTED": _admin_scope_restricted,
     "PROJECT_TOKEN_ISOLATION": _project_isolation,
     "NO_PLAINTEXT_CREDENTIAL": _no_active_credential_in_repository,
+    "BROAD_OAUTH_SCOPE": _broad_oauth_scope,
+    "EXCESSIVE_DATA_EXPOSURE": _excessive_data_exposure,
 }
 
 
@@ -431,6 +504,23 @@ def _read_only_nhi_mutates(ctx: EvaluationContext) -> Optional[str]:
     return None
 
 
+def _diagnostic_agent_self_escalation(ctx: EvaluationContext) -> Optional[str]:
+    """진단(read-only) 목적 NHI 가 같은 세션에서 IAM 권한 상승 행위를 수행했는가.
+
+    "보안 진단 Agent" 가 정책 조회 이후 스스로 관리자 권한을 부여하는 시나리오를 겨냥한다.
+    감사 로그(`observed_actions`)에 정책/그룹 변경류 API 가 함께 관측되면 강제 Critical 이다.
+    """
+    declared = set(ctx.declared_permissions)
+    if not declared or not declared <= {PermissionLevel.READ}:
+        return None
+    keywords = tuple(k.lower() for k in ctx.config.privilege_escalation_actions)
+    observed = ctx.signals.observed_actions or []
+    hits = [action for action in observed if any(k in action.lower() for k in keywords)]
+    if not hits:
+        return None
+    return f"조회 전용(진단) NHI 가 IAM 권한 상승 행위를 수행함: {', '.join(hits[:3])}"
+
+
 #: 규칙 ID → 판정 함수 (반환값은 사람이 읽는 근거 문장)
 FORCED_CRITICAL_RULES: Dict[str, Callable[[EvaluationContext], Optional[str]]] = {
     "PUBLIC_REPO_ACTIVE_ADMIN_TOKEN": _public_repo_active_admin,
@@ -440,6 +530,7 @@ FORCED_CRITICAL_RULES: Dict[str, Callable[[EvaluationContext], Optional[str]]] =
     "TOKEN_REPLAY_SUSPECTED": _token_replay_suspected,
     "TOKEN_SHARED_ACROSS_PROJECTS": _shared_across_projects,
     "READ_ONLY_NHI_PERFORMS_MUTATION": _read_only_nhi_mutates,
+    "IAM_PRIVILEGE_SELF_ESCALATION": _diagnostic_agent_self_escalation,
 }
 
 

@@ -23,6 +23,9 @@ python-dotenv>=1.0,<2.0
 
 # --- Secret material 필드 암호화 (AES-256-GCM) / DPoP·GitHub App 서명 ---
 # 50.0.0 미만은 2026년 공개 보안 권고의 영향을 받으므로 허용하지 않는다.
+# (teammate 커밋 2f9dfa8 과 동일한 상향 — Python 3.10 cp39-abi3 wheel 설치 확인,
+#  AESGCM/ec/rsa/serialization 등 사용 API 전부 안정 API라 46→50 업그레이드로
+#  회귀 없음을 전체 테스트(958개)로 확인했다.)
 cryptography>=50.0,<51.0
 
 # --- PostgreSQL 운영 Database ---

@@ -105,7 +105,67 @@ def main() -> None:
         )
         issued.raise_for_status()
         token = issued.json()["access_token"]
+        binding_jkt = issued.json()["cnf"]["jkt"]
         _result("1. DPoP-bound token 발급", issued)
+
+        # /runtime/protected는 DPoP 검증(인증)만으로 ALLOW하지 않는다 — 이어서
+        # Agent Access Evaluator(인가)도 통과해야 한다. 등록되지 않은 Agent나
+        # 승인되지 않은 NHI/자원은 기본 차단(BLOCK)이므로, 정상 경로(2번)를
+        # 보여주려면 먼저 이 Agent를 NHI 생명주기·Agent Access 기준선에
+        # 등록해야 한다.
+        registration = client.post(
+            f"{base_url}/nhi/inventory/saas/analyze",
+            json={
+                "nhi": {
+                    "provider": "runtime",
+                    "nhi_id": "trusted-agent-007",
+                    "nhi_name": "trusted-agent-007",
+                    "active": True,
+                }
+            },
+        )
+        registration.raise_for_status()
+        runtime_nhi_id = registration.json()["discovery"]["nhi_id"]
+
+        activated = client.patch(
+            f"{base_url}/nhi/{runtime_nhi_id}/lifecycle",
+            json={"status": "ACTIVE", "actor": "demo-script"},
+            headers={"X-NHI-Admin-Key": admin_key},
+        )
+        activated.raise_for_status()
+
+        profile_registered = client.put(
+            f"{base_url}/agent-access/profiles/trusted-agent-007",
+            json={
+                "agent_id": "trusted-agent-007",
+                "display_name": "Trusted Runtime Agent (demo)",
+                "owner": "platform-team",
+                "inventory_complete": True,
+                "require_sender_constraint": True,
+                "allowed_binding_methods": ["DPoP"],
+                "grants": [
+                    {
+                        "grant_id": "trusted-agent-007-runtime-grant",
+                        "provider": "runtime",
+                        "nhi_id": runtime_nhi_id,
+                        "credential_fingerprints": [f"jkt:{binding_jkt}"],
+                        "credential_inventory_complete": True,
+                        "permissions": ["READ"],
+                        "permission_inventory_complete": True,
+                        "resources": ["/runtime/protected"],
+                        "resource_inventory_complete": True,
+                    }
+                ],
+            },
+            headers={"X-NHI-Admin-Key": admin_key},
+        )
+        profile_registered.raise_for_status()
+        print(
+            json.dumps(
+                {"step": "1b. NHI 생명주기 ACTIVE + Agent Access 기준선 등록", "http_status": 200},
+                ensure_ascii=False,
+            )
+        )
 
         legitimate_proof = _proof(
             trusted_key, method="GET", htu=resource_url, token=token

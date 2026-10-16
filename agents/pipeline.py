@@ -67,6 +67,7 @@ from core.models import (
 from core.nhi_models import (
     AnalysisSignals,
     AnalysisSource,
+    ChangePreviewSnapshot,
     ContextInsight,
     NHIAnalysis,
     NHIAnalysisReport,
@@ -75,6 +76,7 @@ from core.nhi_models import (
 from graph.blast_radius import BlastRadiusCalculator, summarize_blast_radius
 from graph.relationship_graph import RelationshipGraph
 from policy.rules import EvaluationContext, PolicyConfig, evaluate_security_scenarios
+from security.redaction import sanitize_security_value
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +114,53 @@ def finding_from_dict(data: Dict[str, Any]) -> SecretFinding:
         status=ResolutionStatus(data.get("status", "new")),
         detected_at=data.get("detected_at", ""),
         secret_ref=data.get("secret_ref"),
+    )
+
+
+#: `finding_from_dict()`가 복원하는 필드 중 Change Preview 재현에 쓰는 부분만
+#: 추린 목록이다. `_raw_value`/원문 Secret은 애초에 여기 들어오지 않는다.
+_REPLAY_FINDING_FIELDS = (
+    "secret_type",
+    "provider",
+    "credential_active",
+    "credential_revoked",
+    "raw_scopes",
+    "credential_detail",
+    "occurrence_count",
+    "duplicate_locations",
+    "status",
+    "detected_at",
+)
+
+
+def _build_replay_snapshot(
+    finding: SecretFinding, signals: AnalysisSignals
+) -> ChangePreviewSnapshot:
+    """Change Preview가 가정 상태를 재구성할 수 있도록 입력을 보존한다.
+
+    `NHIAnalysis.to_dict()`에 저장되는 값이므로 원문 Secret 값은 절대 담지
+    않는다 — `SecretFinding.to_dict()`도 이미 원문을 제거하지만, `signals`는
+    감사 로그 등 신뢰할 수 없는 입력(`observed_actions`/`request_user_agent`
+    등)을 그대로 담을 수 있으므로 다른 보안 이벤트 직렬화와 동일하게
+    `sanitize_security_value()`로 한 번 더 정리한다.
+
+    `preserve_top_level_keys=True`를 준다 — `signals.to_dict()`/`finding_snapshot`의
+    최상위 키는 우리가 정의한 `AnalysisSignals`/`SecretFinding` 필드명이지,
+    감사 로그에서 온 신뢰 불가 값이 아니다. 이 플래그 없이 기본 동작(키도
+    정리)을 쓰면 `token_used_after_revocation`처럼 20자 이상인 필드명이
+    `redact_unknown_tokens()`에 토큰으로 오인돼 마스킹되고, `AnalysisSignals
+    .from_dict()`가 그 필드를 복원하지 못해 Change Preview 재계산에서 해당
+    보안 신호가 조용히 사라진다 — 값이 아니라 필드 자체를 잃는 문제였다.
+    `extra` 처럼 호출부가 정의하지 않은 중첩 dict의 키는 여전히 정리된다
+    (depth가 올라가면 기본 동작으로 돌아감).
+    """
+    finding_dict = finding.to_dict()
+    finding_snapshot = {
+        key: finding_dict.get(key) for key in _REPLAY_FINDING_FIELDS
+    }
+    return ChangePreviewSnapshot(
+        signals=sanitize_security_value(signals.to_dict(), preserve_top_level_keys=True),
+        finding=sanitize_security_value(finding_snapshot, preserve_top_level_keys=True),
     )
 
 
@@ -408,6 +457,7 @@ class NHIAnalysisPipeline:
             permission_usage=permission_usage,
             events=events,
             permission_scenario_matches=permission_scenario_matches,
+            replay_snapshot=_build_replay_snapshot(finding, signals),
         )
 
     # ------------------------------------------------------------------

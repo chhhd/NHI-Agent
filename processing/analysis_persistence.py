@@ -27,6 +27,16 @@ def persist_analysis(
     `GET /nhi`/`GET /nhi/{nhi_id}` 응답에 그대로 노출된다 — provider 마다
     필드가 다른 상세 정보(예: AWS 의 `access_key_id`/`broad_access`)를
     가공하지 않고 담는 용도다.
+
+    신규 NHI 라면 생명주기(`storage.initialize_nhi_lifecycle()`)를
+    `REGISTERED` + `CREATED` 이벤트로 초기화한다. 이 호출은 가장 마지막에
+    두고, 그 전 단계(`upsert_nhi`/`save_analysis`/`update_finding_analysis`/
+    `ActionService.create_from_analysis`) 중 하나라도 예외를 던지면 이 함수도
+    그대로 전파하며 중단된다 — 분석 저장 자체가 실패했는데 생명주기 데이터만
+    먼저 생겨 NHI가 "분석도 없이 등록된 것처럼" 보이는 불일치를 막기 위함이다.
+    이미 등록된 NHI는 `initialize_nhi_lifecycle()` 이 멱등이라(이미 있으면
+    아무것도 쓰지 않고 현재 상태를 그대로 반환) 재분석마다 호출돼도 기존
+    상태를 덮어쓰거나 `CREATED` 이벤트를 중복 생성하지 않는다.
     """
     profile = analysis.profile
     nhi_data = profile.to_dict()
@@ -69,6 +79,16 @@ def persist_analysis(
     )
     actions = ActionService(storage).create_from_analysis(
         analysis_id, analysis, policy_version=POLICY_VERSION
+    )
+    storage.initialize_nhi_lifecycle(
+        profile.nhi_id,
+        actor="system",
+        note=f"{analysis.source.value} 분석으로 최초 등록",
+        detail={
+            "source": analysis.source.value,
+            "provider": profile.provider,
+            "analysis_id": analysis_id,
+        },
     )
     return {
         "analysis_id": analysis_id,

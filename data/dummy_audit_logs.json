@@ -1,72 +1,117 @@
 {
-  "schema_version": 1,
-  "synthetic": true,
   "events": [
     {
       "nhi_id": "nhi-recent",
-      "timestamp": "2026-08-28T09:00:00+00:00",
+      "timestamp": "2026-08-28T10:00:00+00:00",
       "action": "read",
       "resource_type": "repository",
       "resource_id": "repo-1",
       "provider": "mock",
-      "metadata": {
-        "synthetic": true
-      }
+      "raw_action": "repository.read"
     },
     {
       "nhi_id": "nhi-recent",
       "timestamp": "2026-08-29T10:00:00+00:00",
       "action": "write",
       "resource_type": "repository",
-      "resource_id": "repo-2",
+      "resource_id": "repo-1",
       "provider": "mock",
-      "metadata": {
-        "synthetic": true
-      }
+      "raw_action": "repository.write"
     },
     {
-      "nhi_id": "nhi-unexpected-write",
-      "timestamp": "2026-08-30T11:00:00+00:00",
-      "action": "write",
+      "nhi_id": "nhi-admin-unused",
+      "timestamp": "2026-08-25T10:00:00+00:00",
+      "action": "read",
       "resource_type": "repository",
-      "resource_id": "repo-read-only",
+      "resource_id": "repo-2",
       "provider": "mock",
-      "metadata": {
-        "synthetic": true
-      }
+      "raw_action": "repository.read"
     },
     {
       "nhi_id": "nhi-stale",
-      "timestamp": "2026-04-01T08:00:00+00:00",
+      "timestamp": "2026-05-04T10:00:00+00:00",
       "action": "read",
-      "resource_type": "document",
-      "resource_id": "internal-doc-1",
+      "resource_type": "bucket",
+      "resource_id": "bucket-1",
       "provider": "mock",
-      "metadata": {
-        "synthetic": true
-      }
+      "raw_action": "bucket.read"
     },
     {
-      "nhi_id": "nhi-shared-token",
-      "timestamp": "2026-08-27T07:00:00+00:00",
+      "nhi_id": "nhi-orphaned",
+      "timestamp": "2026-02-13T10:00:00+00:00",
       "action": "read",
-      "resource_type": "repository",
-      "resource_id": "project-a",
+      "resource_type": "database",
+      "resource_id": "db-1",
       "provider": "mock",
-      "metadata": {
-        "synthetic": true
-      }
+      "raw_action": "database.read"
     },
     {
-      "nhi_id": "nhi-shared-token",
-      "timestamp": "2026-08-29T07:30:00+00:00",
+      "nhi_id": "nhi-unexpected-write",
+      "timestamp": "2026-08-27T10:00:00+00:00",
       "action": "write",
       "resource_type": "repository",
-      "resource_id": "project-b",
+      "resource_id": "repo-3",
       "provider": "mock",
-      "metadata": {
-        "synthetic": true
-      }
+      "raw_action": "repository.write"
     }
-  ]
+  ],
+  "_team_variant_events": {
+    "_source": "origin/feat/nhi-github-slack-aws commit 2f9dfa8 (teammate KoYejun) — load_usage_events()는 'events' 키만 읽으므로 이 키는 현재 아무 코드에도 연결되지 않는다. nhi-shared-token 이벤트 쌍은 우리 fixture에 없는 SCN_005(TOKEN_SHARED_ACROSS_PROJECTS) 커버리지를 제공해 통합 가치가 있다 — 팀 논의 후 'events'에 편입할지 결정.",
+    "events": [
+      {
+        "nhi_id": "nhi-recent",
+        "timestamp": "2026-08-28T09:00:00+00:00",
+        "action": "read",
+        "resource_type": "repository",
+        "resource_id": "repo-1",
+        "provider": "mock",
+        "metadata": {"synthetic": true}
+      },
+      {
+        "nhi_id": "nhi-recent",
+        "timestamp": "2026-08-29T10:00:00+00:00",
+        "action": "write",
+        "resource_type": "repository",
+        "resource_id": "repo-2",
+        "provider": "mock",
+        "metadata": {"synthetic": true}
+      },
+      {
+        "nhi_id": "nhi-unexpected-write",
+        "timestamp": "2026-08-30T11:00:00+00:00",
+        "action": "write",
+        "resource_type": "repository",
+        "resource_id": "repo-read-only",
+        "provider": "mock",
+        "metadata": {"synthetic": true}
+      },
+      {
+        "nhi_id": "nhi-stale",
+        "timestamp": "2026-04-01T08:00:00+00:00",
+        "action": "read",
+        "resource_type": "document",
+        "resource_id": "internal-doc-1",
+        "provider": "mock",
+        "metadata": {"synthetic": true}
+      },
+      {
+        "nhi_id": "nhi-shared-token",
+        "timestamp": "2026-08-27T07:00:00+00:00",
+        "action": "read",
+        "resource_type": "repository",
+        "resource_id": "project-a",
+        "provider": "mock",
+        "metadata": {"synthetic": true}
+      },
+      {
+        "nhi_id": "nhi-shared-token",
+        "timestamp": "2026-08-29T07:30:00+00:00",
+        "action": "write",
+        "resource_type": "repository",
+        "resource_id": "project-b",
+        "provider": "mock",
+        "metadata": {"synthetic": true}
+      }
+    ]
+  }
 }

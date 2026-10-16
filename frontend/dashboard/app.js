@@ -322,9 +322,132 @@ async function showNhiDetail(nhiId) {
   try {
     const record = await api(`/nhi/${encodeURIComponent(nhiId)}`);
     renderNhiDetailBody(record);
+    // Timeline은 별도 API라 본문과 분리해서 로드한다 — 실패해도 이미 표시된
+    // 나머지 상세 정보에는 영향을 주지 않는다.
+    loadNhiTimeline(nhiId);
   } catch (error) {
     body.innerHTML = `<div class="empty-state">상세 정보를 불러오지 못했습니다: ${escapeHtml(error.message)}</div>`;
   }
+}
+
+async function loadNhiTimeline(nhiId) {
+  const container = document.querySelector("#nhi-timeline-container");
+  if (!container) return;
+  container.innerHTML = `<div class="empty-state">Timeline 불러오는 중…</div>`;
+  try {
+    const result = await api(`/nhi/${encodeURIComponent(nhiId)}/timeline`);
+    if (state.nhiDetailId !== nhiId) return; // 그 사이 다른 NHI로 전환됐으면 버린다
+    container.innerHTML = renderNhiTimeline(result);
+  } catch (error) {
+    if (state.nhiDetailId !== nhiId) return;
+    container.innerHTML = `<div class="empty-state">Timeline을 불러오지 못했습니다: ${escapeHtml(error.message)}</div>`;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// NHI Timeline — 생명주기 이벤트(생성·활성화·권한 변경·비활성화·파기)와 분석
+// 이력을 시간순(최신 먼저, API가 이미 그 순서로 반환)으로 함께 보여준다.
+// ---------------------------------------------------------------------------
+const LIFECYCLE_EVENT_LABELS = {
+  CREATED: "생성·등록",
+  ACTIVATED: "활성화(사용 시작)",
+  PERMISSION_CHANGED: "권한 변경",
+  DEACTIVATED: "비활성화(종료)",
+  REACTIVATED: "재사용",
+  DECOMMISSIONED: "파기",
+};
+
+function renderNhiTimeline(result) {
+  const items = result.timeline || [];
+  if (!items.length) {
+    return `<div class="empty-state">아직 생명주기 이벤트나 분석 이력이 없습니다.</div>`;
+  }
+  return `
+    <div class="nhi-timeline">
+      ${items.map((item) => item.type === "lifecycle_event"
+        ? renderLifecycleTimelineItem(item)
+        : renderAnalysisTimelineItem(item)
+      ).join("")}
+    </div>
+  `;
+}
+
+function renderLifecycleTimelineItem(item) {
+  const label = LIFECYCLE_EVENT_LABELS[item.event_type] || item.event_type;
+  const transitionText = item.changes_status
+    ? `${escapeHtml(item.from_status || "—")} → ${escapeHtml(item.to_status)}`
+    : `상태 유지(${escapeHtml(item.to_status)}) — 권한 변경 기록만 남음, 상태는 바뀌지 않음`;
+  return `
+    <article class="timeline-item lifecycle">
+      <header>
+        <span class="badge TIMELINE_LIFECYCLE">NHI 상태</span>
+        <strong>${escapeHtml(label)}</strong>
+        <time>${fmtDate(item.occurred_at)}</time>
+      </header>
+      <p>${transitionText}</p>
+      ${item.note ? `<p class="sub">${escapeHtml(item.note)}</p>` : ""}
+      <footer>actor: ${escapeHtml(item.actor)}</footer>
+    </article>
+  `;
+}
+
+function renderAnalysisTimelineItem(item) {
+  return `
+    <article class="timeline-item analysis">
+      <header>
+        <span class="badge TIMELINE_ANALYSIS">분석</span>
+        ${badge(item.risk_level || "UNKNOWN")}
+        <time>${fmtDate(item.occurred_at)}</time>
+      </header>
+      <p>Risk ${item.risk_score ?? "—"} / 100 · ${escapeHtml(item.policy_outcome || "—")} · 권고 ${escapeHtml(item.recommended_action || "MONITOR")}</p>
+    </article>
+  `;
+}
+
+// ---------------------------------------------------------------------------
+// NHI 상태(관리적) vs Credential 상태(기술적) — 서로 다른 축을 나란히 보여주고,
+// 둘이 어긋나면(특히 파기인데 Credential 폐기가 확인되지 않은 경우) 경고한다.
+// ---------------------------------------------------------------------------
+function renderNhiLifecycleSummary(record, latestAnalysis) {
+  const lifecycleStatus = record.lifecycle_status;
+  const lifecycleBadge = lifecycleStatus
+    ? badge(lifecycleStatus)
+    : `<span class="badge CP_UNKNOWN">미초기화</span>`;
+
+  // Credential 활성/폐기 여부는 분석 snapshot의 replay_snapshot(Change Preview용
+  // 재현 입력)에만 구조화된 boolean으로 있다 — 이 기능 이전 분석에는 없을 수
+  // 있으므로, 없으면 "미확인"으로만 표시하고 활성/비활성을 단정하지 않는다.
+  const finding = latestAnalysis?.replay_snapshot?.finding || null;
+  let credentialLabel = "미확인";
+  let credentialClass = "CP_UNKNOWN";
+  if (finding?.credential_revoked === true) {
+    credentialLabel = "폐기됨(확인됨)";
+    credentialClass = "RESOLVED";
+  } else if (finding?.credential_active === true) {
+    credentialLabel = "활성(확인됨)";
+    credentialClass = "CRITICAL";
+  } else if (finding?.credential_active === false) {
+    credentialLabel = "비활성(확인됨)";
+    credentialClass = "LOW";
+  }
+
+  let warning = "";
+  if (lifecycleStatus === "DECOMMISSIONED" && finding?.credential_revoked !== true) {
+    warning = `<div class="cp-sim-banner">⚠ NHI는 파기(DECOMMISSIONED)로 표시되어 있지만, Credential이 실제로
+      폐기되었는지는 확인되지 않았습니다 — 이 상태를 "Credential 폐기 완료"로 오해하지 말고
+      별도로 재검증하세요.</div>`;
+  } else if (lifecycleStatus === "DEACTIVATED" && finding?.credential_active === true) {
+    warning = `<div class="cp-sim-banner">⚠ NHI는 종료(DEACTIVATED) 처리되었지만, Credential은 여전히 활성
+      상태로 확인됩니다 — 실제 폐기·회전 조치가 필요할 수 있습니다.</div>`;
+  }
+
+  return `
+    <dl>
+      <div><dt>NHI 상태 (관리적)</dt><dd>${lifecycleBadge}${record.lifecycle_updated_at ? ` <span class="sub">${fmtDate(record.lifecycle_updated_at)}</span>` : ""}</dd></div>
+      <div><dt>Credential 상태 (기술적)</dt><dd><span class="badge ${credentialClass}">${escapeHtml(credentialLabel)}</span></dd></div>
+    </dl>
+    ${warning}
+  `;
 }
 
 async function runNhiDryRun() {
@@ -346,6 +469,7 @@ async function runNhiDryRun() {
         <div><dt>Risk after (estimate)</dt><dd>${result.risk_after_estimate} / 100</dd></div>
       </dl>
       ${(result.expected_changes || []).map((change) => `<div class="risk-reason">${escapeHtml(change)}</div>`).join("")}
+      ${renderChangePreview(result.change_preview)}
     `;
     approvalButton.hidden = false;
   } catch (error) {
@@ -353,6 +477,124 @@ async function runNhiDryRun() {
   } finally {
     button.disabled = false;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Change Preview — Dry-run 응답의 change_preview 섹션(있을 때만) 렌더링.
+// 실제 Credential/권한은 바뀌지 않는 시뮬레이션이라는 점을 항상 배너로
+// 알리고, 모든 before/after 항목에 calculated/estimated/unknown 근거
+// 수준을 구분해서 보여준다(`core.nhi_models.ImpactConfidence` 와 동일한 값).
+// ---------------------------------------------------------------------------
+const CONFIDENCE_LABELS = { calculated: "계산됨", estimated: "추정", unknown: "확인 불가" };
+
+function confidenceBadge(confidence) {
+  const key = String(confidence || "unknown").toLowerCase();
+  const label = CONFIDENCE_LABELS[key] || key.toUpperCase();
+  return `<span class="badge CP_${escapeHtml(key.toUpperCase())}">${escapeHtml(label)}</span>`;
+}
+
+function changePreviewCompareRow(label, beforeHtml, afterHtml) {
+  return `
+    <div class="cp-row">
+      <span class="cp-row-label">${escapeHtml(label)}</span>
+      <span class="cp-row-before">${beforeHtml}</span>
+      <span class="cp-row-arrow">→</span>
+      <span class="cp-row-after">${afterHtml}</span>
+    </div>
+  `;
+}
+
+function changePreviewImpactList(title, items) {
+  if (!items || !items.length) return "";
+  return `
+    <p class="sub">${escapeHtml(title)}</p>
+    ${items.map((item) => `
+      <div class="risk-reason cp-impact-item">
+        <div class="cp-impact-head"><span>${escapeHtml(item.name)}</span>${confidenceBadge(item.confidence)}</div>
+        ${item.detail ? `<p>${escapeHtml(item.detail)}</p>` : ""}
+      </div>
+    `).join("")}
+  `;
+}
+
+function changePreviewNotes(title, confidence, notes) {
+  if (!notes || !notes.length) return "";
+  return `
+    <p class="sub">${confidenceBadge(confidence)} ${escapeHtml(title)}</p>
+    ${notes.map((note) => `<div class="risk-reason">${escapeHtml(note)}</div>`).join("")}
+  `;
+}
+
+function renderChangePreview(preview) {
+  if (!preview) return "";
+
+  const banner = `<div class="cp-sim-banner">⚠ 이 비교는 시뮬레이션 결과입니다 — 실제 Credential/권한은 변경되지 않았습니다.</div>`;
+
+  if (!preview.applicable) {
+    return `
+      <div class="change-preview">
+        <h4>Change Preview</h4>
+        ${banner}
+        <div class="empty-state">${escapeHtml(preview.not_applicable_reason || "이 조치에 대한 Change Preview를 계산할 수 없습니다.")}</div>
+      </div>
+    `;
+  }
+
+  const riskBefore = preview.risk_before || {};
+  const riskAfter = preview.risk_after || {};
+  const blastBefore = preview.blast_radius_before || {};
+  const blastAfter = preview.blast_radius_after || {};
+  const permsBefore = preview.permissions_before?.permissions || [];
+  const permsAfter = preview.permissions_after?.permissions || [];
+  const diff = preview.policy_diff || {};
+  const dq = preview.data_quality || {};
+
+  const compareRows = [
+    changePreviewCompareRow(
+      "위험도",
+      `${badge(riskBefore.level || "UNKNOWN")} ${riskBefore.score ?? "—"}`,
+      `${badge(riskAfter.level || "UNKNOWN")} ${riskAfter.score ?? "—"}`,
+    ),
+    changePreviewCompareRow(
+      "권한",
+      permsBefore.length ? permsBefore.map(badge).join(" ") : `<span class="empty-state">없음</span>`,
+      permsAfter.length ? permsAfter.map(badge).join(" ") : `<span class="empty-state">없음</span>`,
+    ),
+    changePreviewCompareRow(
+      "Blast radius impact",
+      `${blastBefore.impact_score ?? "—"} / 100`,
+      `${blastAfter.impact_score ?? "—"} / 100`,
+    ),
+    changePreviewCompareRow(
+      "연결 서비스",
+      escapeHtml((blastBefore.connected_services || []).join(", ") || "—"),
+      escapeHtml((blastAfter.connected_services || []).join(", ") || "—"),
+    ),
+  ];
+
+  const hasPolicyChange = diff.resolved_violations?.length || diff.new_violations?.length || diff.unchanged_violations?.length;
+  const policyHtml = hasPolicyChange ? `
+    <div class="cp-policy-diff">
+      ${diff.resolved_violations?.length ? `<p><span class="removed">해소됨</span> ${diff.resolved_violations.map(escapeHtml).join(", ")}</p>` : ""}
+      ${diff.new_violations?.length ? `<p><span class="added">신규</span> ${diff.new_violations.map(escapeHtml).join(", ")}</p>` : ""}
+      ${diff.unchanged_violations?.length ? `<p class="sub">유지됨: ${diff.unchanged_violations.map(escapeHtml).join(", ")}</p>` : ""}
+    </div>
+  ` : `<div class="empty-state">정책 위반 없음(변화 없음)</div>`;
+
+  return `
+    <div class="change-preview">
+      <h4>Change Preview <span class="sub">(계산됨 — 같은 정책·위험도·영향범위 엔진을 가정 상태로 재실행)</span></h4>
+      ${banner}
+      <div class="cp-compare">${compareRows.join("")}</div>
+      <p class="sub">정책 위반 변화</p>
+      ${policyHtml}
+      ${changePreviewImpactList("서비스 의존성 영향", preview.service_dependency_impact)}
+      ${changePreviewImpactList("영향받을 수 있는 작업", preview.affected_operations)}
+      ${changePreviewNotes("근거", "calculated", dq.calculated_notes)}
+      ${changePreviewNotes("근거", "estimated", dq.estimated_notes)}
+      ${changePreviewNotes("근거", "unknown", dq.unknown_notes)}
+    </div>
+  `;
 }
 
 async function requestNhiApproval() {
@@ -479,6 +721,9 @@ function renderNhiDetailBody(record) {
       <div><dt>Environment</dt><dd>${escapeHtml(record.environment || "unknown")}</dd></div>
     </dl>
 
+    <h3>생명주기</h3>
+    ${renderNhiLifecycleSummary(record, latest)}
+
     <h3>위험도</h3>
     <dl>
       <div><dt>Risk score</dt><dd>${record.risk_score ?? "—"} / 100</dd></div>
@@ -511,6 +756,9 @@ function renderNhiDetailBody(record) {
     <div id="nhi-dry-run-result"></div>
     <button type="button" id="nhi-approval-request-button" class="secondary-button" onclick="requestNhiApproval()" hidden>승인 요청</button>
     <div id="nhi-approval-result"></div>
+
+    <h3>Timeline</h3>
+    <div id="nhi-timeline-container"><div class="empty-state">불러오는 중…</div></div>
   `;
 }
 

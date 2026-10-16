@@ -24,8 +24,10 @@ from backend.models.entities import (
     ProjectRecord,
 )
 from backend.services.finding_lifecycle import validate_transition
+from backend.services.nhi_lifecycle import validate_transition as validate_nhi_lifecycle_transition
 from core.action_models import ActionRequest, ActionStatus
 from core.approval_models import ApprovalRequest
+from core.destruction_models import DestructionEvidence, evidence_digest
 from core.models import (
     CodeContext,
     DetectorType,
@@ -35,7 +37,13 @@ from core.models import (
     SecretFinding,
     Severity,
 )
+from core.nhi_lifecycle_models import (
+    STATUS_TRANSITION_EVENTS,
+    NHILifecycleEventType,
+    NHILifecycleStatus,
+)
 from core.observation_models import CredentialObservation
+from security.redaction import sanitize_security_text, sanitize_security_value
 from storage.base import Storage
 
 _SCHEMA = """
@@ -115,6 +123,53 @@ CREATE TABLE IF NOT EXISTS credential_nhi_bindings (
     updated_at  TEXT NOT NULL,
     PRIMARY KEY (fingerprint, nhi_id)
 );
+
+-- NHI 생명주기(관리적 축 — REGISTERED/ACTIVE/DEACTIVATED/DECOMMISSIONED).
+-- Credential 자체의 활성/폐기 여부(`findings.credential_active` 등)는 이
+-- 테이블과 무관한 별도 축이라 여기서 다루지 않는다.
+CREATE TABLE IF NOT EXISTS nhi_lifecycle_state (
+    nhi_id      TEXT PRIMARY KEY,
+    status      TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS nhi_lifecycle_history (
+    history_id  TEXT PRIMARY KEY,
+    nhi_id      TEXT NOT NULL,
+    event_type  TEXT NOT NULL,
+    from_status TEXT,
+    to_status   TEXT NOT NULL,
+    actor       TEXT NOT NULL,
+    note        TEXT,
+    detail      TEXT NOT NULL,
+    occurred_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_nhi_lifecycle_history_nhi
+    ON nhi_lifecycle_history(nhi_id, occurred_at);
+
+-- 변경 승인(Change Control) — Change Preview 결과를 승인·적용·롤백까지 추적한다.
+-- 실제 Provider 호출은 전혀 하지 않는다(executor_result.provider_call 이 항상
+-- "not_configured") — InventoryStateExecutor 가 내부 상태(NHI Lifecycle)만 바꾼다.
+CREATE TABLE IF NOT EXISTS change_requests (
+    change_id          TEXT PRIMARY KEY,
+    nhi_id              TEXT NOT NULL,
+    idempotency_key     TEXT NOT NULL UNIQUE,
+    status              TEXT NOT NULL,
+    data                TEXT NOT NULL,
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_change_requests_nhi ON change_requests(nhi_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_change_requests_status ON change_requests(status);
+
+-- DPoP proof(jti) 재전송 방지 — jkt|method|htu|jti 조합의 SHA-256만 저장한다
+-- (원문 jti/jkt/서명은 저장하지 않는다). 여러 워커·프로세스 재시작 사이에서도
+-- 같은 DB 파일을 공유하면 단일 사용이 유지된다.
+CREATE TABLE IF NOT EXISTS dpop_replay (
+    digest      TEXT PRIMARY KEY,
+    expires_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dpop_replay_expires ON dpop_replay(expires_at);
 
 CREATE TABLE IF NOT EXISTS agent_access_profiles (
     agent_id    TEXT PRIMARY KEY,
@@ -313,6 +368,13 @@ class SQLiteStorage(Storage):
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
+        # busy_timeout: 다른 프로세스(워커)가 쓰기 중이면 즉시 "database is
+        # locked" 에러를 내지 않고 잠깐 기다린다 — DPoP replay 키처럼 여러
+        # 워커가 동시에 쓸 수 있는 테이블의 정상적인 경합을 에러로 착각하지
+        # 않게 한다. WAL은 파일 기반 DB에서만 의미가 있다(:memory: 는 그대로).
+        self._conn.execute("PRAGMA busy_timeout = 5000")
+        if db_path != ":memory:":
+            self._conn.execute("PRAGMA journal_mode = WAL")
         with self._lock:
             self._conn.executescript(_SCHEMA)
             self._conn.commit()
@@ -697,6 +759,255 @@ class SQLiteStorage(Storage):
             )
             self._conn.commit()
 
+    # -- NHI 생명주기 (NHI 상태 — Credential 활성/폐기 상태와는 별개 축) ----
+    def get_nhi_lifecycle_state(self, nhi_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT nhi_id, status, updated_at FROM nhi_lifecycle_state WHERE nhi_id=?",
+                (nhi_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def initialize_nhi_lifecycle(
+        self,
+        nhi_id: str,
+        *,
+        actor: str,
+        note: str = "",
+        detail: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        with self._lock:
+            existing = self._conn.execute(
+                "SELECT nhi_id, status, updated_at FROM nhi_lifecycle_state WHERE nhi_id=?",
+                (nhi_id,),
+            ).fetchone()
+            if existing is not None:
+                return dict(existing)
+
+            now = _utcnow()
+            self._conn.execute(
+                "INSERT INTO nhi_lifecycle_state (nhi_id, status, updated_at) VALUES (?, ?, ?)",
+                (nhi_id, NHILifecycleStatus.REGISTERED.value, now),
+            )
+            self._insert_nhi_lifecycle_history_locked(
+                nhi_id,
+                NHILifecycleEventType.CREATED,
+                from_status=None,
+                to_status=NHILifecycleStatus.REGISTERED,
+                actor=actor,
+                note=note,
+                detail=detail,
+            )
+            self._conn.commit()
+        return {"nhi_id": nhi_id, "status": NHILifecycleStatus.REGISTERED.value, "updated_at": now}
+
+    def update_nhi_lifecycle_status(
+        self,
+        nhi_id: str,
+        status: NHILifecycleStatus,
+        *,
+        event_type: NHILifecycleEventType,
+        actor: str,
+        note: str = "",
+        detail: Optional[Dict[str, Any]] = None,
+        destruction_evidence: Optional[DestructionEvidence] = None,
+    ) -> Dict[str, Any]:
+        if event_type not in STATUS_TRANSITION_EVENTS:
+            raise ValueError(
+                f"'{event_type.value}' 는 상태 전이를 동반하지 않는 이벤트입니다 — "
+                "record_nhi_permission_change() 를 사용하세요."
+            )
+        # DECOMMISSIONED 로 전이할 때만 증적을 다룬다. 전달되면 먼저 검증하고
+        # (수행자≠검증자 등), 실패 시 아래 쓰기 전체를 건너뛴다 — 상태/이력
+        # 어느 쪽도 바뀌지 않는다.
+        if destruction_evidence is not None and status is not NHILifecycleStatus.DECOMMISSIONED:
+            raise ValueError("destruction_evidence 는 DECOMMISSIONED 전이에서만 사용합니다.")
+        if destruction_evidence is not None:
+            destruction_evidence.validate()
+
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT status FROM nhi_lifecycle_state WHERE nhi_id=?", (nhi_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(nhi_id)
+            current = NHILifecycleStatus(row["status"])
+            # 잘못된 전이 방지 — 허용되지 않으면 ValueError, 상태/이력 모두 쓰지 않는다
+            # (아래 쓰기 전에 검증하므로 실패 시 트랜잭션에 아무 변경도 남지 않는다).
+            validate_nhi_lifecycle_transition(current, status)
+
+            final_detail = dict(detail or {})
+            preserve_detail_keys = False
+            extra_unsanitized_detail: Optional[Dict[str, Any]] = None
+            if status is NHILifecycleStatus.DECOMMISSIONED:
+                # 두 분기 모두 20자 이상의 구조화된 키(destruction_*,
+                # destruction_evidence_provided)를 depth 0에 넣으므로, 증적
+                # 유무와 무관하게 키 이름을 보존해야 한다.
+                preserve_detail_keys = True
+                if destruction_evidence is not None:
+                    previous_row = self._conn.execute(
+                        "SELECT history_id FROM nhi_lifecycle_history WHERE nhi_id=? "
+                        "ORDER BY occurred_at DESC, rowid DESC LIMIT 1",
+                        (nhi_id,),
+                    ).fetchone()
+                    previous_event_id = previous_row["history_id"] if previous_row else None
+                    evidence_dict = destruction_evidence.to_dict()
+                    # `preserve_top_level_keys`는 depth 0 키만 보존하므로, 증적을
+                    # 중첩 dict로 넣으면 그 내부 필드명(예: verification_result,
+                    # 20자)이 depth 1에서 다시 마스킹 대상이 된다 — Change Preview
+                    # replay snapshot 버그와 같은 원인이라, 애초에 중첩시키지 않고
+                    # detail 최상위에 펼쳐 담는다.
+                    final_detail["destruction_method"] = evidence_dict["method"]
+                    final_detail["destruction_performed_by"] = evidence_dict["performed_by"]
+                    final_detail["destruction_verified_by"] = evidence_dict["verified_by"]
+                    final_detail["destruction_verification_check"] = evidence_dict[
+                        "verification_check"
+                    ]
+                    final_detail["destruction_verification_result"] = evidence_dict[
+                        "verification_result"
+                    ]
+                    final_detail["destruction_verified_at"] = evidence_dict["verified_at"]
+                    final_detail["destruction_notes"] = evidence_dict["notes"]
+                    final_detail["destruction_evidence_provided"] = True
+                    # sha256 다이제스트는 20자 이상의 불투명 문자열이라 값
+                    # 마스킹(redact_unknown_tokens)에 그대로 걸린다 — 우리가
+                    # 계산한 해시일 뿐 사용자 입력이 아니므로 sanitize 이후에
+                    # 그대로 붙인다(위 docstring 참고).
+                    extra_unsanitized_detail = {
+                        "evidence_digest": evidence_digest(evidence_dict, previous_event_id)
+                    }
+                else:
+                    final_detail["destruction_evidence_provided"] = False
+
+            now = _utcnow()
+            self._conn.execute(
+                "UPDATE nhi_lifecycle_state SET status=?, updated_at=? WHERE nhi_id=?",
+                (status.value, now, nhi_id),
+            )
+            self._insert_nhi_lifecycle_history_locked(
+                nhi_id,
+                event_type,
+                from_status=current,
+                to_status=status,
+                actor=actor,
+                note=note,
+                detail=final_detail,
+                preserve_detail_keys=preserve_detail_keys,
+                extra_unsanitized_detail=extra_unsanitized_detail,
+            )
+            # 상태 갱신과 이력 기록을 같은 커밋으로 묶어 하나의 트랜잭션으로 처리한다.
+            self._conn.commit()
+        return {"nhi_id": nhi_id, "status": status.value, "updated_at": now}
+
+    def record_nhi_permission_change(
+        self,
+        nhi_id: str,
+        *,
+        actor: str,
+        note: str = "",
+        detail: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """권한 변경 — 상태(`nhi_lifecycle_state.status`)는 건드리지 않고
+        Timeline 이벤트만 남긴다. `from_status`/`to_status`가 같은 값으로
+        기록되는 것으로 "상태 전이가 아님"을 표시한다.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT status FROM nhi_lifecycle_state WHERE nhi_id=?", (nhi_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(nhi_id)
+            current = NHILifecycleStatus(row["status"])
+            self._insert_nhi_lifecycle_history_locked(
+                nhi_id,
+                NHILifecycleEventType.PERMISSION_CHANGED,
+                from_status=current,
+                to_status=current,
+                actor=actor,
+                note=note,
+                detail=detail,
+            )
+            self._conn.commit()
+        return {"nhi_id": nhi_id, "status": current.value}
+
+    def _insert_nhi_lifecycle_history_locked(
+        self,
+        nhi_id: str,
+        event_type: NHILifecycleEventType,
+        *,
+        from_status: Optional[NHILifecycleStatus],
+        to_status: NHILifecycleStatus,
+        actor: str,
+        note: str,
+        detail: Optional[Dict[str, Any]],
+        preserve_detail_keys: bool = False,
+        extra_unsanitized_detail: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """호출부가 이미 `self._lock`을 쥔 상태에서만 호출한다(커밋은 호출부 책임).
+
+        `note`/`detail`은 관리자가 자유 텍스트로 입력할 수 있는 필드라 — 다른
+        보안 이벤트 직렬화와 동일하게 `sanitize_security_text`/
+        `sanitize_security_value`로 Credential-like 값을 제거한 뒤 저장한다.
+
+        `preserve_detail_keys=True`면 `detail`의 최상위 키 이름은 보존한다
+        (값은 여전히 마스킹) — `destruction_evidence`처럼 구조화된 긴
+        필드명(예: `verification_result`, 20자)이 토큰형 문자열로 오인돼
+        마스킹되는 걸 막는다(`security/redaction.py` 의
+        `preserve_top_level_keys` 와 같은 설계, Change Preview replay
+        snapshot 버그 수정과 동일한 원인·대응).
+
+        `extra_unsanitized_detail`은 정리(sanitize) 이후에 그대로 덧붙인다 —
+        `evidence_digest`처럼 우리가 직접 계산한 해시값은 20자 이상의
+        불투명한 문자열이라 값 마스킹(`redact_unknown_tokens`)에 걸려
+        깨지지만, 사용자 입력이 아니라 우리 데이터로만 계산한 해시라 애초에
+        정리할 민감정보가 없다. 자유 텍스트(`note`/`detail`의 다른 필드)는
+        여기 넣지 않는다.
+        """
+        safe_note = sanitize_security_text(note) if note else ""
+        safe_detail = sanitize_security_value(
+            detail or {}, preserve_top_level_keys=preserve_detail_keys
+        )
+        if extra_unsanitized_detail:
+            safe_detail.update(extra_unsanitized_detail)
+        self._conn.execute(
+            """
+            INSERT INTO nhi_lifecycle_history
+                (history_id, nhi_id, event_type, from_status, to_status,
+                 actor, note, detail, occurred_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(uuid4()),
+                nhi_id,
+                event_type.value,
+                from_status.value if from_status else None,
+                to_status.value,
+                actor,
+                safe_note,
+                json.dumps(safe_detail, ensure_ascii=False),
+                _utcnow(),
+            ),
+        )
+
+    def get_nhi_lifecycle_history(
+        self, nhi_id: str, *, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT history_id, nhi_id, event_type, from_status, to_status,
+                       actor, note, detail, occurred_at
+                FROM nhi_lifecycle_history WHERE nhi_id=? ORDER BY occurred_at LIMIT ?
+                """,
+                (nhi_id, limit),
+            ).fetchall()
+        results = []
+        for row in rows:
+            item = dict(row)
+            item["detail"] = json.loads(item["detail"]) if item.get("detail") else {}
+            results.append(item)
+        return results
+
     def save_analysis(
         self,
         data: Dict[str, Any],
@@ -762,16 +1073,24 @@ class SQLiteStorage(Storage):
     def list_nhi_analyses(
         self, nhi_id: str, *, limit: int = 100
     ) -> List[Dict[str, Any]]:
-        """Credential↔NHI binding을 기준으로 분석 이력을 최신순 조회한다."""
+        """Credential↔NHI binding을 기준으로 분석 이력을 최신순 조회한다.
+
+        `analyzed_at`만으로 정렬하면, 짧은 시간에 분석이 여러 번 저장될 때
+        (테스트처럼 아주 빠르게 연속 저장되는 경우 등) 타임스탬프가 같은 값으로
+        겹쳐 "최신"이 어느 쪽인지 결정할 수 없는 경우가 생긴다 — `ar.rowid`
+        (삽입 순서)를 2차 정렬 키로 둬 항상 실제로 더 나중에 저장된 분석이
+        먼저 오게 한다(`ar`에서 온 같은 물리적 행은 join으로 몇 번 중복돼도
+        rowid가 같으므로 `SELECT DISTINCT`의 중복 제거는 그대로 유지된다).
+        """
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT DISTINCT ar.data, ar.analyzed_at
+                SELECT DISTINCT ar.data, ar.analyzed_at, ar.rowid
                 FROM analysis_runs ar
                 JOIN credential_nhi_bindings binding
                   ON binding.fingerprint = ar.fingerprint
                 WHERE binding.nhi_id=?
-                ORDER BY ar.analyzed_at DESC
+                ORDER BY ar.analyzed_at DESC, ar.rowid DESC
                 LIMIT ?
                 """,
                 (nhi_id, limit),
@@ -1327,6 +1646,138 @@ class SQLiteStorage(Storage):
         result["recent_analyses"] = [json.loads(item["data"]) for item in analyses]
         return result
 
+    # -- 변경 승인(Change Control) --------------------------------------
+    def create_change_request(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """`idempotency_key`가 이미 있으면 새로 만들지 않고 기존 레코드를 그대로
+        반환한다 — 같은 키로 재요청(예: 네트워크 재시도)해도 중복 생성되지 않는다.
+        """
+        with self._lock:
+            existing = self._conn.execute(
+                "SELECT data FROM change_requests WHERE idempotency_key=?",
+                (data["idempotency_key"],),
+            ).fetchone()
+            if existing is not None:
+                return json.loads(existing["data"])
+            now = data.get("created_at") or _utcnow()
+            self._conn.execute(
+                """
+                INSERT INTO change_requests
+                    (change_id, nhi_id, idempotency_key, status, data, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    data["change_id"], data["nhi_id"], data["idempotency_key"],
+                    data["status"], json.dumps(data, ensure_ascii=False), now, now,
+                ),
+            )
+            self._conn.commit()
+        return data
+
+    def get_change_request(self, change_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT data FROM change_requests WHERE change_id=?", (change_id,)
+            ).fetchone()
+        return json.loads(row["data"]) if row else None
+
+    def list_change_requests(
+        self,
+        *,
+        nhi_id: Optional[str] = None,
+        status: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        clauses = []
+        args: List[Any] = []
+        if nhi_id:
+            clauses.append("nhi_id=?")
+            args.append(nhi_id)
+        if status:
+            clauses.append("status=?")
+            args.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT data FROM change_requests {where} "
+                "ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (*args, limit),
+            ).fetchall()
+        return [json.loads(row["data"]) for row in rows]
+
+    def transition_change_request(
+        self,
+        change_id: str,
+        *,
+        expected_status: str,
+        new_status: str,
+        fields: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """`expected_status`일 때만 원자적으로 `new_status`로 전이하고 `fields`를
+        병합한다. 반환값이 `False`면 아무것도 바뀌지 않았다 — 호출부는 "이미
+        다른 요청이 처리함" 또는 "더 이상 그 상태가 아님"으로 해석해야 한다.
+
+        `UPDATE ... WHERE change_id=? AND status=?`의 `WHERE`가 전이 가능 여부를
+        최종적으로 판단하므로, 동시에 여러 호출이 들어와도 정확히 하나만
+        `rowcount == 1`을 받는다 — 중복 적용·중복 롤백 방지의 핵심이다.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT data FROM change_requests WHERE change_id=? AND status=?",
+                (change_id, expected_status),
+            ).fetchone()
+            if row is None:
+                return False
+            payload = json.loads(row["data"])
+            payload.update(fields or {})
+            payload["status"] = new_status
+            now = _utcnow()
+            payload["updated_at"] = now
+            cursor = self._conn.execute(
+                "UPDATE change_requests SET status=?, data=?, updated_at=? "
+                "WHERE change_id=? AND status=?",
+                (new_status, json.dumps(payload, ensure_ascii=False), now, change_id, expected_status),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
+
+    # -- DPoP proof(jti) 재전송 방지 ------------------------------------
+    def consume_replay_key(
+        self, digest: str, *, expires_at: float, now: float, max_entries: int
+    ) -> str:
+        """``digest``를 원자적으로 "처음 봄"으로 기록한다. `NEW`/`DUPLICATE`/`FULL`.
+
+        `DELETE`(만료 정리) → `COUNT(*)`(한도 확인) → `INSERT OR IGNORE ...
+        SELECT`(조건부 삽입)를 **하나의 SQLite 트랜잭션**으로 실행한다 —
+        `DELETE`가 먼저 쓰기 트랜잭션을 열어 이후 문장까지 같은 트랜잭션에
+        묶이므로, 같은 DB 파일을 쓰는 다른 프로세스가 동시에 같은 `digest`로
+        들어와도 SQLite의 파일 잠금이 둘을 직렬화한다 — 두 호출 중 정확히
+        하나만 `INSERT`에 성공한다(`cursor.rowcount == 1`). `self._lock`은
+        같은 프로세스 내 스레드 간 경합만 줄일 뿐, 이 원자성 자체는 SQLite
+        트랜잭션이 보장한다(다중 프로세스에서도 유지되는 이유).
+        """
+        with self._lock:
+            self._conn.execute("DELETE FROM dpop_replay WHERE expires_at <= ?", (now,))
+            total = self._conn.execute(
+                "SELECT COUNT(*) FROM dpop_replay"
+            ).fetchone()[0]
+            cursor = self._conn.execute(
+                "INSERT OR IGNORE INTO dpop_replay (digest, expires_at) "
+                "SELECT ?, ? WHERE ? < ?",
+                (digest, expires_at, total, max_entries),
+            )
+            self._conn.commit()
+            if cursor.rowcount == 1:
+                return "NEW"
+            exists = self._conn.execute(
+                "SELECT 1 FROM dpop_replay WHERE digest=?", (digest,)
+            ).fetchone()
+            return "DUPLICATE" if exists else "FULL"
+
+    def clear_replay_keys(self) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM dpop_replay")
+            self._conn.commit()
+
     # -- 회사 AI Agent 접근 기준선 / API 호출 판정 ----------------------
     def upsert_agent_access_profile(
         self, agent_id: str, data: Dict[str, Any]
@@ -1637,6 +2088,8 @@ class SQLiteStorage(Storage):
             counts["actions"] = delete_in("action_requests", "action_id", action_ids)
             delete_in("finding_status_history", "finding_id", finding_ids)
             delete_in("credential_nhi_bindings", "nhi_id", nhi_ids)
+            delete_in("nhi_lifecycle_history", "nhi_id", nhi_ids)
+            delete_in("nhi_lifecycle_state", "nhi_id", nhi_ids)
             if fingerprints:
                 delete_in("credential_nhi_bindings", "fingerprint", fingerprints)
                 delete_in("encrypted_secret_material", "fingerprint", fingerprints)

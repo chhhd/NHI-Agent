@@ -207,6 +207,25 @@ class DatabaseSettings:
 
 
 @dataclass
+class AccessControlSettings:
+    """실시간 접근 통제 운영 모드.
+
+    `enforce`(기본값)는 기존 동작 그대로다 — ALLOW만 허용, REVIEW/DENY는
+    차단. `monitor`는 판정만 기록하고 REVIEW는 통과시키는 섀도 모드지만,
+    **DENY(비활성 Lifecycle, 폐기 확인된 Credential, 평가 실패 등 blocking=True
+    finding)는 이 모드에서도 절대 통과시키지 않는다** — `monitor`는 "아직
+    확정하지 못한 요청을 더 지켜볼지"를 바꿀 뿐, "이미 확정된 위반을 막을지"는
+    바꾸지 않는다(`backend/services/access_enforcement.py::enforcement_action_for()`
+    참고). `human_in_the_loop`는 REVIEW를 `enforce`와 동일하게 차단하지만,
+    "정책상 영구 차단"이 아니라 "사람 승인 대기"라는 의미를 응답의
+    `directive`에 남긴다 — 이 프로젝트는 아직 승인 후 재시도 흐름을 구현하지
+    않았으므로 실제로는 승인 전까지 계속 차단된다.
+    """
+
+    mode: str = field(default_factory=lambda: _env("NHI_CONTROL_MODE", "enforce"))
+
+
+@dataclass
 class Settings:
     github: GitHubSettings = field(default_factory=GitHubSettings)
     github_app: GitHubAppSettings = field(default_factory=GitHubAppSettings)
@@ -216,6 +235,7 @@ class Settings:
     scanner: ScannerSettings = field(default_factory=ScannerSettings)
     secret_storage: SecretStorageSettings = field(default_factory=SecretStorageSettings)
     runtime_security: RuntimeSecuritySettings = field(default_factory=RuntimeSecuritySettings)
+    access_control: AccessControlSettings = field(default_factory=AccessControlSettings)
     database: DatabaseSettings = field(default_factory=DatabaseSettings)
     http_timeout: float = field(default_factory=lambda: _env_float("HTTP_TIMEOUT", 15.0))
     max_retries: int = field(default_factory=lambda: _env_int("HTTP_MAX_RETRIES", 3))

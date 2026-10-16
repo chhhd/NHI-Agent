@@ -197,6 +197,50 @@ tbody tr:hover { background: rgba(255,255,255,.018); }
 .badge.MEDIUM { color: var(--medium); border-color: rgba(245,204,95,.3); }
 .badge.LOW, .badge.CONNECTED, .badge.RESOLVED { color: var(--low); border-color: rgba(84,214,157,.3); }
 .badge.NEW, .badge.NEEDS_REVIEW, .badge.PENDING_APPROVAL { color: var(--accent-2); border-color: rgba(77,163,255,.3); }
+.badge.CP_CALCULATED { color: var(--low); border-color: rgba(84,214,157,.3); }
+.badge.CP_ESTIMATED { color: var(--medium); border-color: rgba(245,204,95,.3); }
+.badge.CP_UNKNOWN { color: var(--muted); border-color: var(--line); border-style: dashed; }
+
+/* NHI 생명주기 상태 — Credential 상태 배지는 기존 CRITICAL/LOW/RESOLVED/CP_UNKNOWN 재사용 */
+.badge.REGISTERED { color: var(--accent-2); border-color: rgba(77,163,255,.3); }
+.badge.ACTIVE { color: var(--low); border-color: rgba(84,214,157,.3); }
+.badge.DEACTIVATED { color: var(--medium); border-color: rgba(245,204,95,.3); }
+.badge.DECOMMISSIONED { color: var(--muted); border-color: var(--line); }
+.badge.TIMELINE_LIFECYCLE { color: #a58bff; border-color: rgba(165,139,255,.35); }
+.badge.TIMELINE_ANALYSIS { color: var(--accent); border-color: rgba(104,224,193,.3); }
+
+/* Change Preview — Dry-run 결과에 추가되는 변경 전·후 비교 섹션 */
+.change-preview { margin-top: 14px; padding-top: 14px; border-top: 1px dashed var(--line); }
+.change-preview h4 { margin: 0 0 10px; font-size: 12px; }
+.change-preview h4 .sub { display: inline; margin-left: 6px; font-size: 10px; }
+.cp-sim-banner { margin-bottom: 12px; padding: 9px 12px; border: 1px solid rgba(245,204,95,.35); border-radius: 8px; background: rgba(245,204,95,.06); color: var(--medium); font-size: 11px; }
+.cp-compare { display: grid; gap: 8px; margin-bottom: 4px; }
+.cp-row { display: grid; grid-template-columns: 130px 1fr 20px 1fr; align-items: center; gap: 8px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: rgba(255,255,255,.015); }
+.cp-row-label { color: var(--muted); font-size: 10px; }
+.cp-row-before, .cp-row-after { font-size: 11px; color: #c8d5e5; overflow-wrap: anywhere; }
+.cp-row-arrow { color: var(--muted); text-align: center; }
+.cp-policy-diff p { margin: 4px 0; font-size: 11px; color: #c8d5e5; }
+.cp-policy-diff .added { color: var(--high); font-weight: 700; }
+.cp-policy-diff .removed { color: var(--low); font-weight: 700; }
+.cp-impact-item { margin-top: 8px; }
+.cp-impact-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11px; color: var(--text); }
+
+@media (max-width: 480px) {
+  .cp-row { grid-template-columns: 1fr; gap: 4px; }
+  .cp-row-arrow { display: none; }
+}
+
+/* NHI Timeline — 생명주기 이벤트 + 분석 이력을 같은 세로 목록에 표시 */
+.nhi-timeline { display: grid; gap: 0; }
+.timeline-item { position: relative; padding: 13px 4px 13px 22px; border-bottom: 1px solid var(--line); }
+.timeline-item:last-child { border-bottom: 0; }
+.timeline-item::before { content: ""; position: absolute; left: 2px; top: 19px; width: 7px; height: 7px; border-radius: 50%; background: #a58bff; box-shadow: 0 0 0 5px rgba(165,139,255,.08); }
+.timeline-item.analysis::before { background: var(--accent); box-shadow: 0 0 0 5px rgba(104,224,193,.08); }
+.timeline-item header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.timeline-item header time { margin-left: auto; color: var(--muted); font-size: 9px; }
+.timeline-item p { margin: 6px 0; overflow-wrap: anywhere; color: #c8d5e5; font-size: 11px; line-height: 1.5; }
+.timeline-item p.sub { color: var(--muted); font-size: 10px; }
+.timeline-item footer { color: var(--muted); font-size: 9px; letter-spacing: .04em; }
 .status-dot { display: inline-block; width: 6px; height: 6px; margin-right: 6px; border-radius: 50%; background: var(--muted); }
 .status-dot.good { background: var(--low); }
 .status-dot.warn { background: var(--medium); }
