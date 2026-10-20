@@ -66,6 +66,9 @@ class CredentialStatus:
     raw_scopes: List[str] = field(default_factory=list)
     account: Dict[str, Any] = field(default_factory=dict)   # team/user/app 식별 정보
     accessible_resources: List[Dict[str, Any]] = field(default_factory=list)
+    # 빈 목록이 실제로 "접근 가능한 리소스 없음"인지, 수집 실패/상한 때문인지 구분한다.
+    resource_inventory_complete: Optional[bool] = None
+    resource_inventory_note: Optional[str] = None
     checked_at: str = field(default_factory=_utcnow)
     error: Optional[str] = None
 

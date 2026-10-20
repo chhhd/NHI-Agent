@@ -3,8 +3,21 @@
 .env.*
 !.env.example
 
-# 저장소 DB
+# 개인키·인증서·자격 증명 파일 (GitHub App 개인키 등)
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*private-key*
+credentials*.json
+service-account*.json
+
+# 저장소 DB (감사 로그·분석 결과·암호화 Secret 참조가 들어 있다)
 *.db
+*.db-journal
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
 
@@ -17,4 +30,6 @@ venv/
 .venv/
 *.egg-info/
 
-.env
+# Local archive review and original bundles
+.archive-review/
+/hanium.zip

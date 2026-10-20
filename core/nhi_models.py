@@ -55,6 +55,8 @@ class NHIType(str, Enum):
     GITHUB_MACHINE_USER = "GITHUB_MACHINE_USER"
     GITHUB_APP = "GITHUB_APP"
     GITHUB_ACTIONS_CREDENTIAL = "GITHUB_ACTIONS_CREDENTIAL"
+    MICROSOFT_SERVICE_PRINCIPAL = "MICROSOFT_SERVICE_PRINCIPAL"
+    GOOGLE_OAUTH_CLIENT = "GOOGLE_OAUTH_CLIENT"
     GITLAB_SERVICE_ACCOUNT = "GITLAB_SERVICE_ACCOUNT"
     CLOUD_SERVICE_ACCOUNT = "CLOUD_SERVICE_ACCOUNT"
     AI_AGENT_CREDENTIAL = "AI_AGENT_CREDENTIAL"
@@ -146,6 +148,20 @@ class PolicyOutcome(str, Enum):
     MONITOR = "MONITOR"                      # 위반 없음 — 관찰
 
 
+class SecurityEventType(str, Enum):
+    """감사 로그·런타임 신호에서 추출한 공급자 중립 보안 이벤트."""
+
+    HIGH_RISK_SCOPE_GRANTED = "HIGH_RISK_SCOPE_GRANTED"
+    STALE_PERMISSION = "STALE_PERMISSION"
+    UNUSED_HIGH_PRIVILEGE = "UNUSED_HIGH_PRIVILEGE"
+    OWNER_MISSING = "OWNER_MISSING"
+    TOKEN_REPLAY = "TOKEN_REPLAY"
+    REVOKED_CREDENTIAL_USE = "REVOKED_CREDENTIAL_USE"
+    TERMINATED_AGENT_CREDENTIAL_USE = "TERMINATED_AGENT_CREDENTIAL_USE"
+    UNDECLARED_PERMISSION_USE = "UNDECLARED_PERMISSION_USE"
+    CROSS_PROJECT_CREDENTIAL_USE = "CROSS_PROJECT_CREDENTIAL_USE"
+
+
 # ---------------------------------------------------------------------------
 # 외부 입력 신호
 # ---------------------------------------------------------------------------
@@ -171,6 +187,17 @@ class AnalysisSignals:
     observed_actions: List[str] = field(default_factory=list)
     #: 폐기 처리 이후에도 호출이 관측되었는가
     token_used_after_revocation: Optional[bool] = None
+    #: 자격 증명이 실제로 폐기된 시각. last_used_at과 순서를 비교할 때만 사용한다.
+    revoked_at: Optional[str] = None
+    #: Runtime gateway가 탈취 token/proof 재사용을 탐지했는가
+    token_replay_suspected: Optional[bool] = None
+    #: token이 호출 주체의 key/certificate에 암호학적으로 바인딩되었는가
+    sender_constrained: Optional[bool] = None
+    #: DPoP, mTLS, SPIFFE 등 적용된 sender constraint 방식
+    token_binding_method: Optional[str] = None
+    #: 이상행동 상관분석용 출처. 인증 주체를 결정하는 근거로 사용하지 않는다.
+    request_source_ip: Optional[str] = None
+    request_user_agent: Optional[str] = None
     #: 동일 Credential 을 함께 쓰는 프로젝트 목록
     shared_projects: List[str] = field(default_factory=list)
     created_at: Optional[str] = None
@@ -310,6 +337,130 @@ class PermissionProfile:
 
 
 @dataclass
+class UsageAnalysisResult:
+    """승인된 권한과 관측 행위를 비교한 사용 분석 결과.
+
+    관측 로그가 없다는 사실을 정상 사용으로 해석하지 않는다. ``evidence``에
+    미관측/미확인 상태를 명시해 이후 정책과 보고서가 근거를 잃지 않게 한다.
+    """
+
+    declared_permissions: List[PermissionLevel] = field(default_factory=list)
+    #: approved_signal / granted_scope / assumed_scope / unavailable
+    permission_baseline_source: str = "unavailable"
+    #: 승인 기준과 관측 행위가 모두 있어 초과 여부를 판정할 수 있는가.
+    permission_comparison_complete: bool = False
+    observed_permissions: List[PermissionLevel] = field(default_factory=list)
+    observed_actions: List[str] = field(default_factory=list)
+    unexpected_permissions: List[PermissionLevel] = field(default_factory=list)
+    #: 완전한 사용 이력과 신뢰 가능한 권한 기준이 모두 있을 때만 채운다.
+    unused_permissions: List[PermissionLevel] = field(default_factory=list)
+    #: active / inactive_warning / stale / orphaned_candidate / unknown
+    activity_status: str = "unknown"
+    mutation_observed: bool = False
+    #: None은 사용 로그 자체가 미제공/불완전함을 의미한다.
+    usage_observed: Optional[bool] = None
+    used_after_revocation: Optional[bool] = None
+    replay_suspected: Optional[bool] = None
+    last_used_at: Optional[str] = None
+    sender_constrained: Optional[bool] = None
+    token_binding_method: Optional[str] = None
+    source_ip: Optional[str] = None
+    user_agent: Optional[str] = None
+    data_complete: bool = False
+    confidence: float = 0.0
+    sources: List[str] = field(default_factory=list)
+    evidence: List[str] = field(default_factory=list)
+    analyzed_at: str = field(default_factory=_utcnow)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "declared_permissions": [item.value for item in self.declared_permissions],
+            "permission_baseline_source": self.permission_baseline_source,
+            "permission_comparison_complete": self.permission_comparison_complete,
+            "observed_permissions": [item.value for item in self.observed_permissions],
+            "observed_actions": list(self.observed_actions),
+            "unexpected_permissions": [item.value for item in self.unexpected_permissions],
+            "unused_permissions": [item.value for item in self.unused_permissions],
+            "activity_status": self.activity_status,
+            "mutation_observed": self.mutation_observed,
+            "usage_observed": self.usage_observed,
+            "used_after_revocation": self.used_after_revocation,
+            "replay_suspected": self.replay_suspected,
+            "last_used_at": self.last_used_at,
+            "sender_constrained": self.sender_constrained,
+            "token_binding_method": self.token_binding_method,
+            "source_ip": self.source_ip,
+            "user_agent": self.user_agent,
+            "data_complete": self.data_complete,
+            "confidence": self.confidence,
+            "sources": list(self.sources),
+            "evidence": list(self.evidence),
+            "analyzed_at": self.analyzed_at,
+        }
+
+
+@dataclass
+class SecurityEvent:
+    """Usage Analysis에서 추출한 단일 보안 이벤트."""
+
+    event_id: str
+    event_type: SecurityEventType
+    severity: RiskLevel
+    title: str
+    detail: str
+    #: observed는 감사/런타임 직접 관측, derived/control_gap은 규칙으로 파생된 상태다.
+    origin: str = "observed"
+    confidence: float = 1.0
+    source: Optional[str] = None
+    source_event_id: Optional[str] = None
+    occurred_at: Optional[str] = None
+    #: 권한을 확인할 수 없는 이벤트는 None이며 JSON에서는 null로 보존한다.
+    access_level: Optional[PermissionLevel] = None
+    evidence: List[str] = field(default_factory=list)
+    attributes: Dict[str, Any] = field(default_factory=dict)
+    observed_at: str = field(default_factory=_utcnow)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "event_id": self.event_id,
+            "event_type": self.event_type.value,
+            "severity": self.severity.value,
+            "title": self.title,
+            "detail": self.detail,
+            "origin": self.origin,
+            "confidence": self.confidence,
+            "source": self.source,
+            "source_event_id": self.source_event_id,
+            "occurred_at": self.occurred_at,
+            "access_level": self.access_level.value if self.access_level else None,
+            "evidence": list(self.evidence),
+            "attributes": dict(self.attributes),
+            "observed_at": self.observed_at,
+        }
+
+
+@dataclass
+class ScenarioMatch:
+    """추출된 이벤트가 조직의 공격/오용 시나리오와 일치한 결과."""
+
+    scenario_id: str
+    name: str
+    severity: RiskLevel
+    confidence: float
+    reason: str
+    event_ids: List[str] = field(default_factory=list)
+    evidence: List[str] = field(default_factory=list)
+    matched: bool = True
+    forced_critical: bool = False
+    category: str = "usage_anomaly"
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = asdict(self)
+        data["severity"] = self.severity.value
+        return data
+
+
+@dataclass
 class RiskFactor:
     """위험 점수 평가 영역 1건."""
 
@@ -436,11 +587,16 @@ class NHIAnalysis:
     permissions: PermissionProfile
     risk: RiskAssessment
     policy: PolicyEvaluation
+    usage_analysis: UsageAnalysisResult = field(default_factory=UsageAnalysisResult)
+    security_events: List[SecurityEvent] = field(default_factory=list)
+    scenario_matches: List[ScenarioMatch] = field(default_factory=list)
     recommendations: List[Recommendation] = field(default_factory=list)
     blast_radius: BlastRadiusReport = field(default_factory=BlastRadiusReport)
     analyzed_at: str = field(default_factory=_utcnow)
     #: 코드 스캔 결과인가, NHI 인벤토리 입력인가
     source: AnalysisSource = AnalysisSource.CODE_SCAN
+    #: 생명주기(DAS) 관리용 시각 정보 — `to_dict()` 출력에는 포함하지 않는다.
+    lifecycle_timestamps: Dict[str, Optional[str]] = field(default_factory=dict)
 
     @property
     def recommended_action(self) -> RecommendedAction:
@@ -470,6 +626,9 @@ class NHIAnalysis:
             "discovery": self.profile.to_dict(),
             "context_analysis": self.context.to_dict(),
             "permission_detail": self.permissions.to_dict(),
+            "usage_analysis": self.usage_analysis.to_dict(),
+            "security_events": [event.to_dict() for event in self.security_events],
+            "scenario_matches": [match.to_dict() for match in self.scenario_matches],
             "risk_detail": self.risk.to_dict(),
             "policy": self.policy.to_dict(),
             "recommendations": [r.to_dict() for r in self.recommendations],

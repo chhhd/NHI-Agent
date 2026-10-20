@@ -35,6 +35,15 @@
         <button class="nav-item" data-view-target="reviews">
           <span class="nav-icon">✓</span><span>Review Queue</span><b id="nav-review-count">0</b>
         </button>
+        <button class="nav-item" data-view-target="lifecycle">
+          <span class="nav-icon">◔</span><span>Lifecycle</span>
+        </button>
+        <button class="nav-item" data-view-target="changes">
+          <span class="nav-icon">⇄</span><span>Change Control</span><b id="nav-change-count">0</b>
+        </button>
+        <button class="nav-item" data-view-target="control">
+          <span class="nav-icon">◉</span><span>Live Control</span><b id="nav-quarantine-count" class="quiet">0</b>
+        </button>
         <button class="nav-item" data-view-target="audit">
           <span class="nav-icon">≡</span><span>Audit Log</span>
         </button>
@@ -170,6 +179,53 @@
         <div id="review-list" class="review-list"></div>
       </section>
 
+      <section class="view" data-view="lifecycle">
+        <div class="section-heading"><div><h2>NHI lifecycle</h2><p>생성부터 파기까지 NHI의 전 과정을 단계별로 추적하고, 노후화된 NHI를 찾아냅니다.</p></div><span id="lifecycle-policy" class="updated"></span></div>
+        <div id="stage-pipeline" class="stage-pipeline" role="group" aria-label="생명주기 단계 필터"></div>
+        <article class="panel">
+          <div class="panel-head"><div><h3>Aging alerts</h3><p>다음에 해야 할 조치가 있는 NHI</p></div></div>
+          <div id="aging-alerts" class="alert-list"></div>
+        </article>
+        <article class="panel"><div class="table-wrap"><table>
+          <thead><tr><th>NHI</th><th>단계</th><th>수명</th><th>노후화 신호</th><th>대기</th><th></th></tr></thead>
+          <tbody id="lifecycle-rows"></tbody>
+        </table></div></article>
+      </section>
+
+      <section class="view" data-view="changes">
+        <div class="section-heading"><div><h2>Change control</h2><p>Token 폐기·교체·권한 변경은 변경 전·후 형상과 영향도를 확인한 뒤 승인하고, 문제가 생기면 롤백합니다.</p></div><button id="new-change-button" class="primary-button">+ 변경 제안</button></div>
+        <div id="change-filters" class="segmented">
+          <button data-status="PENDING_APPROVAL">승인 대기</button><button data-status="APPLIED">적용됨</button>
+          <button data-status="ROLLED_BACK">롤백됨</button><button data-status="REJECTED">거부됨</button><button data-status="">전체</button>
+        </div>
+        <div id="change-list" class="change-list"></div>
+      </section>
+
+      <section class="view" data-view="control">
+        <div class="section-heading"><div><h2>Real-time control</h2><p>사용 이벤트를 즉시 판정해 허용·경고·차단·격리합니다. 격리는 승인 없이 즉시, 폐기는 승인 후에 진행됩니다.</p></div><div id="control-mode"></div></div>
+        <div id="control-counters" class="counter-row"></div>
+        <article class="panel">
+          <div class="panel-head"><div><h3>Quarantined NHI</h3><p>해제하면 즉시 복구됩니다</p></div></div>
+          <div id="quarantine-list" class="alert-list"></div>
+        </article>
+        <div class="control-grid">
+          <article class="panel">
+            <div class="panel-head"><div><h3>Live decisions</h3><p>3초마다 갱신</p></div><span class="chip live-chip">LIVE</span></div>
+            <div id="control-feed" class="feed"></div>
+          </article>
+          <article class="panel">
+            <div class="panel-head"><div><h3>Event simulator</h3><p>판정 흐름을 직접 확인합니다</p></div></div>
+            <div class="sim-form">
+              <label>NHI<select id="sim-nhi"></select></label>
+              <label>이벤트<select id="sim-type"><option value="CREDENTIAL_USE">권한 사용 요청</option><option value="USAGE_SPIKE">사용량 급증</option><option value="EXPOSURE_DETECTED">Credential 노출</option></select></label>
+              <div id="sim-fields"></div>
+              <button id="sim-fire" class="primary-button">이벤트 발생</button>
+              <div id="sim-result"></div>
+            </div>
+          </article>
+        </div>
+      </section>
+
       <section class="view" data-view="audit">
         <div class="section-heading"><div><h2>Audit log</h2><p>수집, 분석, 승인과 상태 변경 이력을 추적합니다.</p></div><a class="secondary-button" href="/reports/summary?format=markdown" target="_blank">Markdown report</a></div>
         <article class="panel"><div id="audit-list" class="audit-list"></div></article>
@@ -188,6 +244,26 @@
     </form>
   </dialog>
 
+  <dialog id="lifecycle-dialog" class="wide"><div id="lifecycle-detail" class="dialog-body"></div></dialog>
+  <dialog id="change-dialog" class="wide"><div id="change-detail" class="dialog-body"></div></dialog>
+  <dialog id="propose-dialog" class="wide">
+    <div class="dialog-body">
+      <div class="dialog-head"><div><p class="eyebrow">CHANGE CONTROL</p><h2>변경 제안</h2></div><button type="button" class="dialog-close" onclick="this.closest('dialog').close()">×</button></div>
+      <div class="propose-grid">
+        <label>대상 NHI<select id="propose-nhi"></select></label>
+        <label>변경 유형<select id="propose-type"><option value="TOKEN_ROTATE">Token 교체</option><option value="SCOPE_CHANGE">권한 변경</option><option value="TOKEN_REVOKE">Token 폐기</option><option value="TOKEN_DISPOSE">Token 파기</option></select></label>
+      </div>
+      <div id="propose-params"></div>
+      <div class="propose-grid">
+        <label>요청자<input id="propose-actor"></label>
+        <label>사유<input id="propose-reason" placeholder="변경 사유"></label>
+      </div>
+      <div class="dialog-actions inline"><button type="button" id="propose-preview-button" class="secondary-button">영향도 미리보기</button><button type="button" id="propose-submit-button" class="primary-button">제안</button></div>
+      <div id="propose-preview"></div>
+    </div>
+  </dialog>
+
   <script src="/dashboard/app.js" defer></script>
+  <script src="/dashboard/governance.js" defer></script>
 </body>
 </html>

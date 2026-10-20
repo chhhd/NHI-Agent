@@ -10,7 +10,11 @@ from connectors.base_connector import (
     PermissionDeniedError,
     RateLimitError,
 )
-from connectors.github_connector import GitHubConnector, Repository
+from connectors.github_connector import (
+    GitHubConnector,
+    GitHubOrganizationDiscoveryResult,
+    Repository,
+)
 from connectors.github_webhook import (
     GitHubWebhookHandler,
     WebhookEvent,
@@ -19,7 +23,9 @@ from connectors.github_webhook import (
     verify_signature,
 )
 from connectors.gitlab_connector import GitLabConnector
+from connectors.google_workspace_connector import GoogleWorkspaceConnector
 from connectors.huggingface_connector import HuggingFaceConnector
+from connectors.microsoft_graph_connector import MicrosoftGraphConnector
 from connectors.notion_connector import NotionConnector
 from connectors.slack_connector import SlackConnector
 
@@ -33,6 +39,8 @@ CONNECTOR_REGISTRY: Dict[str, Callable[..., BaseConnector]] = {
     "gitlab": GitLabConnector,
     "notion": NotionConnector,
     "huggingface": HuggingFaceConnector,
+    "microsoft": MicrosoftGraphConnector,
+    "google_workspace": GoogleWorkspaceConnector,
 }
 
 
@@ -50,9 +58,12 @@ __all__ = [
     "CONNECTOR_REGISTRY",
     "ConnectorError",
     "GitHubConnector",
+    "GitHubOrganizationDiscoveryResult",
     "GitHubWebhookHandler",
     "GitLabConnector",
+    "GoogleWorkspaceConnector",
     "HuggingFaceConnector",
+    "MicrosoftGraphConnector",
     "NotFoundError",
     "NotionConnector",
     "PermissionDeniedError",

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from agents.context_analysis_agent import ContextAnalysisAgent
 from agents.discovery_agent import DiscoveryAgent
 from agents.scope_translation_agent import ScopeTranslationAgent
@@ -63,6 +65,40 @@ def test_blast_radius_notes_missing_scope_information():
     _, _, blast = _parts(finding)
 
     assert any("Scope 미확인" in note for note in blast.notes)
+
+
+@pytest.mark.parametrize(
+    "provider,nhi_type,scope,label",
+    [
+        ("microsoft", "MICROSOFT_SERVICE_PRINCIPAL", "Mail.ReadWrite", "Microsoft 365"),
+        ("google_workspace", "GOOGLE_OAUTH_CLIENT", "https://www.googleapis.com/auth/gmail.send", "Google Workspace"),
+    ],
+)
+def test_saas_inventory_blast_radius_identifies_external_transfer(provider, nhi_type, scope, label):
+    from agents.pipeline import NHIAnalysisPipeline
+    from core.inventory_models import SaaSNHIInput
+    from core.nhi_models import NHIType
+
+    result = NHIAnalysisPipeline().analyze_saas_nhi(SaaSNHIInput(
+        provider=provider,
+        nhi_id="mail-client",
+        nhi_name="Mail automation",
+        nhi_type=NHIType(nhi_type),
+        raw_scopes=[scope],
+    ))
+
+    assert label in result.blast_radius.connected_services
+    assert result.blast_radius.can_write is True
+    assert result.blast_radius.external_transfer_possible is True
+
+
+@pytest.mark.parametrize("selection", ["all", "selected"])
+def test_github_repository_selection_preserves_unknown_resource_coverage(selection):
+    finding = make_finding(secret_type="GITHUB_PAT", provider="github", raw_scopes=["repo"])
+    _, _, blast = _parts(finding, AnalysisSignals(extra={"repository_selection": selection}))
+
+    assert blast.accessible_resources == 0
+    assert any("개별 이름은 미수집" in note for note in blast.notes)
 
 
 def test_summarize_blast_radius_merges_reports():

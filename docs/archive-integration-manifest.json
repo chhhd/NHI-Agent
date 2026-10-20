@@ -1,0 +1,553 @@
+{
+  "archive": "hanium.zip",
+  "archive_sha256": "3757bfe2bb1aec5faaba617d36d7bd06cfdb22133e8f8c12172f658c4784cf8a",
+  "baseline_commit": "be08df42e74390809f6f5110a7fc0ce35e902940",
+  "files": [
+    {
+      "path": ".env.example",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/.env.example",
+      "sha256": "71aa9dd7a8f69ebfd2ea93af56e8aca88432306ef022cbbb34a6fbf2e24f0d4a"
+    },
+    {
+      "path": ".gitignore",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/.gitignore",
+      "sha256": "3be4768b503f8bfb6482d76edcba33b456892b7ce3eb6288c11ff1e4472fade8"
+    },
+    {
+      "path": "agent_runtime/__init__.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/agent_runtime/__init__.py",
+      "sha256": "aa6960a0649038b441a37e3c41611dc0288aec4a2ee6d196e279c29562ceecea"
+    },
+    {
+      "path": "agent_runtime/models.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/agent_runtime/models.py",
+      "sha256": "0faf53a37205cb45b289eb4a47971385cd33f1a604266283fe76f18adf8c5fe1"
+    },
+    {
+      "path": "agent_runtime/orchestrator.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/agent_runtime/orchestrator.py",
+      "sha256": "d3d65e0cd1f0afedd55c8ad3fd8c0e3006b6403d86758a5401b719ef076ab0b0"
+    },
+    {
+      "path": "agent_runtime/planner.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/agent_runtime/planner.py",
+      "sha256": "bbadacc0d77d918dcb577205dfa92329a808b359c6536ae036c0ab4cd9702976"
+    },
+    {
+      "path": "agent_runtime/replanner.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/agent_runtime/replanner.py",
+      "sha256": "be5b6d5177aa5f50168eb427f3b579888aeb11e33a29ba4e65aa75a2b54fc0c4"
+    },
+    {
+      "path": "agent_runtime/tools.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/agent_runtime/tools.py",
+      "sha256": "95c3d0dab7002109df8d514163ce6a71f16d597943de427361537d2d333ffbfc"
+    },
+    {
+      "path": "agents/__init__.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/agents/__init__.py",
+      "sha256": "4f1bfff7ab17d9fd8bec1c9fede7f0576ede9af1a34cf060c6d2dfbcc2c1f9eb"
+    },
+    {
+      "path": "agents/inventory_adapter.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/agents/inventory_adapter.py",
+      "sha256": "b7df28964eddaab1612847e9675b1e2c284561c497ee7f41fb79a2bbceb261e2"
+    },
+    {
+      "path": "agents/pipeline.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/agents/pipeline.py",
+      "sha256": "36b608919a80664f4602426201e15e0d46ac19b54d2ce0cc77a14959d287a4eb"
+    },
+    {
+      "path": "agents/policy_evidence_agent.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/agents/policy_evidence_agent.py",
+      "sha256": "8b34dcf4d6e1460efb0de9f0790f0ae96e1af960d92f5c7b9a9fd65cc8d7ebc7"
+    },
+    {
+      "path": "agents/recommendation_agent.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/agents/recommendation_agent.py",
+      "sha256": "750c64cb35f56039ce9e7fa0dbe6f33fe3c6f8473bcd359fa61ac32dd66a2463"
+    },
+    {
+      "path": "agents/saas_inventory_adapter.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/agents/saas_inventory_adapter.py",
+      "sha256": "f7701484e2c4fe5fa78130d2544e6ae17511b47d91d7de27c5c3466bf1b6a343"
+    },
+    {
+      "path": "agents/scope_translation_agent.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/agents/scope_translation_agent.py",
+      "sha256": "7e17c356da6ed616d55c384b1345ab2de84f2999e1504beb44ff1303f0379bb7"
+    },
+    {
+      "path": "agents/usage_analysis_agent.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/agents/usage_analysis_agent.py",
+      "sha256": "bfb0fb801c3c57c101468489e1679d54f652088a028aafba2d074d0cae0e4ba2"
+    },
+    {
+      "path": "api/app.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/api/app.py",
+      "sha256": "5b43c886ace0508b2d62fff6e838b2ae0957df972b71e4c58d59255950e8974a"
+    },
+    {
+      "path": "backend/database/postgres_schema.sql",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/backend/database/postgres_schema.sql",
+      "sha256": "4ae6ad94d56d901b3226c89411cf258f7da6704008a2b7ce27a27232727df73e"
+    },
+    {
+      "path": "backend/services/agent_access_evaluator.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/backend/services/agent_access_evaluator.py",
+      "sha256": "39bcf6e12f45675fe41b4f64687c1d5918e2c46cddebe0e2cd3b46053a725cbd"
+    },
+    {
+      "path": "backend/services/analysis_history.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/backend/services/analysis_history.py",
+      "sha256": "54a5b84f6743dbdff37eee5ddc32c6e4bbc45db165c9d0fe143ca5cce84f4f89"
+    },
+    {
+      "path": "backend/services/change_control_service.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/backend/services/change_control_service.py",
+      "sha256": "e2b203d897990dcba982afb858056e473f0821098028babd8db65b0d16955053"
+    },
+    {
+      "path": "backend/services/control_approval.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/backend/services/control_approval.py",
+      "sha256": "0c3d2a7fa4030d07a014ba09510c62f82a6ff8a747b093ce584a0b1beb12ddbd"
+    },
+    {
+      "path": "backend/services/control_service.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/backend/services/control_service.py",
+      "sha256": "2a65400cd63f393a2ef36d920abfa9a94d40e6467e45b7adb531c6b6b626e2f0"
+    },
+    {
+      "path": "backend/services/demo_workspace.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/backend/services/demo_workspace.py",
+      "sha256": "26bbe4ead9a78b3b2b5139f4025040ae28e76396a35e13cb2cfc327a1d7026af"
+    },
+    {
+      "path": "backend/services/github_continuous_assessment.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/backend/services/github_continuous_assessment.py",
+      "sha256": "7232d0657e555b1d16254a8652dbf116d5da7f36aa86bd5cb22d876f1ea841da"
+    },
+    {
+      "path": "backend/services/lifecycle_service.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/backend/services/lifecycle_service.py",
+      "sha256": "bcabae071874fe23aa85701b263cc66149b97a64295f507f37a138c0bfeea8ef"
+    },
+    {
+      "path": "backend/services/nhi_aging.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/backend/services/nhi_aging.py",
+      "sha256": "2f2517333731c45b7896f6be4f143c16082c0dbcd71243956581b765283b9b46"
+    },
+    {
+      "path": "backend/services/nhi_state.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/backend/services/nhi_state.py",
+      "sha256": "e9b6e7916fb23b84b927e7435139f97798a99f95a931c91d7c0da994be614550"
+    },
+    {
+      "path": "backend/services/usage_rate.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/backend/services/usage_rate.py",
+      "sha256": "fd15c556ad309178a47ddcc98be3204be820922c54ba45039b17dd6202e4299b"
+    },
+    {
+      "path": "connectors/__init__.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/connectors/__init__.py",
+      "sha256": "d2b26b32355a657e20c8d6d5c51efa5f3df8a9061abf6b2fb93f8e2439462027"
+    },
+    {
+      "path": "connectors/github_connector.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/connectors/github_connector.py",
+      "sha256": "8425e114dce230552a24d0c0cb1c59a2d41b65b797be07cdd104237ca74c1ce7"
+    },
+    {
+      "path": "connectors/google_workspace_connector.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/connectors/google_workspace_connector.py",
+      "sha256": "a3fe7128bf3bbc5e3aea046836bf345c91cb15578fd316d806bf0cc7045af2f6"
+    },
+    {
+      "path": "connectors/microsoft_graph_connector.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/connectors/microsoft_graph_connector.py",
+      "sha256": "53f96be2120529963f4591b5e038ceaa5f5e2cc4f77fcee89203acb29a884843"
+    },
+    {
+      "path": "connectors/slack_connector.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/connectors/slack_connector.py",
+      "sha256": "e4f2fd6cfb6b49a0ed7a887c52d8fdc9217c4dbbf8f1f48b58c403a3f6645ea4"
+    },
+    {
+      "path": "core/agent_access_models.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/core/agent_access_models.py",
+      "sha256": "c80cb3d03d5edeca455125b9bff5ad1d12809ff0b44a1de8fd8a136173b94a34"
+    },
+    {
+      "path": "core/config.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/core/config.py",
+      "sha256": "f917791e1bbcc54d9f46105aba4a8fde63e5c013a0a4378e4d2d229dd5fbeddc"
+    },
+    {
+      "path": "core/destruction_models.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/core/destruction_models.py",
+      "sha256": "c10e38961a840ce2256ab99dd8ebd9701354a6f02b0467be8a353ae68666a394"
+    },
+    {
+      "path": "core/governance_models.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/core/governance_models.py",
+      "sha256": "2e5c30d800bca00a3446df2f00964db9738a10d8c891216eb3844eaba2af4bce"
+    },
+    {
+      "path": "core/inventory_models.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/core/inventory_models.py",
+      "sha256": "92a73e902315715b5e4560c614fdc76cd2dc413c9dffc2ff90f0e4503e252157"
+    },
+    {
+      "path": "core/models.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/core/models.py",
+      "sha256": "9e15eaf27ef5a8808cf13c668a6490e99c0d63c427e8b7e8647defc078ec7bb4"
+    },
+    {
+      "path": "core/nhi_models.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/core/nhi_models.py",
+      "sha256": "e16bc6baa31714d980d25ad81e933da44d3dc592b90c0853ca8503e5a7076eb6"
+    },
+    {
+      "path": "core/usage_models.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/core/usage_models.py",
+      "sha256": "c0057be9151db6de17e98c487aab48983382e67b10a5d66f6ddf89a4c8547fd2"
+    },
+    {
+      "path": "frontend/dashboard/app.js",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/frontend/dashboard/app.js",
+      "sha256": "ff26ec432a24903d6c54e37fd4c05f3196fb047f047c99fdca0c47fff1eb1d97"
+    },
+    {
+      "path": "frontend/dashboard/governance.js",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/frontend/dashboard/governance.js",
+      "sha256": "4c831cfcdc28a9d152d15396e61322dfa1de0cde6613c23bb9cb8d6a2ca6bc30"
+    },
+    {
+      "path": "frontend/dashboard/index.html",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/frontend/dashboard/index.html",
+      "sha256": "229d8565b7078e0464515bee26592f7c5635f72c4a0c7853b3613538d1616bac"
+    },
+    {
+      "path": "frontend/dashboard/styles.css",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/frontend/dashboard/styles.css",
+      "sha256": "73453271441c20423820d26dbb955cc402d0ed4e886c9574d0e8813fbe9be763"
+    },
+    {
+      "path": "normalization/__init__.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/normalization/__init__.py",
+      "sha256": "db588465279fb16b899eee4aefd297b3ab27b2382c743e9b08d2145cf6f06f21"
+    },
+    {
+      "path": "normalization/github_audit.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/normalization/github_audit.py",
+      "sha256": "e2a6db6c2e656f6d2fefd3de2be8c992ca3987aacb6d38c4d9b4e08477891cc9"
+    },
+    {
+      "path": "normalization/observation_normalizer.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/normalization/observation_normalizer.py",
+      "sha256": "ab0c302cd70e46f9e0678fe48bdf81b09fb19429eabbaf40b5485053282e6108"
+    },
+    {
+      "path": "normalization/usage_event_adapter.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/normalization/usage_event_adapter.py",
+      "sha256": "6d77fc717a980a32cd4dd5ea2b344dab2986200b04e323e28ba45ea3b4d07229"
+    },
+    {
+      "path": "normalization/usage_ingestion.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/normalization/usage_ingestion.py",
+      "sha256": "a8c061ab0ec550bbaa413e204165c73135c4e41182e1c82d204bc219ef30f082"
+    },
+    {
+      "path": "policy/rules.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/policy/rules.py",
+      "sha256": "02262f4b08b2c0489d1422c453cbf892d8b739fb8a1d50795b3486d1f846c011"
+    },
+    {
+      "path": "policy/scoring.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/policy/scoring.py",
+      "sha256": "c605918fd77faa297eb87b2108f379e711e91394f37fc3cee94aa02168603426"
+    },
+    {
+      "path": "processing/analysis_persistence.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/processing/analysis_persistence.py",
+      "sha256": "20cb31208950414b5a015c25c6d97699d698880bcdc63969863fc8cacfca90fb"
+    },
+    {
+      "path": "README.md",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/README.md",
+      "sha256": "eca8cbdf9f805b89ef966e47accbefbcada43157d8eee0b9ee18778f045a401e"
+    },
+    {
+      "path": "rescan/credential_verifier.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/rescan/credential_verifier.py",
+      "sha256": "66578997eb4dbc763a098a5b965f5833ce09f763d2c578020f2d638a907a6c3b"
+    },
+    {
+      "path": "scripts/__init__.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/scripts/__init__.py",
+      "sha256": "f01a374e9c81e3db89b3a42940c4d6a5447684986a1296e42bf13f196eed6295"
+    },
+    {
+      "path": "scripts/check_security.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/scripts/check_security.py",
+      "sha256": "e5b66878acb2ecfe64e9c8edbc15e8665dadf9fa06264a03a762ff6501d8d379"
+    },
+    {
+      "path": "scripts/demo_dpop_replay.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/scripts/demo_dpop_replay.py",
+      "sha256": "35975e536cc11bc7ffc7cbf9c6fefa4d3fc2514503efa4a08b19965852c0a3dc"
+    },
+    {
+      "path": "security/admin_identity.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/security/admin_identity.py",
+      "sha256": "2741440c183f73fccf6d69e19c56b6d23730cfb7bebdf69028d86be32909ccb5"
+    },
+    {
+      "path": "security/dpop.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/security/dpop.py",
+      "sha256": "23bf5c61add814786cb83c52c6ed482a5e18f73956224d6a7fe32e3e05d20ab6"
+    },
+    {
+      "path": "security/privacy.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/security/privacy.py",
+      "sha256": "9757dbd070bd2274f7bbfd27fe8985c48f294dc061a7a596ec5f18b9d9feec96"
+    },
+    {
+      "path": "security/redaction.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/security/redaction.py",
+      "sha256": "1dab950babbd142b3c74214be632614b4a33fcc67a9060431f0b8fa692f2c705"
+    },
+    {
+      "path": "security/replay_store.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/security/replay_store.py",
+      "sha256": "de971c9c6625b31003896296e56acb783bccd5c93a627b91e161de9b24bb717c"
+    },
+    {
+      "path": "storage/base.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/storage/base.py",
+      "sha256": "c636e137fe7bc31ddb2c5d9037b580a0eeb004fda6e7487478c9e2dddf3495e6"
+    },
+    {
+      "path": "storage/sqlite_store.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/storage/sqlite_store.py",
+      "sha256": "ceca61927ce4c51e22d1588e4a47e466903ba9a9d8934250134efd431f40f697"
+    },
+    {
+      "path": "tests/conftest.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/tests/conftest.py",
+      "sha256": "108cadd9b0a254865bf444d9943ab776602e439f37960e49f08bcc5e1a943d52"
+    },
+    {
+      "path": "tests/helpers_app.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/tests/helpers_app.py",
+      "sha256": "1044311cb68180b3e5b9d7ed30d03e3c12de5b47b1d3f7dc4bd0a309a4998877"
+    },
+    {
+      "path": "tests/test_admin_identity.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/tests/test_admin_identity.py",
+      "sha256": "7ba78da435a7968e252a18aa59824419c6ec93781a51fa90be9ebf1f5a453b10"
+    },
+    {
+      "path": "tests/test_agent_access_control.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/tests/test_agent_access_control.py",
+      "sha256": "29e3a78126892a163e18b2ea7520b6e22b9a2171dcb024f55cc1622ee7438c18"
+    },
+    {
+      "path": "tests/test_agent_runtime.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/tests/test_agent_runtime.py",
+      "sha256": "aa2d0bbe5203879d6f4dcf1e8db8d6d451061ee091b24f3a511210ea766eff23"
+    },
+    {
+      "path": "tests/test_aging_and_destruction.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/tests/test_aging_and_destruction.py",
+      "sha256": "1d91134e060d69ce7182d06b356aa46406a3c847a35da0bf72fb9fc4aa880140"
+    },
+    {
+      "path": "tests/test_analysis_history.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/tests/test_analysis_history.py",
+      "sha256": "8ce00fb2323050dd9550a34db49a0ec172f0c74453df6965889000a9c131a86c"
+    },
+    {
+      "path": "tests/test_analysis_history_integration.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/tests/test_analysis_history_integration.py",
+      "sha256": "05d5095265da8901b171f28df508181dba56cb5d336ead9e242d9377f7c91eba"
+    },
+    {
+      "path": "tests/test_connectors.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/tests/test_connectors.py",
+      "sha256": "b6196f317490790d17b6cfb3b35da6a2b213406341d5c0a8962f3221013e4c04"
+    },
+    {
+      "path": "tests/test_control_approval.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/tests/test_control_approval.py",
+      "sha256": "5c39c76f1a6df76c57edc0747b6d8744d28fb64c27922e032ee8ae078c408142"
+    },
+    {
+      "path": "tests/test_control_rule_parity.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/tests/test_control_rule_parity.py",
+      "sha256": "ec910a634a4acc50d2ac10571e5f08472db38008d99e06a4485e7055d861a3ae"
+    },
+    {
+      "path": "tests/test_dpop_runtime_api.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/tests/test_dpop_runtime_api.py",
+      "sha256": "1ae391ce98c3c4ffff2f192933b236f1ca514ec0912e1ccb316fc4f7c77c01e7"
+    },
+    {
+      "path": "tests/test_dpop_security.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/tests/test_dpop_security.py",
+      "sha256": "e8d4951e0589436bb75e5cf7737a476c4aed8fe696d49005d1c73d47afcce2d8"
+    },
+    {
+      "path": "tests/test_github_continuous_assessment.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/tests/test_github_continuous_assessment.py",
+      "sha256": "ad7524eae91a9b84291b730f38f70653b55a78a44eb36c53b3abc4b7183b2cdc"
+    },
+    {
+      "path": "tests/test_github_discovery_endpoint.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/tests/test_github_discovery_endpoint.py",
+      "sha256": "82dc88117f55a3400e51f1629ee04ed10319ca25340c5cd76552633404e412fc"
+    },
+    {
+      "path": "tests/test_governance.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/tests/test_governance.py",
+      "sha256": "d605eaede9f932ffa560ad6ce1520ad146593610cad449f826d20de73a9596f3"
+    },
+    {
+      "path": "tests/test_hermetic_environment.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/tests/test_hermetic_environment.py",
+      "sha256": "58e6fdf897b1f05e340267de242a78c49c9ae189380d7db0fef474cab62dbc64"
+    },
+    {
+      "path": "tests/test_nhi_api.py",
+      "kind": "modified",
+      "source": "hanium/hanium/hanium/NHI-Agent/tests/test_nhi_api.py",
+      "sha256": "012fc737788fb119fc6b00830090b584e27065aa828fb59f20116e5d8563e6d9"
+    },
+    {
+      "path": "tests/test_saas_discovery.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/tests/test_saas_discovery.py",
+      "sha256": "fc7f3400424663deee5308bed52bdf5ba794d7d73a7e5de68c9e846656bc7b36"
+    },
+    {
+      "path": "tests/test_security_check.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/tests/test_security_check.py",
+      "sha256": "7798aa4e0fb7cd9767d31a3c23b590499bca00fad22fdc3d87976b2144aad82e"
+    },
+    {
+      "path": "tests/test_slack_endpoints.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/tests/test_slack_endpoints.py",
+      "sha256": "f9a7cb031e8ac8a3d7e13d05ae087906761c3537bdfcfa1448330a34d36b7dde"
+    },
+    {
+      "path": "tests/test_usage_analysis.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/tests/test_usage_analysis.py",
+      "sha256": "6a30532a3bf4e058f73e9ae53ef45d7352831b4830021448469290ef71e6126b"
+    },
+    {
+      "path": "tests/test_usage_event_adapter.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/tests/test_usage_event_adapter.py",
+      "sha256": "cf8ffe606f3ef116c053b14ee18ba1a6074bc750767cd3a3852f3b46d253f1d5"
+    },
+    {
+      "path": "tests/test_usage_pipeline_integration.py",
+      "kind": "added",
+      "source": "hanium/hanium/hanium/NHI-Agent/tests/test_usage_pipeline_integration.py",
+      "sha256": "fd4a06a56407e8311cb707a4ec683c4c304cd3a3c4122679248e31a1f6e3dfb1"
+    },
+    {
+      "path": "graph/blast_radius.py",
+      "kind": "modified",
+      "source": "hanium/hanium/NHI-Agent-upgrade.zip!NHI-Agent-upgrade/graph/blast_radius.py",
+      "sha256": "32db10640623cb421157a44ccc6dda96381e557c6bee3bb2b02630f0cf7ff696"
+    }
+  ]
+}

@@ -3,6 +3,14 @@
 from normalization.observation_normalizer import (
     observation_from_finding,
     observation_from_inventory,
+    observation_from_saas_inventory,
 )
+from normalization.usage_event_adapter import UsageEventAdaptation, UsageEventAdapter
 
-__all__ = ["observation_from_finding", "observation_from_inventory"]
+__all__ = [
+    "UsageEventAdaptation",
+    "UsageEventAdapter",
+    "observation_from_finding",
+    "observation_from_inventory",
+    "observation_from_saas_inventory",
+]

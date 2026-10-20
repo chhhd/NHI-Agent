@@ -78,6 +78,14 @@ def build_signals(
         "extra": {
             "environment": nhi.environment.value,
             "repositories": repositories,
+            "github_account": dict(nhi.account),
+            "repository_selection": nhi.repository_selection,
+            "repository_inventory_complete": nhi.repository_inventory_complete,
+            "inventory_is_complete": nhi.inventory_is_complete,
+            "collection_source": nhi.collection_source,
+            "collection_evidence": list(nhi.collection_evidence),
+            "subscribed_events": list(nhi.subscribed_events),
+            "suspended_at": _iso(nhi.suspended_at),
         },
     }
 
@@ -114,6 +122,7 @@ def build_credential_record(nhi: GitHubNHIInput) -> SecretFinding:
         raw_scopes=nhi.scopes,
         credential_detail={
             "account": {
+                **dict(nhi.account),
                 "id": nhi.nhi_id,
                 "name": nhi.nhi_name,
                 "type": "bot" if nhi.nhi_type_common in _BOT_TYPES else "user",
@@ -130,6 +139,13 @@ def build_profile(nhi: GitHubNHIInput, signals: AnalysisSignals) -> NHIProfile:
         f"GitHub NHI 인벤토리 입력 — 유형 {nhi.nhi_type.value} → {nhi_type.value}",
         f"접근 가능 저장소 {len(nhi.repositories)}개",
     ]
+    evidence.extend(nhi.collection_evidence)
+    if not nhi.repository_inventory_complete:
+        evidence.append(
+            f"저장소 이름 인벤토리 불완전 (selection={nhi.repository_selection or 'unknown'})"
+        )
+    if not nhi.inventory_is_complete:
+        evidence.append("조직 installation 인벤토리가 부분 수집됨")
 
     owner = (signals.owner or "").strip() or None
     if owner:
@@ -155,7 +171,8 @@ def build_profile(nhi: GitHubNHIInput, signals: AnalysisSignals) -> NHIProfile:
         owner=owner,
         owner_candidates=[owner] if owner else [],
         owner_source="external_signal" if owner else None,
-        account={"id": nhi.nhi_id, "name": nhi.nhi_name},
+        # 외부 account payload가 canonical NHI id/name을 덮어쓰지 못하게 한다.
+        account={**dict(nhi.account), "id": nhi.nhi_id, "name": nhi.nhi_name},
         identified=nhi_type is not NHIType.UNKNOWN_NHI,
         confidence=DECLARED_CONFIDENCE,
         evidence=evidence,
@@ -182,6 +199,12 @@ def build_context(nhi: GitHubNHIInput, signals: AnalysisSignals) -> ContextInsig
         notes.append(f"민감 저장소 접근: {', '.join(repo.name for repo in sensitive[:3])}")
     if nhi.environment is Environment.UNKNOWN:
         notes.append("사용 환경 미지정 — 보수적으로 평가")
+    if not nhi.repository_inventory_complete:
+        notes.append(
+            "개별 저장소 이름 미확인 — 접근 범위를 0개로 단정하지 않음"
+        )
+    if nhi.repository_selection == "all":
+        notes.append("GitHub App이 조직의 모든 저장소를 선택 범위로 가짐")
 
     path_signals = [f"접근 저장소 {len(nhi.repositories)}개"] if nhi.repositories else []
 

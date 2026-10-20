@@ -174,7 +174,7 @@ def test_agent_run_endpoint(client):
 
     body = response.json()
     assert body["status"] == "COMPLETED"
-    assert body["replan_count"] == 1
+    assert body["replan_count"] == 2  # 분석 후 1회 + Secret 스캔 결과를 본 2차 재계획
     assert body["nhi_analysis"]["risk_level"] in {"CRITICAL", "HIGH"}
     assert body["policy_evaluation"]["policy_evaluated"] is True
 

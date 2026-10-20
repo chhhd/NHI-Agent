@@ -25,6 +25,10 @@ from core.nhi_models import (
     PermissionProfile,
     PolicyViolation,
     RiskLevel,
+    ScenarioMatch,
+    SecurityEvent,
+    SecurityEventType,
+    UsageAnalysisResult,
     days_since,
 )
 
@@ -86,6 +90,10 @@ class EvaluationContext:
     observed_permissions: List[PermissionLevel] = field(default_factory=list)
     #: 분석 대상이 코드 스캔 결과인가, NHI 인벤토리 입력인가
     source: AnalysisSource = AnalysisSource.CODE_SCAN
+    #: 독립된 Usage → Event → Scenario 분석 산출물. None은 해당 단계 미실행.
+    usage_analysis: Optional[UsageAnalysisResult] = None
+    security_events: List[SecurityEvent] = field(default_factory=list)
+    scenario_matches: Optional[List[ScenarioMatch]] = None
 
     # -- 파생 값 --------------------------------------------------------
     @property
@@ -97,6 +105,17 @@ class EvaluationContext:
     def accessible_repositories(self) -> List[Dict[str, object]]:
         """NHI 가 접근할 수 있는 저장소 목록 (인벤토리 입력에서만 채워진다)."""
         items = self.signals.extra.get("repositories") if self.signals.extra else None
+        if not isinstance(items, (list, tuple)):
+            return []
+        return [item for item in items if isinstance(item, dict)]
+
+    @property
+    def accessible_resources(self) -> List[Dict[str, object]]:
+        """공급자 중립 인벤토리에서 확인한 접근 자원 목록."""
+        items = self.signals.extra.get("accessible_resources") if self.signals.extra else None
+        if not isinstance(items, (list, tuple)):
+            detail = self.finding.credential_detail or {}
+            items = detail.get("accessible_resources")
         if not isinstance(items, (list, tuple)):
             return []
         return [item for item in items if isinstance(item, dict)]
@@ -127,6 +146,18 @@ class EvaluationContext:
         if self.finding.credential_active is not None:
             return self.finding.credential_active
         return self.context.in_use
+
+    def scenario(self, scenario_id: str) -> Optional[ScenarioMatch]:
+        if self.scenario_matches is None:
+            return None
+        return next(
+            (
+                match
+                for match in self.scenario_matches
+                if match.matched and match.scenario_id == scenario_id
+            ),
+            None,
+        )
 
 
 def derive_shared_projects(finding: SecretFinding, signals: AnalysisSignals) -> List[str]:
@@ -355,6 +386,9 @@ def _ownerless_sensitive_access(ctx: EvaluationContext) -> Optional[str]:
 
 
 def _terminated_agent_active_token(ctx: EvaluationContext) -> Optional[str]:
+    matched = ctx.scenario("TERMINATED_AGENT_ACTIVE_TOKEN")
+    if matched is not None:
+        return matched.reason
     status = (ctx.signals.agent_status or "").lower()
     if status in ("terminated", "deleted", "decommissioned", "stopped") and ctx.is_active is True:
         return f"종료된 AI Agent({ctx.signals.agent_name or ctx.profile.linked_ai_agent or '이름 미상'})에 활성 Token 존재"
@@ -362,8 +396,13 @@ def _terminated_agent_active_token(ctx: EvaluationContext) -> Optional[str]:
 
 
 def _revoked_token_still_used(ctx: EvaluationContext) -> Optional[str]:
+    matched = ctx.scenario("REVOKED_TOKEN_STILL_USED")
+    if matched is not None:
+        return matched.reason
     if ctx.signals.token_used_after_revocation is True:
         return "폐기 처리된 Token 이 계속 사용되고 있음"
+    if ctx.usage_analysis is not None and ctx.usage_analysis.used_after_revocation is True:
+        return "폐기 시각 이후의 사용 기록이 확인됨"
     if ctx.finding.credential_revoked is True:
         days = ctx.days_since_use
         if days is not None and days <= 7:
@@ -371,7 +410,21 @@ def _revoked_token_still_used(ctx: EvaluationContext) -> Optional[str]:
     return None
 
 
+def _token_replay_suspected(ctx: EvaluationContext) -> Optional[str]:
+    matched = ctx.scenario("TOKEN_REPLAY_SUSPECTED")
+    if matched is not None:
+        return matched.reason
+    if ctx.signals.token_replay_suspected is True:
+        binding = ctx.signals.token_binding_method or "미적용/미상"
+        source = ctx.signals.request_source_ip or "출처 미상"
+        return f"탈취 token 또는 proof 재사용 의심 요청 탐지 (binding={binding}, source={source})"
+    return None
+
+
 def _shared_across_projects(ctx: EvaluationContext) -> Optional[str]:
+    matched = ctx.scenario("TOKEN_SHARED_ACROSS_PROJECTS")
+    if matched is not None:
+        return matched.reason
     projects = ctx.shared_projects
     if len(projects) >= 2:
         return f"하나의 Token 이 여러 프로젝트에서 공유됨: {', '.join(projects[:5])}"
@@ -379,6 +432,9 @@ def _shared_across_projects(ctx: EvaluationContext) -> Optional[str]:
 
 
 def _read_only_nhi_mutates(ctx: EvaluationContext) -> Optional[str]:
+    matched = ctx.scenario("READ_ONLY_NHI_PERFORMS_MUTATION")
+    if matched is not None:
+        return matched.reason
     declared = set(ctx.declared_permissions)
     if declared and declared <= {PermissionLevel.READ}:
         mutating = {PermissionLevel.WRITE, PermissionLevel.DELETE, PermissionLevel.ADMIN}
@@ -395,6 +451,9 @@ def _diagnostic_agent_self_escalation(ctx: EvaluationContext) -> Optional[str]:
     "보안 진단 Agent" 가 정책 조회 이후 스스로 관리자 권한을 부여하는 시나리오를 겨냥한다.
     감사 로그(`observed_actions`)에 정책/그룹 변경류 API 가 함께 관측되면 강제 Critical 이다.
     """
+    matched = ctx.scenario("IAM_PRIVILEGE_SELF_ESCALATION")
+    if matched is not None:
+        return matched.reason
     declared = set(ctx.declared_permissions)
     if not declared or not declared <= {PermissionLevel.READ}:
         return None
@@ -412,6 +471,7 @@ FORCED_CRITICAL_RULES: Dict[str, Callable[[EvaluationContext], Optional[str]]] =
     "OWNERLESS_SENSITIVE_DATA_ACCESS": _ownerless_sensitive_access,
     "TERMINATED_AGENT_ACTIVE_TOKEN": _terminated_agent_active_token,
     "REVOKED_TOKEN_STILL_USED": _revoked_token_still_used,
+    "TOKEN_REPLAY_SUSPECTED": _token_replay_suspected,
     "TOKEN_SHARED_ACROSS_PROJECTS": _shared_across_projects,
     "READ_ONLY_NHI_PERFORMS_MUTATION": _read_only_nhi_mutates,
     "IAM_PRIVILEGE_SELF_ESCALATION": _diagnostic_agent_self_escalation,
@@ -432,6 +492,135 @@ def evaluate_forced_critical(ctx: EvaluationContext) -> List[Dict[str, str]]:
         if reason:
             hits.append({"rule_id": rule_id, "reason": reason})
     return hits
+
+
+_SCENARIO_NAMES: Dict[str, str] = {
+    "PUBLIC_REPO_ACTIVE_ADMIN_TOKEN": "공개 저장소의 활성 Admin Token",
+    "OWNERLESS_SENSITIVE_DATA_ACCESS": "Owner 없는 민감 데이터 접근",
+    "TERMINATED_AGENT_ACTIVE_TOKEN": "종료 Agent 자격 증명 잔존",
+    "REVOKED_TOKEN_STILL_USED": "폐기 Token 지속 사용",
+    "TOKEN_REPLAY_SUSPECTED": "탈취 Token/Proof 재사용",
+    "TOKEN_SHARED_ACROSS_PROJECTS": "프로젝트 간 Token 공유",
+    "READ_ONLY_NHI_PERFORMS_MUTATION": "조회 전용 NHI의 변경 행위",
+    "IAM_PRIVILEGE_SELF_ESCALATION": "조회 전용 NHI의 IAM 권한 상승",
+}
+
+_SCENARIO_EVENT_TYPES: Dict[str, SecurityEventType] = {
+    "PUBLIC_REPO_ACTIVE_ADMIN_TOKEN": SecurityEventType.HIGH_RISK_SCOPE_GRANTED,
+    "OWNERLESS_SENSITIVE_DATA_ACCESS": SecurityEventType.OWNER_MISSING,
+    "TERMINATED_AGENT_ACTIVE_TOKEN": SecurityEventType.TERMINATED_AGENT_CREDENTIAL_USE,
+    "REVOKED_TOKEN_STILL_USED": SecurityEventType.REVOKED_CREDENTIAL_USE,
+    "TOKEN_REPLAY_SUSPECTED": SecurityEventType.TOKEN_REPLAY,
+    "TOKEN_SHARED_ACROSS_PROJECTS": SecurityEventType.CROSS_PROJECT_CREDENTIAL_USE,
+    "READ_ONLY_NHI_PERFORMS_MUTATION": SecurityEventType.UNDECLARED_PERMISSION_USE,
+    "IAM_PRIVILEGE_SELF_ESCALATION": SecurityEventType.UNDECLARED_PERMISSION_USE,
+}
+
+
+def evaluate_security_scenarios(ctx: EvaluationContext) -> List[ScenarioMatch]:
+    """강제 Critical 규칙과 동일한 판정에서 ScenarioMatch를 구성한다.
+
+    Usage Agent의 event 기반 임시 매핑을 다시 신뢰하지 않고 canonical rule을 한 번
+    평가하므로 ``scenario_matches``와 ``risk.forced_rules``가 어긋나지 않는다.
+    """
+    previous = ctx.scenario_matches
+    ctx.scenario_matches = []
+    try:
+        hits = evaluate_forced_critical(ctx)
+    finally:
+        ctx.scenario_matches = previous
+
+    scenarios: List[ScenarioMatch] = []
+    hit_ids = {item["rule_id"] for item in hits}
+    for hit in hits:
+        rule_id = hit["rule_id"]
+        event_type = _SCENARIO_EVENT_TYPES.get(rule_id)
+        related = [
+            event
+            for event in ctx.security_events
+            if event_type is not None and event.event_type is event_type
+        ]
+        scenarios.append(
+            ScenarioMatch(
+                scenario_id=rule_id,
+                name=_SCENARIO_NAMES[rule_id],
+                severity=RiskLevel.CRITICAL,
+                confidence=max((event.confidence for event in related), default=1.0),
+                reason=hit["reason"],
+                event_ids=[event.event_id for event in related],
+                evidence=[
+                    evidence for event in related for evidence in event.evidence
+                ]
+                or [hit["reason"]],
+                forced_critical=True,
+                category="forced_critical",
+            )
+        )
+
+    # 일반 Scope 초과는 이벤트로 남기되 강제 Critical 시나리오와 구분한다.
+    if not hit_ids & {"READ_ONLY_NHI_PERFORMS_MUTATION", "IAM_PRIVILEGE_SELF_ESCALATION"}:
+        for event in ctx.security_events:
+            if event.event_type is not SecurityEventType.UNDECLARED_PERMISSION_USE:
+                continue
+            scenarios.append(
+                ScenarioMatch(
+                    scenario_id="OBSERVED_ACTION_EXCEEDS_DECLARED_SCOPE",
+                    name="승인 Scope 초과 행위",
+                    severity=event.severity,
+                    confidence=event.confidence,
+                    reason=event.detail,
+                    event_ids=[event.event_id],
+                    evidence=list(event.evidence),
+                    forced_critical=False,
+                    category="usage_anomaly",
+                )
+            )
+
+    # 점수를 다시 더하지 않는 설명용 시나리오다. 기존 Risk factor와 강제 규칙이
+    # 점수의 단일 진실 공급원이며, 아래 결과는 변화 추적과 대응 근거에만 사용한다.
+    used_event_ids = {
+        event_id for scenario in scenarios for event_id in scenario.event_ids
+    }
+    descriptive = {
+        SecurityEventType.HIGH_RISK_SCOPE_GRANTED: (
+            "HIGH_RISK_SCOPE_GRANTED",
+            "고위험 Scope 부여",
+            "permission_governance",
+        ),
+        SecurityEventType.UNUSED_HIGH_PRIVILEGE: (
+            "UNUSED_HIGH_PRIVILEGE",
+            "실제 사용보다 과도한 고권한",
+            "least_privilege",
+        ),
+        SecurityEventType.STALE_PERMISSION: (
+            "STALE_PERMISSION",
+            "장기 미사용 권한 잔존",
+            "lifecycle",
+        ),
+        SecurityEventType.OWNER_MISSING: (
+            "OWNER_MISSING",
+            "책임자 없는 NHI",
+            "ownership",
+        ),
+    }
+    for event in ctx.security_events:
+        if event.event_id in used_event_ids or event.event_type not in descriptive:
+            continue
+        scenario_id, name, category = descriptive[event.event_type]
+        scenarios.append(
+            ScenarioMatch(
+                scenario_id=scenario_id,
+                name=name,
+                severity=event.severity,
+                confidence=event.confidence,
+                reason=event.detail,
+                event_ids=[event.event_id],
+                evidence=list(event.evidence),
+                forced_critical=False,
+                category=category,
+            )
+        )
+    return scenarios
 
 
 def is_inactive_nhi(ctx: EvaluationContext) -> bool:

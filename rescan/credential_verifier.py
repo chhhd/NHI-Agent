@@ -54,6 +54,8 @@ class CredentialVerifier:
         finding.credential_detail = {
             "account": status.account,
             "accessible_resources": status.accessible_resources,
+            "resource_inventory_complete": status.resource_inventory_complete,
+            "resource_inventory_note": status.resource_inventory_note,
             "checked_at": status.checked_at,
             "error": status.error,
         }

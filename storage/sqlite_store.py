@@ -13,7 +13,7 @@ import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Sequence, Set
 from uuid import uuid4
 
 from connectors.github_connector import Repository
@@ -25,6 +25,12 @@ from backend.models.entities import (
 )
 from backend.services.finding_lifecycle import validate_transition
 from core.action_models import ActionRequest, ActionStatus
+from core.governance_models import (
+    ChangeRequest,
+    ChangeStatus,
+    ControlEvent,
+    LifecycleEvent,
+)
 from core.models import (
     CodeContext,
     DetectorType,
@@ -35,6 +41,8 @@ from core.models import (
     Severity,
 )
 from core.observation_models import CredentialObservation
+from core.nhi_models import parse_dt
+from core.usage_models import UsageEvent
 from storage.base import Storage
 
 _SCHEMA = """
@@ -98,6 +106,27 @@ CREATE TABLE IF NOT EXISTS observations (
 );
 CREATE INDEX IF NOT EXISTS idx_observations_fp ON observations(fingerprint);
 
+CREATE TABLE IF NOT EXISTS usage_events (
+    event_id      TEXT PRIMARY KEY,
+    provider      TEXT NOT NULL,
+    principal_id  TEXT NOT NULL,
+    occurred_at   TEXT NOT NULL,
+    expires_at    TEXT NOT NULL,
+    data          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_usage_principal ON usage_events(principal_id, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_usage_expiry ON usage_events(expires_at);
+
+CREATE TABLE IF NOT EXISTS collection_checkpoints (
+    provider      TEXT NOT NULL,
+    source        TEXT NOT NULL,
+    scope         TEXT NOT NULL,
+    cursor        TEXT,
+    collected_at  TEXT NOT NULL,
+    detail        TEXT NOT NULL,
+    PRIMARY KEY (provider, source, scope)
+);
+
 CREATE TABLE IF NOT EXISTS nhi_identities (
     nhi_id      TEXT PRIMARY KEY,
     provider    TEXT,
@@ -154,6 +183,69 @@ CREATE TABLE IF NOT EXISTS encrypted_secret_material (
     destroyed_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_secret_material_fp ON encrypted_secret_material(fingerprint);
+
+CREATE TABLE IF NOT EXISTS lifecycle_events (
+    seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id    TEXT NOT NULL UNIQUE,
+    nhi_id      TEXT NOT NULL,
+    stage       TEXT NOT NULL,
+    event_type  TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    data        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lifecycle_nhi ON lifecycle_events(nhi_id, occurred_at);
+
+CREATE TABLE IF NOT EXISTS change_requests (
+    change_id   TEXT PRIMARY KEY,
+    nhi_id      TEXT NOT NULL,
+    change_type TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    tier        TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    data        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_changes_nhi ON change_requests(nhi_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_changes_status ON change_requests(status);
+
+CREATE TABLE IF NOT EXISTS control_events (
+    seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id    TEXT NOT NULL UNIQUE,
+    nhi_id      TEXT NOT NULL,
+    event_type  TEXT NOT NULL,
+    verdict     TEXT NOT NULL,
+    severity    TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    data        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_control_nhi ON control_events(nhi_id, occurred_at);
+
+CREATE TABLE IF NOT EXISTS dpop_replay (
+    digest      TEXT PRIMARY KEY,
+    expires_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dpop_replay_expiry ON dpop_replay(expires_at);
+
+CREATE TABLE IF NOT EXISTS admin_principals (
+    admin_id    TEXT PRIMARY KEY,
+    disabled    INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL,
+    data        TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS control_approvals (
+    decision_id TEXT PRIMARY KEY,
+    status      TEXT NOT NULL,
+    requested_at TEXT NOT NULL,
+    data        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_control_approvals_status ON control_approvals(status, requested_at);
+
+CREATE TABLE IF NOT EXISTS agent_access_profiles (
+    agent_id    TEXT PRIMARY KEY,
+    updated_at  TEXT NOT NULL,
+    data        TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS audit_events (
     event_id    TEXT PRIMARY KEY,
@@ -278,6 +370,19 @@ class SQLiteStorage(Storage):
         self._lock = threading.Lock()
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            # 기존 5단계 인벤토리를 4단계 표준으로 옮긴다. 이력 원문은 보존한다.
+            from core.governance_models import LifecycleStage
+            for row in self._conn.execute("SELECT nhi_id, data FROM nhi_identities").fetchall():
+                record = json.loads(row["data"])
+                old = record.get("lifecycle_stage")
+                if old:
+                    stage = LifecycleStage(old).value
+                    if stage != old:
+                        record["lifecycle_stage"] = stage
+                        self._conn.execute(
+                            "UPDATE nhi_identities SET data=? WHERE nhi_id=?",
+                            (json.dumps(record, ensure_ascii=False), row["nhi_id"]),
+                        )
             self._conn.commit()
 
     # -- Repository ------------------------------------------------------
@@ -607,8 +712,152 @@ class SQLiteStorage(Storage):
             rows = self._conn.execute(sql, args).fetchall()
         return [CredentialObservation.from_dict(json.loads(row["data"])) for row in rows]
 
+    # -- 개인정보 최소화된 사용 이벤트 / 수집 checkpoint --------------
+    def save_usage_events(
+        self, events: Sequence[UsageEvent], *, retention_days: int
+    ) -> Dict[str, int]:
+        retention_days = min(max(int(retention_days), 1), 365)
+        reference = datetime.now(timezone.utc)
+        counts = {
+            "inserted": 0,
+            "duplicates": 0,
+            "expired_skipped": 0,
+            "invalid_skipped": 0,
+            "purged": 0,
+        }
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM usage_events WHERE expires_at <= ?", (reference.isoformat(),)
+            )
+            counts["purged"] = max(int(cur.rowcount or 0), 0)
+            for event in events:
+                occurred = parse_dt(event.occurred_at)
+                if occurred is None:
+                    counts["invalid_skipped"] += 1
+                    continue
+                expires_at = occurred + timedelta(days=retention_days)
+                if expires_at <= reference:
+                    counts["expired_skipped"] += 1
+                    continue
+                cur = self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO usage_events
+                        (event_id, provider, principal_id, occurred_at, expires_at, data)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event.event_id,
+                        event.provider,
+                        event.principal_id,
+                        event.occurred_at,
+                        expires_at.isoformat(),
+                        json.dumps(event.to_dict(), ensure_ascii=False),
+                    ),
+                )
+                if int(cur.rowcount or 0) == 1:
+                    counts["inserted"] += 1
+                else:
+                    counts["duplicates"] += 1
+            self._conn.commit()
+        return counts
+
+    def list_usage_events(
+        self,
+        *,
+        principal_id: Optional[str] = None,
+        provider: Optional[str] = None,
+        since: Optional[str] = None,
+        limit: int = 1000,
+    ) -> List[UsageEvent]:
+        clauses = ["expires_at > ?"]
+        args: List[Any] = [datetime.now(timezone.utc).isoformat()]
+        if principal_id is not None:
+            clauses.append("principal_id = ?")
+            args.append(principal_id)
+        if provider is not None:
+            clauses.append("provider = ?")
+            args.append(provider)
+        if since is not None:
+            clauses.append("occurred_at >= ?")
+            args.append(since)
+        args.append(min(max(int(limit), 1), 10001))
+        sql = (
+            "SELECT data FROM usage_events WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY occurred_at ASC LIMIT ?"
+        )
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(args)).fetchall()
+        return [UsageEvent.from_dict(json.loads(row["data"])) for row in rows]
+
+    def purge_expired_usage_events(self, *, now: Optional[str] = None) -> int:
+        reference = parse_dt(now) or datetime.now(timezone.utc)
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM usage_events WHERE expires_at <= ?", (reference.isoformat(),)
+            )
+            self._conn.commit()
+        return max(int(cur.rowcount or 0), 0)
+
+    def save_collection_checkpoint(
+        self,
+        *,
+        provider: str,
+        source: str,
+        scope: str,
+        cursor: Optional[str],
+        detail: Dict[str, Any],
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO collection_checkpoints
+                    (provider, source, scope, cursor, collected_at, detail)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(provider, source, scope) DO UPDATE SET
+                    cursor=excluded.cursor,
+                    collected_at=excluded.collected_at,
+                    detail=excluded.detail
+                """,
+                (
+                    provider,
+                    source,
+                    scope,
+                    cursor,
+                    _utcnow(),
+                    json.dumps(detail, ensure_ascii=False),
+                ),
+            )
+            self._conn.commit()
+
+    def get_collection_checkpoint(
+        self, *, provider: str, source: str, scope: str
+    ) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT cursor, collected_at, detail FROM collection_checkpoints
+                WHERE provider=? AND source=? AND scope=?
+                """,
+                (provider, source, scope),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "provider": provider,
+            "source": source,
+            "scope": scope,
+            "cursor": row["cursor"],
+            "collected_at": row["collected_at"],
+            "detail": json.loads(row["detail"]),
+        }
+
     # -- NHI / 분석 스냅샷 ----------------------------------------------
     def upsert_nhi(self, nhi_id: str, data: Dict[str, Any]) -> None:
+        from core.governance_models import LifecycleStage
+        data = dict(data)
+        if data.get("lifecycle_stage"):
+            data["lifecycle_stage"] = LifecycleStage(data["lifecycle_stage"]).value
         now = _utcnow()
         with self._lock:
             self._conn.execute(
@@ -720,6 +969,25 @@ class SQLiteStorage(Storage):
             args = (repository, limit)
         with self._lock:
             rows = self._conn.execute(sql, args).fetchall()
+        return [json.loads(row["data"]) for row in rows]
+
+    def list_nhi_analyses(
+        self, nhi_id: str, *, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        """Credential↔NHI binding 을 기준으로 분석 이력을 최신순 조회한다."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT DISTINCT ar.data, ar.analyzed_at
+                FROM analysis_runs ar
+                JOIN credential_nhi_bindings binding
+                  ON binding.fingerprint = ar.fingerprint
+                WHERE binding.nhi_id=?
+                ORDER BY ar.analyzed_at DESC
+                LIMIT ?
+                """,
+                (nhi_id, limit),
+            ).fetchall()
         return [json.loads(row["data"]) for row in rows]
 
     # -- 조치 요청 ------------------------------------------------------
@@ -839,6 +1107,314 @@ class SQLiteStorage(Storage):
                 (_utcnow(), secret_id),
             )
             self._conn.commit()
+
+    def list_encrypted_secret_ids(self, fingerprint: str) -> List[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT secret_id FROM encrypted_secret_material
+                WHERE fingerprint=? AND destroyed_at IS NULL
+                """,
+                (fingerprint,),
+            ).fetchall()
+        return [row["secret_id"] for row in rows]
+
+    # -- 거버넌스: 생명주기 / 변경 승인 / 실시간 통제 -------------------
+    def append_lifecycle_event(self, event: LifecycleEvent) -> LifecycleEvent:
+        from core.governance_models import LifecycleStage
+        event.stage = LifecycleStage(event.stage).value
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO lifecycle_events
+                    (event_id, nhi_id, stage, event_type, occurred_at, data)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.event_id,
+                    event.nhi_id,
+                    event.stage,
+                    event.event_type,
+                    event.occurred_at,
+                    json.dumps(event.to_dict(), ensure_ascii=False),
+                ),
+            )
+            self._conn.commit()
+        return event
+
+    def list_lifecycle_events(
+        self, *, nhi_id: Optional[str] = None, limit: int = 200
+    ) -> List[Dict[str, Any]]:
+        sql = "SELECT data FROM lifecycle_events"
+        args: tuple = ()
+        if nhi_id:
+            sql += " WHERE nhi_id=?"
+            args = (nhi_id,)
+        sql += " ORDER BY occurred_at DESC, seq DESC LIMIT ?"
+        with self._lock:
+            rows = self._conn.execute(sql, (*args, limit)).fetchall()
+        from core.governance_models import LifecycleStage
+        events = [json.loads(row["data"]) for row in rows]
+        for event in events:
+            original = event["stage"]
+            event["stage"] = LifecycleStage(original).value
+            if event["stage"] != original:
+                event["legacy_stage"] = original
+        return events
+
+    def save_change_request(self, change: ChangeRequest) -> ChangeRequest:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO change_requests
+                    (change_id, nhi_id, change_type, status, tier,
+                     created_at, updated_at, data)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(change_id) DO UPDATE SET
+                    status=excluded.status,
+                    updated_at=excluded.updated_at,
+                    data=excluded.data
+                """,
+                (
+                    change.change_id,
+                    change.nhi_id,
+                    change.change_type.value,
+                    change.status.value,
+                    change.tier.value,
+                    change.created_at,
+                    change.updated_at,
+                    json.dumps(change.to_dict(), ensure_ascii=False),
+                ),
+            )
+            self._conn.commit()
+        return change
+
+    def get_change_request(self, change_id: str) -> Optional[ChangeRequest]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT data FROM change_requests WHERE change_id=?", (change_id,)
+            ).fetchone()
+        return ChangeRequest.from_dict(json.loads(row["data"])) if row else None
+
+    def list_change_requests(
+        self,
+        *,
+        status: Optional[ChangeStatus] = None,
+        nhi_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[ChangeRequest]:
+        clauses, args = [], []
+        if status is not None:
+            clauses.append("status=?")
+            args.append(status.value)
+        if nhi_id:
+            clauses.append("nhi_id=?")
+            args.append(nhi_id)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT data FROM change_requests{where} "
+                "ORDER BY created_at DESC LIMIT ?",
+                (*args, limit),
+            ).fetchall()
+        return [ChangeRequest.from_dict(json.loads(row["data"])) for row in rows]
+
+    def append_control_event(self, event: ControlEvent) -> ControlEvent:
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                INSERT INTO control_events
+                    (event_id, nhi_id, event_type, verdict, severity, occurred_at, data)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.event_id,
+                    event.nhi_id,
+                    event.event_type,
+                    event.verdict,
+                    event.severity,
+                    event.occurred_at,
+                    json.dumps(event.to_dict(), ensure_ascii=False),
+                ),
+            )
+            event.seq = int(cursor.lastrowid)
+            self._conn.execute(
+                "UPDATE control_events SET data=? WHERE seq=?",
+                (json.dumps(event.to_dict(), ensure_ascii=False), event.seq),
+            )
+            self._conn.commit()
+        return event
+
+    def list_control_events(
+        self,
+        *,
+        after_seq: Optional[int] = None,
+        nhi_id: Optional[str] = None,
+        since: Optional[str] = None,
+        verdict: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        clauses, args = [], []
+        if after_seq is not None:
+            clauses.append("seq>?")
+            args.append(after_seq)
+        if nhi_id:
+            clauses.append("nhi_id=?")
+            args.append(nhi_id)
+        if since:
+            clauses.append("occurred_at>=?")
+            args.append(since)
+        if verdict:
+            clauses.append("verdict=?")
+            args.append(verdict)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        order = "ASC" if after_seq is not None else "DESC"
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT data FROM control_events{where} ORDER BY seq {order} LIMIT ?",
+                (*args, limit),
+            ).fetchall()
+        return [json.loads(row["data"]) for row in rows]
+
+    # -- DPoP replay 방지 -----------------------------------------------
+    def consume_replay_key(
+        self, digest: str, *, expires_at: float, now: float, max_entries: int
+    ) -> str:
+        with self._lock:
+            self._conn.execute("DELETE FROM dpop_replay WHERE expires_at <= ?", (now,))
+            total = self._conn.execute("SELECT COUNT(*) FROM dpop_replay").fetchone()[0]
+            cursor = self._conn.execute(
+                "INSERT OR IGNORE INTO dpop_replay (digest, expires_at) "
+                "SELECT ?, ? WHERE ? < ?",
+                (digest, expires_at, total, max_entries),
+            )
+            self._conn.commit()
+            if cursor.rowcount == 1:
+                return "NEW"
+            exists = self._conn.execute(
+                "SELECT 1 FROM dpop_replay WHERE digest=?", (digest,)
+            ).fetchone()
+            return "DUPLICATE" if exists else "FULL"
+
+    # -- 관리자 계정 ----------------------------------------------------
+    def save_admin_principal(self, principal: Dict[str, Any]) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO admin_principals (admin_id, disabled, created_at, data)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(admin_id) DO UPDATE SET
+                    disabled=excluded.disabled, data=excluded.data
+                """,
+                (
+                    principal["admin_id"],
+                    1 if principal.get("disabled") else 0,
+                    principal["created_at"],
+                    json.dumps(principal, ensure_ascii=False),
+                ),
+            )
+            self._conn.commit()
+
+    def get_admin_principal(self, admin_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT data FROM admin_principals WHERE admin_id=?", (admin_id,)
+            ).fetchone()
+        return json.loads(row["data"]) if row else None
+
+    def list_admin_principals(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT data FROM admin_principals ORDER BY created_at"
+            ).fetchall()
+        return [json.loads(row["data"]) for row in rows]
+
+    # -- 실시간 통제 승인 대기 -------------------------------------------
+    def save_control_approval(self, approval: Dict[str, Any]) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO control_approvals (decision_id, status, requested_at, data)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(decision_id) DO NOTHING
+                """,
+                (
+                    approval["decision_id"],
+                    approval["status"],
+                    approval["requested_at"],
+                    json.dumps(approval, ensure_ascii=False),
+                ),
+            )
+            self._conn.commit()
+
+    def get_control_approval(self, decision_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT data FROM control_approvals WHERE decision_id=?", (decision_id,)
+            ).fetchone()
+        return json.loads(row["data"]) if row else None
+
+    def list_control_approvals(
+        self, *, status: Optional[str] = None, limit: int = 100
+    ) -> List[Dict[str, Any]]:
+        where, args = ("WHERE status=?", (status,)) if status else ("", ())
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT data FROM control_approvals {where} "
+                "ORDER BY requested_at DESC LIMIT ?",
+                (*args, limit),
+            ).fetchall()
+        return [json.loads(row["data"]) for row in rows]
+
+    def compare_and_set_control_approval(
+        self, decision_id: str, *, expected_status: str, approval: Dict[str, Any]
+    ) -> bool:
+        """상태가 `expected_status` 일 때만 갱신한다. 동시 결정·허가 중복 사용을 막는 원자 연산."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE control_approvals SET status=?, data=? WHERE decision_id=? AND status=?",
+                (
+                    approval["status"],
+                    json.dumps(approval, ensure_ascii=False),
+                    decision_id,
+                    expected_status,
+                ),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
+
+    # -- Agent 접근 기준선 ----------------------------------------------
+    def save_agent_access_profile(self, profile: Dict[str, Any]) -> None:
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO agent_access_profiles (agent_id, updated_at, data)
+                VALUES (?, ?, ?)
+                ON CONFLICT(agent_id) DO UPDATE SET
+                    updated_at=excluded.updated_at, data=excluded.data
+                """,
+                (
+                    profile["agent_id"],
+                    profile["updated_at"],
+                    json.dumps(profile, ensure_ascii=False),
+                ),
+            )
+            self._conn.commit()
+
+    def get_agent_access_profile(self, agent_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT data FROM agent_access_profiles WHERE agent_id=?", (agent_id,)
+            ).fetchone()
+        return json.loads(row["data"]) if row else None
+
+    def list_agent_access_profiles(self, *, limit: int = 100) -> List[Dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT data FROM agent_access_profiles ORDER BY updated_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [json.loads(row["data"]) for row in rows]
 
     # -- 감사 로그 ------------------------------------------------------
     def append_audit_event(
@@ -1340,6 +1916,9 @@ class SQLiteStorage(Storage):
                     "analyses": 0,
                     "actions": 0,
                     "audit_events": 0,
+                    "change_requests": 0,
+                    "lifecycle_events": 0,
+                    "control_events": 0,
                 }
 
             repo_marks = ",".join("?" for _ in repositories)
@@ -1402,8 +1981,27 @@ class SQLiteStorage(Storage):
                 "analyses": len(analysis_ids),
                 "actions": 0,
                 "audit_events": 0,
+                "change_requests": 0,
+                "lifecycle_events": 0,
+                "control_events": 0,
             }
             counts["actions"] = delete_in("action_requests", "action_id", action_ids)
+            change_ids = [
+                row["change_id"]
+                for row in self._conn.execute(
+                    """
+                    SELECT change_id FROM change_requests
+                    WHERE json_extract(data, '$.demo_workspace')=1
+                    """
+                ).fetchall()
+            ]
+            counts["change_requests"] = delete_in(
+                "change_requests", "change_id", change_ids
+            )
+            counts["lifecycle_events"] = delete_in(
+                "lifecycle_events", "nhi_id", nhi_ids
+            )
+            counts["control_events"] = delete_in("control_events", "nhi_id", nhi_ids)
             delete_in("finding_status_history", "finding_id", finding_ids)
             delete_in("credential_nhi_bindings", "nhi_id", nhi_ids)
             if fingerprints:
@@ -1446,6 +2044,8 @@ class SQLiteStorage(Storage):
                 *finding_ids,
                 *nhi_ids,
                 *action_ids,
+                *change_ids,
+                *nhi_ids,
             ]
             counts["audit_events"] += delete_in(
                 "audit_events", "target", audit_targets

@@ -159,38 +159,56 @@ class RiskScorer:
         return self._factor("exposure_location", score, reasons)
 
     def _exposure_access_scope(self, ctx: EvaluationContext) -> RiskFactor:
-        """인벤토리 입력 — 접근 가능한 저장소 범위로 노출 면적을 평가한다."""
+        """인벤토리 입력 — 접근 가능한 저장소/서비스 자원 범위로 평가한다."""
         reasons: List[str] = []
         repositories = ctx.accessible_repositories
-        total = len(repositories)
+        resources = ctx.accessible_resources
+        inventory = repositories or resources
+        noun = "저장소" if repositories else "자원"
+        total = len(inventory)
         threshold = ctx.config.broad_repository_access_threshold
+        repository_selection = str(
+            (ctx.signals.extra or {}).get("repository_selection") or ""
+        ).lower()
+        repository_inventory_complete = (
+            (ctx.signals.extra or {}).get("repository_inventory_complete") is True
+        )
 
         private = sum(
             1
-            for repo in repositories
+            for repo in inventory
             if str(repo.get("visibility", "private")).strip().lower() != "public"
         )
-        sensitive = sum(1 for repo in repositories if repo.get("is_sensitive") is True)
+        sensitive = sum(1 for repo in inventory if repo.get("is_sensitive") is True)
 
-        if total == 0:
+        if total == 0 and repository_selection == "all":
+            score = 14
+            noun = "저장소"
+            reasons.append(
+                "조직의 모든 저장소 접근 범위(selection=all), 개별 저장소 수는 미확인"
+            )
+        elif total == 0:
             score = 8
-            reasons.append("접근 가능한 저장소 목록 미확인 — 보수적으로 평가")
+            reasons.append("접근 가능한 자원 목록 미확인 — 보수적으로 평가")
         elif total >= threshold:
             score = 14
-            reasons.append(f"{total}개 저장소에 광범위하게 접근 가능 (기준 {threshold}개)")
+            reasons.append(f"{total}개 {noun}에 광범위하게 접근 가능 (기준 {threshold}개)")
         elif total >= 2:
             score = 8
-            reasons.append(f"{total}개 저장소에 접근 가능")
+            reasons.append(f"{total}개 {noun}에 접근 가능")
         else:
             score = 4
-            reasons.append("단일 저장소에만 접근 가능")
+            reasons.append(f"단일 {noun}에만 접근 가능")
 
-        if private:
+        if repositories and private:
             score += 3
             reasons.append(f"비공개 저장소 {private}개 접근 가능")
         if sensitive:
             score += 3
             reasons.append(f"민감 저장소 {sensitive}개 접근 가능")
+        if repositories or repository_selection:
+            if not repository_inventory_complete:
+                reasons.append("저장소 이름 인벤토리가 불완전해 전체 범위를 확정할 수 없음")
 
         return self._factor("exposure_location", score, reasons)
 
@@ -322,14 +340,42 @@ class RiskScorer:
                 score += 2
                 reasons.append(f"{days}일간 미사용 상태로 방치")
 
-        if ctx.signals.token_used_after_revocation is True:
+        usage = ctx.usage_analysis
+        used_after_revocation = (
+            usage.used_after_revocation
+            if usage is not None
+            else ctx.signals.token_used_after_revocation
+        )
+        replay_suspected = (
+            usage.replay_suspected
+            if usage is not None
+            else ctx.signals.token_replay_suspected
+        )
+        sender_constrained = (
+            usage.sender_constrained
+            if usage is not None
+            else ctx.signals.sender_constrained
+        )
+
+        if used_after_revocation is True:
             score += 7
             reasons.append("폐기 이후에도 호출 기록 존재")
 
-        declared = set(ctx.declared_permissions)
-        observed = set(ctx.observed_permissions)
-        if declared and observed - declared:
-            over = ", ".join(sorted(p.value for p in observed - declared))
+        if replay_suspected is True:
+            score += 10
+            reasons.append("탈취 token 또는 DPoP proof 재사용 의심")
+
+        if sender_constrained is False:
+            score += 2
+            reasons.append("sender-constrained token 미적용")
+
+        unexpected = (
+            set(usage.unexpected_permissions)
+            if usage is not None
+            else set(ctx.observed_permissions) - set(ctx.declared_permissions)
+        )
+        if unexpected:
+            over = ", ".join(sorted(p.value for p in unexpected))
             score += 5
             reasons.append(f"승인 범위를 넘는 행위 관측: {over}")
 

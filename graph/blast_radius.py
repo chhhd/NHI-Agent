@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 #: 데이터를 조직 밖으로 내보낼 수 있는 provider (쓰기 권한 결합 시)
 EXTERNAL_TRANSFER_PROVIDERS = {
     "slack", "sendgrid", "notion", "huggingface", "npm", "github", "gitlab",
+    "microsoft", "google_workspace",
 }
 
 #: provider → 대표 서비스 표기
@@ -43,6 +44,8 @@ SERVICE_LABEL = {
     "huggingface": "Hugging Face",
     "aws": "AWS",
     "google": "Google Cloud",
+    "google_workspace": "Google Workspace",
+    "microsoft": "Microsoft 365",
     "anthropic": "Anthropic API",
     "openai": "OpenAI API",
     "stripe": "Stripe",
@@ -100,6 +103,17 @@ class BlastRadiusCalculator:
             report.notes.append("Scope 미확인 — 권한은 Secret 유형 기준 가정값")
         if not resources:
             report.notes.append("접근 가능 자원 목록을 확인하지 못함 (토큰 검증 미수행 또는 권한 부족)")
+        repository_selection = str(
+            (signals.extra or {}).get("repository_selection") or ""
+        ).lower()
+        if repository_selection == "all":
+            report.notes.append(
+                "GitHub App installation은 조직의 모든 저장소 범위이나 개별 이름은 미수집"
+            )
+        elif repository_selection == "selected" and not resources:
+            report.notes.append(
+                "GitHub App installation은 선택 저장소 범위이나 개별 이름은 미수집"
+            )
         if profile.linked_ai_agent:
             report.notes.append(f"AI Agent '{profile.linked_ai_agent}' 가 이 Credential 을 사용")
 

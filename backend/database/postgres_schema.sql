@@ -172,6 +172,29 @@ CREATE TABLE IF NOT EXISTS activities (
     metadata JSONB NOT NULL DEFAULT '{}'
 );
 
+-- 원본 Audit Log가 아닌 개인정보 최소화·가명처리된 사용 이벤트만 보존한다.
+CREATE TABLE IF NOT EXISTS usage_events (
+    event_id TEXT PRIMARY KEY,
+    provider TEXT NOT NULL,
+    principal_id TEXT NOT NULL,
+    occurred_at TIMESTAMPTZ NOT NULL,
+    expires_at TIMESTAMPTZ NOT NULL,
+    data JSONB NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_usage_events_principal
+    ON usage_events(principal_id, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_usage_events_expiry ON usage_events(expires_at);
+
+CREATE TABLE IF NOT EXISTS collection_checkpoints (
+    provider TEXT NOT NULL,
+    source TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    cursor TEXT,
+    collected_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    detail JSONB NOT NULL DEFAULT '{}',
+    PRIMARY KEY (provider, source, scope)
+);
+
 CREATE TABLE IF NOT EXISTS risk_assessments (
     assessment_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     finding_id UUID REFERENCES findings(finding_id) ON DELETE CASCADE,
@@ -240,6 +263,57 @@ CREATE TABLE IF NOT EXISTS audit_events (
     occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- NHI 거버넌스: 생명주기(DAS) / 변경 승인(영향도·롤백) / 실시간 통제
+CREATE TABLE IF NOT EXISTS lifecycle_events (
+    seq BIGSERIAL PRIMARY KEY,
+    event_id UUID NOT NULL UNIQUE DEFAULT gen_random_uuid(),
+    nhi_id TEXT NOT NULL,
+    stage TEXT NOT NULL CHECK (stage IN
+        ('REGISTERED', 'ACTIVE', 'DEACTIVATED', 'DECOMMISSIONED')),
+    event_type TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    change_id UUID,
+    detail JSONB NOT NULL DEFAULT '{}',
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS change_requests (
+    change_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    nhi_id TEXT NOT NULL,
+    change_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    tier TEXT NOT NULL,
+    requested_by TEXT NOT NULL,
+    approved_by TEXT,
+    reason TEXT NOT NULL DEFAULT '',
+    params JSONB NOT NULL DEFAULT '{}',
+    before_state JSONB NOT NULL,
+    after_state JSONB NOT NULL,
+    impact JSONB NOT NULL,
+    rollback JSONB NOT NULL,
+    rollback_expires_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS control_events (
+    seq BIGSERIAL PRIMARY KEY,
+    event_id UUID NOT NULL UNIQUE DEFAULT gen_random_uuid(),
+    nhi_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    verdict TEXT NOT NULL CHECK (verdict IN ('ALLOW', 'ALERT', 'REVIEW', 'DENY', 'QUARANTINE')),
+    severity TEXT NOT NULL,
+    rules JSONB NOT NULL DEFAULT '[]',
+    attributes JSONB NOT NULL DEFAULT '{}',
+    enforced BOOLEAN NOT NULL DEFAULT TRUE,
+    change_id UUID,
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_lifecycle_nhi ON lifecycle_events(nhi_id, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS idx_changes_nhi ON change_requests(nhi_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_changes_status ON change_requests(status);
+CREATE INDEX IF NOT EXISTS idx_control_nhi ON control_events(nhi_id, occurred_at DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status);
 CREATE INDEX IF NOT EXISTS idx_findings_risk ON findings(risk_level, risk_score DESC);
 CREATE INDEX IF NOT EXISTS idx_findings_project ON findings(project_id);

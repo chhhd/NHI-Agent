@@ -14,7 +14,7 @@ Slack Web API 는 HTTP 200 을 주면서 body 의 `ok: false` 로 오류를 알�
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -136,7 +136,11 @@ class SlackConnector(BaseConnector):
             "url": payload.get("url"),
             "is_enterprise_install": payload.get("is_enterprise_install", False),
         }
-        status.accessible_resources = self._safe_channels(target)
+        (
+            status.accessible_resources,
+            status.resource_inventory_complete,
+            status.resource_inventory_note,
+        ) = self._safe_channels(target)
         return status
 
     def is_revoked(self, token: Optional[str] = None) -> bool:
@@ -242,13 +246,16 @@ class SlackConnector(BaseConnector):
                 break
         return channels
 
-    def _safe_channels(self, token: str) -> List[Dict[str, Any]]:
-        """Scope 부족 등으로 실패해도 전체 검증이 깨지지 않도록 감싼다."""
+    def _safe_channels(
+        self, token: str
+    ) -> Tuple[List[Dict[str, Any]], bool, Optional[str]]:
+        """검증 경로에서는 최대 100개 표본만 수집하고 완전성을 명시한다."""
         try:
-            return self.list_channels(token=token, limit=100, max_pages=1)
+            channels = self.list_channels(token=token, limit=100, max_pages=1)
+            return channels, False, "Slack Credential 검증은 접근 채널 최대 100개 표본만 수집함"
         except (PermissionDeniedError, ConnectorError) as exc:
             logger.info("채널 목록 조회 생략: %s", exc)
-            return []
+            return [], False, "Slack 채널 목록을 조회하지 못함"
 
     # ------------------------------------------------------------------
     # 내부
