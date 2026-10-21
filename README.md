@@ -246,22 +246,28 @@ NHI 단위 질의(`/control/authorize`)와 Agent 호출(`/control/agent-calls`)�
 `POST /control/authorize` (게이트웨이용 동기 인가 질의) · `POST /control/events` · `GET /control/events?after_seq=`
 · `GET /control/status` · `POST /control/nhi/{id}/quarantine|release`
 
-#### 2. 변경 승인 — 영향도 미리보기 · 중요도별 승인 · 롤백 (`change_control_service.py`)
+#### 2. 변경 승인 — 영향도 미리보기 · 관리자 승인 · 단순 롤백 (`change_control_service.py`)
 
 Token **폐기 / 교체 / 권한 변경 / 파기**는 적용 전에 변경 전·후 형상과 영향을 보여 주고, 관리자가 승인한 뒤에만 적용한다.
 
 - 미리보기: permissions·scopes·실효 접근·Credential 상태·생명주기 단계·버전의 전/후 diff, 영향 범위(서비스·리소스·AI Agent),
   서비스 연속성 위험과 완화 방안, 보안 효과, 롤백 계획 (`POST /changes/preview`, 저장하지 않음)
-- 권한 중요도 → 승인 등급: **LOW** 자동 승인 / **MEDIUM** 관리자 승인 / **HIGH** 요청자와 다른 관리자(직무 분리) /
-  **CRITICAL** 직무 분리 + 영향도 확인(`acknowledge_impact`). 권한 상향 변경은 한 등급 올려 심사한다.
-- 롤백: 적용 후 변경 전 형상으로 복원. 이후 다른 변경이 있으면 덮어쓰지 않도록 409 로 거부하고, 제안 이후 대상 상태가
-  달라졌다면 승인도 거부한다. 교체는 유예 시간 안에서만, **파기는 롤백 불가**(승인 화면에 명시).
+- 위험 등급: LOW/MEDIUM/HIGH/CRITICAL은 영향 정보로 계속 계산하지만 승인 인원·역할을 나누지 않는다.
+  격리를 제외한 모든 변경은 공용 관리자 키로 인증된 관리자 한 명의 승인을 기다린다.
+- 단순 롤백: 적용 후 **내부 Inventory**를 변경 전 형상으로 복원한다. Provider에는 역호출하지 않는다.
+  이후 다른 변경이 있으면 덮어쓰지 않도록 409로 거부하며, 교체는 유예 시간 안에서만 가능하고 파기는 롤백 불가다.
 
 `POST /changes` · `GET /changes` · `POST /changes/{id}/approve|reject|rollback`
 
-> 기본 실행기(`InventoryStateExecutor`)는 NHI 인벤토리 상태만 바꾸고 **외부 Provider(GitHub/Slack)를 호출하지 않는다.**
-> 실제 Token 폐기·교체는 `ChangeExecutor` 공급자 어댑터를 연결해야 일어난다.
-> 개인 관리자 키 사용 시 서버가 승인자 신원을 확정한다.
+`ProviderChangeExecutor`는 GitHub·Slack·AWS 변경을 실제로 시도한다.
+
+- GitHub: App installation token/조직 fine-grained PAT 폐기, OAuth token 교체, installation repository 범위 변경
+- Slack: `auth.revoke`, OAuth token rotation (`oauth.v2.access`)
+- AWS: IAM access key 비활성화/발급, managed/inline user policy 변경
+- 완료 기준은 **내부 Inventory 반영**이다. Provider 성공/실패는 `apply_result.provider`와
+  `PROVIDER_CHANGE_SUCCEEDED|FAILED` 감사 이벤트에 기록되며 외부 실패가 내부 `APPLIED`를 취소하지 않는다.
+  Provider 변경 경로는 자동 재시도하지 않는다.
+- 대상 원문은 `NHI_MASTER_KEY`로 봉인된 `secret_ref`만 사용한다. 새 token/secret도 원문 대신 봉인 참조만 반환한다.
 
 #### 3. 생명주기 — DAS (`lifecycle_service.py`)
 
@@ -332,39 +338,12 @@ Dashboard에는 **Lifecycle / Change Control / Live Control** 화면이 있다. 
   호출자 보고값이라고 메시지에 표시한다.
 
 **한계**: 호출률 측정과 `GOVERNANCE_LOCK` 은 단일 프로세스 메모리 기준이다(다중 워커 시 공유 저장소 필요).
-승인자 신원은 개인 관리자 키로 확정한다(아래 "승인자 신원 · 역할").
 
-#### 승인자 신원 · 역할 (`security/admin_identity.py`)
+#### 관리자 인증
 
-공유 관리자 키 하나와 본문 `actor` 문자열만으로는 "요청자와 다른 관리자만 승인" 같은 직무 분리가
-이름만 바꿔 쓰면 우회된다. 관리자별 개인 키로 신원을 확정하고 역할로 승인 권한을 제한한다.
-
-| 구분 | 내용 |
-| --- | --- |
-| 개인 키 | `nhik.<admin_id>.<secret>`. 서버가 생성해 **한 번만** 보여 주고 SHA-256 digest 만 저장. 회전·비활성 가능 |
-| 역할 | `ADMIN`: 일반 승인·거부·롤백·격리 해제 / `SECURITY`: 추가로 **CRITICAL 변경 승인** |
-| actor | 개인 키를 쓰면 `actor` 는 키의 관리자 ID. 본문에 다른 이름을 적으면 403, 생략하면 키의 ID |
-| bootstrap | 기존 `NHI_ADMIN_API_KEY` 는 관리자 계정 관리 전용(break-glass). 개인 계정이 하나라도 있으면 승인 등 actor 가 필요한 작업에는 쓸 수 없다 |
-| 기록 | `ChangeRequest.requested_by_verified` · `approved_by_verified`, 실시간 보류 `decided_by_verified`, 감사 로그 `actor_verified` |
-
-```bash
-# 1) 공유 키로 관리자 계정 생성 (api_key 는 이 응답에서만 볼 수 있다)
-curl -X POST localhost:8000/admin/principals -H "X-NHI-Admin-Key: $NHI_ADMIN_API_KEY" \
-  -H "Content-Type: application/json" -d '{"admin_id":"alice","roles":["ADMIN"]}'
-curl -X POST localhost:8000/admin/principals -H "X-NHI-Admin-Key: $NHI_ADMIN_API_KEY" \
-  -H "Content-Type: application/json" -d '{"admin_id":"sam","roles":["SECURITY"]}'
-# 2) 이후 승인은 개인 키로 (actor 생략 가능)
-curl -X POST localhost:8000/changes/<id>/approve -H "X-NHI-Admin-Key: nhik.sam.<secret>" \
-  -H "Content-Type: application/json" -d '{"acknowledge_impact":true,"reason":"확인"}'
-```
-
-`GET /admin/whoami` · `GET/POST /admin/principals` · `POST /admin/principals/{id}/rotate-key|disable|enable`
-(관리 API 는 공유 키 전용 — 계정이 스스로 권한을 올릴 수 없다).
-합성 데모 NHI 는 이전처럼 키 없이 체험할 수 있다(`via=demo`, `verified=false`).
-
-**한계**: 개인 키는 IdP 가 아니라 자체 발급 비밀이다(분실·유출 시 회전). 모든 계정을 비활성화하면 공유 키 방식으로
-되돌아가므로, 되돌림을 막으려면 `NHI_REQUIRE_VERIFIED_ADMIN=true` 를 설정한다. CRITICAL 변경의 **2인 승인**
-(OWNER+SECURITY)과 IdP(OIDC) 연동은 아직 없다 — `AdminDirectory.authenticate` 만 교체하면 된다.
+관리자 기능은 `NHI_ADMIN_API_KEY` 한 개와 `X-NHI-Admin-Key` 헤더로 보호한다. 개인 관리자 계정·역할·
+`/admin/principals` API는 사용하지 않는다. 변경 요청/승인 본문의 `requested_by`·`actor`는 감사 표시 이름이며
+인증 신원이 아니다. 합성 데모 NHI는 관리자 키 없이 체험할 수 있다.
 
 #### 5. 사용 분석 → 보안 이벤트 → 시나리오 (`usage_analysis_agent.py`)
 
@@ -413,18 +392,17 @@ python scripts/check_security.py     # HIGH 가 있으면 종료 코드 1, 값�
 
 ```bash
 curl localhost:8000/lifecycle/aging                      # 대상만 계산 (장기 미사용 · 보존 기간 경과)
-curl -X POST localhost:8000/lifecycle/aging/run -H "X-NHI-Admin-Key: nhik.alice.<secret>" \
-  -H "Content-Type: application/json" -d '{}'            # 승인 요청 생성 (create_changes=false 면 dry-run)
+curl -X POST localhost:8000/lifecycle/aging/run -H "X-NHI-Admin-Key: $NHI_ADMIN_API_KEY" \
+  -H "Content-Type: application/json" -d '{"actor":"admin"}' # 승인 요청 생성
 ```
 
 - `STALE_UNUSED`(기본 90일) → **Token 폐기** 요청, `DISPOSAL_DUE`(종료 후 기본 30일) → **Token 파기** 요청.
-- **자동으로 종료·파기하지 않는다.** 요청은 `force_approval` 로 만들어 승인 등급이 LOW 여도 사람이 승인해야 하고,
+- **자동으로 종료·파기하지 않는다.** 위험 등급이 LOW여도 관리자 한 명이 승인해야 하고,
   이미 승인 대기 중이면 중복 생성하지 않는다. 실행은 감사 로그(`AGING_RUN`)에 건수만 남는다.
 - **파기는 증적이 있어야만 승인된다** (`destruction_evidence`): 방법 · 수행자(생략 시 승인자) · **수행자와 다른 검증자** ·
-  검증 방법 · 결과(`AUTH_REJECTED_401/403` · `NOT_FOUND_404` · `MATERIAL_ABSENT`). 개인 계정 모드에서는 검증자가
-  등록된 활성 관리자여야 한다. 증적과 직전 수명주기 이벤트 ID 로 계산한 `evidence_digest` 가
+  검증 방법 · 결과(`AUTH_REJECTED_401/403` · `NOT_FOUND_404` · `MATERIAL_ABSENT`). 증적과 직전 수명주기 이벤트 ID로 계산한 `evidence_digest`가
   `TOKEN_DISPOSED` 이벤트에 남아 타임라인 변조를 탐지할 수 있다. 대시보드의 파기 승인 창에 증적 입력란이 있다.
-- 한계: 실제 공급자에 대한 인증 시도는 아직 운영자가 수행하고 결과를 기록하는 방식이다.
+- 한계: 파기 증적의 검증자 이름은 공용 관리자 모드에서 인증 신원과 연결되지 않는다.
 
 #### 8. AI Agent API token 탈취·재사용 방어 연구 (DPoP)
 
@@ -446,7 +424,7 @@ token 과 정상 proof 를 함께 복사해도 proof `jti` 단일 사용으로 �
 | Sender | token `cnf.jkt` ↔ proof JWK thumbprint | 탈취 token + 공격자 key |
 | Replay | `htm` · `htu` · `iat` · `ath` · 단일 사용 `jti` | token 과 proof 동시 복사 |
 
-- **발급자 신원**: 개인 관리자 모드에서는 공유 키로 발급할 수 없고, 발급자 ID 가 감사 로그(`issued_by`)에 남는다.
+- **발급 경계**: 공용 관리자 키로 보호하며 감사 로그에 `auth_mode=shared_admin_key`를 남긴다.
 - **replay 캐시는 저장소 기반**(`StorageReplayCache`): 프로세스 재시작·다중 워커(같은 DB) 사이에서도 proof 재전송을 막고,
   저장 한도 초과 시 fail-closed 한다. 호스트가 여러 대면 `Storage.consume_replay_key` 를 Redis 등으로 구현한다.
 - **위험 엔진 연동**: 키 불일치·재전송 거부는 `token_replay_suspected` 신호로 NHI 분석에 입력되어
@@ -982,7 +960,7 @@ PostgreSQL 등으로 교체하려면 `storage/base.py` 의 `Storage` 인터페�
 - Agent 접근 기준선 · 위장 호출 판정(ALLOW/REVIEW/DENY) · 실시간 통제(PASS/REQUIRE_APPROVAL/BLOCK) · 1회용 승인 허가
 - 규칙 카탈로그 단일화(NHI 단위 질의와 Agent 호출이 같은 평가기 사용)
 - DPoP sender-constrained token 연구 경로(저장소 기반 replay 차단, Gateway 증거 서버 검증)
-- 개인 관리자 키 · 역할 · 직무 분리, 변경 승인(영향도 미리보기 · 롤백), 격리/해제
+- 공용 관리자 키, 단일 관리자 변경 승인(영향도 미리보기 · 단순 롤백), 격리/해제
 - NHI 생명주기(생성→사용→권한 변경→종료→파기), aging 승인 요청 자동 생성, 파기 증적(수행자≠검증자 · 해시 체인)
 - 분석 이력 영속화와 NHI별 스냅샷 비교
 - Agent 실행 계층(Planner / Tool Registry / 조건부 Replanner / Orchestrator, 조직 수집 모드)
@@ -991,13 +969,12 @@ PostgreSQL 등으로 교체하려면 `storage/base.py` 의 `Storage` 인터페�
 **부분 구현**
 
 - 공급자 Audit Log · CMDB · IdP 가 연결되지 않아 자동 수집 값은 `UNKNOWN` 이거나 부분 범위일 수 있다.
-- 승인 후 revoke/rotate/scope 축소의 **공급자 실행**은 기본 실행기(인벤토리 상태만 변경)뿐이다. 파기 검증도 운영자 수행·기록 방식이다.
+- GitHub/Slack/AWS Provider 변경은 지원 범위와 식별자·봉인 Credential이 있을 때 실행되며, 완료 판정은 내부 Inventory 기준이다.
 - 호출률 측정과 `GOVERNANCE_LOCK` 은 단일 프로세스 기준이다.
 
 **아직 없음**
 
-- 운영용 Agent key enrollment · IdP 연동, 다중 호스트 replay 저장소(Redis 등), DPoP nonce
-- CRITICAL 변경의 2인 승인(OWNER + SECURITY), IdP(OIDC) 연동
+- 운영용 Agent key enrollment, 다중 호스트 replay 저장소(Redis 등), DPoP nonce
 - 사내 API Gateway 플러그인, 비동기 job · Scheduler(aging 은 현재 API 호출로 실행)
 - LLM 기반 Planner / 자연어 보고서
 

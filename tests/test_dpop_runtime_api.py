@@ -50,7 +50,6 @@ def body_of(response) -> dict:
 @pytest.fixture
 def app(monkeypatch, tmp_path):
     monkeypatch.setenv("NHI_ADMIN_API_KEY", ADMIN)
-    monkeypatch.delenv("NHI_REQUIRE_VERIFIED_ADMIN", raising=False)
     monkeypatch.setenv("NHI_RUNTIME_TOKEN_SIGNING_KEY", SIGNING_KEY)
     monkeypatch.setenv("NHI_RUNTIME_TOKEN_ISSUER", "api-test-issuer")
     monkeypatch.setenv("NHI_RUNTIME_TOKEN_AUDIENCE", "api-test-audience")
@@ -100,23 +99,17 @@ def test_issuing_requires_an_admin_key_and_records_who_issued(app):
     assert response.headers["cache-control"] == "no-store"
     assert "token_jti" not in body_of(response) and "proof_jti" not in body_of(response)
     audit = [e for e in app.storage.list_audit_events() if e["event_type"] == "RUNTIME_ACCESS_ALLOW"]
-    assert audit[0]["detail"]["issued_by"] == "bootstrap"
-    assert audit[0]["detail"]["issuer_verified"] is False
+    assert audit[0]["detail"]["issued_by"] == "admin"
+    assert audit[0]["detail"]["auth_mode"] == "shared_admin_key"
     assert "access_token" not in str(audit)
 
 
-def test_in_personal_account_mode_the_shared_key_cannot_issue_tokens(app):
-    alice = app.create_admin_principal(
-        app.AdminPrincipalCreateRequest(admin_id="alice", roles=["ADMIN"]), x_nhi_admin_key=ADMIN
-    )["api_key"]
+def test_shared_key_is_the_only_admin_credential_for_token_issuance(app):
     key = ec.generate_private_key(ec.SECP256R1())
     with pytest.raises(HTTPException) as exc:
-        issue(app, key, admin=ADMIN)
-    assert exc.value.status_code == 403
-    response = issue(app, key, admin=alice)
-    assert response.status_code == 200
-    audit = [e for e in app.storage.list_audit_events() if e["event_type"] == "RUNTIME_ACCESS_ALLOW"]
-    assert audit[0]["detail"]["issued_by"] == "alice" and audit[0]["detail"]["issuer_verified"] is True
+        issue(app, key, admin="personal-looking-key")
+    assert exc.value.status_code == 401
+    assert issue(app, key, admin=ADMIN).status_code == 200
 
 
 def test_stolen_token_with_attacker_key_is_denied_and_feeds_the_risk_engine(app):

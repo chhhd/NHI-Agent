@@ -52,7 +52,7 @@ def terminate(store, changes, nhi_id="nhi-1", days_ago_terminated=40):
 
 # ------------------------------------------------------------ aging
 def test_stale_nhi_gets_a_termination_request_even_when_the_tier_is_low(store):
-    # 비운영 · 읽기 전용 → LOW 등급이라 평소엔 자동 승인·즉시 적용되는 조합
+    # 비운영 · 읽기 전용 → 위험 표시는 LOW지만 관리자 승인이 필요한 조합
     make_nhi(
         store, environment="development", permissions=["READ"], blast_radius={},
         linked_ai_agent=None, last_used_at=days_ago(200),
@@ -67,7 +67,7 @@ def test_stale_nhi_gets_a_termination_request_even_when_the_tier_is_low(store):
     change = changes.get(item["change_id"])
     assert change.status is ChangeStatus.PENDING_APPROVAL  # 자동 적용되지 않았다
     assert change.requested_by == AGING_ACTOR and change.source == "aging-policy"
-    assert any("사람이 승인" in reason for reason in change.approval["reasons"])
+    assert any("관리자 한 명" in reason for reason in change.approval["reasons"])
     assert load_nhi(store, "nhi-1")["credential_state"] == "ACTIVE"
 
 
@@ -176,14 +176,13 @@ def test_valid_evidence_is_recorded_with_a_digest_chained_to_the_previous_event(
     assert load_nhi(store, "nhi-1")["lifecycle_stage"] == "DECOMMISSIONED"
 
 
-# ------------------------------------------------------------ API: 개인 계정 모드에서 검증자 신원
+# ------------------------------------------------------------ API: 공용 관리자 키와 파기 증적
 ADMIN = "bootstrap-shared-key-0123456789abcdef0123"
 
 
 @pytest.fixture
 def app(monkeypatch, tmp_path):
     monkeypatch.setenv("NHI_ADMIN_API_KEY", ADMIN)
-    monkeypatch.delenv("NHI_REQUIRE_VERIFIED_ADMIN", raising=False)
     module, name = load_private_app(tmp_path, monkeypatch)
     module.storage = SQLiteStorage(":memory:")
     reset_settings()
@@ -192,35 +191,27 @@ def app(monkeypatch, tmp_path):
     unload_private_app(module, name)
 
 
-def test_in_personal_account_mode_the_verifier_must_be_a_registered_admin(app):
+def test_shared_admin_mode_requires_a_different_evidence_verifier(app):
     make_nhi(app.storage, last_used_at=days_ago(1))
     changes = ChangeControlService(app.storage)
     terminate(app.storage, changes)
     dispose = changes.propose("nhi-1", ChangeType.TOKEN_DISPOSE, requested_by="alice")
-    alice = app.create_admin_principal(
-        app.AdminPrincipalCreateRequest(admin_id="alice", roles=["ADMIN"]), x_nhi_admin_key=ADMIN
-    )["api_key"]
-    bob = app.create_admin_principal(
-        app.AdminPrincipalCreateRequest(admin_id="bob", roles=["ADMIN"]), x_nhi_admin_key=ADMIN
-    )["api_key"]
-
-    def approve(verifier, key):
+    def approve(verifier):
         return app.approve_change(
             dispose.change_id,
-            app.ChangeDecisionRequest(destruction_evidence={**EVIDENCE, "verified_by": verifier}),
-            x_nhi_admin_key=key,
+            app.ChangeDecisionRequest(
+                actor="bob",
+                destruction_evidence={**EVIDENCE, "verified_by": verifier},
+            ),
+            x_nhi_admin_key=ADMIN,
         )
 
     with pytest.raises(HTTPException) as exc:
-        approve("some-random-name", bob)  # 이름만 적은 검증은 인정하지 않는다
-    assert exc.value.status_code == 422
-    with pytest.raises(HTTPException) as exc:
-        approve("bob", bob)  # 수행자(bob)가 스스로 검증
+        approve("bob")  # 수행자(bob)가 스스로 검증
     assert exc.value.status_code in (409, 422)
 
-    done = approve("alice", bob)
+    done = approve("alice")
     assert done["status"] == "APPLIED"
-    assert alice  # alice 키로도 발급됐음을 확인 (검증자는 등록된 관리자)
 
 
 def test_aging_run_endpoint_never_applies_changes(app):

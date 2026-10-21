@@ -226,13 +226,6 @@ CREATE TABLE IF NOT EXISTS dpop_replay (
 );
 CREATE INDEX IF NOT EXISTS idx_dpop_replay_expiry ON dpop_replay(expires_at);
 
-CREATE TABLE IF NOT EXISTS admin_principals (
-    admin_id    TEXT PRIMARY KEY,
-    disabled    INTEGER NOT NULL DEFAULT 0,
-    created_at  TEXT NOT NULL,
-    data        TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS control_approvals (
     decision_id TEXT PRIMARY KEY,
     status      TEXT NOT NULL,
@@ -959,12 +952,15 @@ class SQLiteStorage(Storage):
         self, *, repository: Optional[str] = None, limit: int = 100
     ) -> List[Dict[str, Any]]:
         if repository is None:
-            sql = "SELECT data FROM analysis_runs ORDER BY analyzed_at DESC LIMIT ?"
+            sql = (
+                "SELECT data FROM analysis_runs "
+                "ORDER BY analyzed_at DESC, rowid DESC LIMIT ?"
+            )
             args = (limit,)
         else:
             sql = (
                 "SELECT data FROM analysis_runs WHERE repository=? "
-                "ORDER BY analyzed_at DESC LIMIT ?"
+                "ORDER BY analyzed_at DESC, rowid DESC LIMIT ?"
             )
             args = (repository, limit)
         with self._lock:
@@ -978,12 +974,12 @@ class SQLiteStorage(Storage):
         with self._lock:
             rows = self._conn.execute(
                 """
-                SELECT DISTINCT ar.data, ar.analyzed_at
+                SELECT ar.data
                 FROM analysis_runs ar
                 JOIN credential_nhi_bindings binding
                   ON binding.fingerprint = ar.fingerprint
                 WHERE binding.nhi_id=?
-                ORDER BY ar.analyzed_at DESC
+                ORDER BY ar.analyzed_at DESC, ar.rowid DESC
                 LIMIT ?
                 """,
                 (nhi_id, limit),
@@ -1295,39 +1291,6 @@ class SQLiteStorage(Storage):
                 "SELECT 1 FROM dpop_replay WHERE digest=?", (digest,)
             ).fetchone()
             return "DUPLICATE" if exists else "FULL"
-
-    # -- 관리자 계정 ----------------------------------------------------
-    def save_admin_principal(self, principal: Dict[str, Any]) -> None:
-        with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO admin_principals (admin_id, disabled, created_at, data)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(admin_id) DO UPDATE SET
-                    disabled=excluded.disabled, data=excluded.data
-                """,
-                (
-                    principal["admin_id"],
-                    1 if principal.get("disabled") else 0,
-                    principal["created_at"],
-                    json.dumps(principal, ensure_ascii=False),
-                ),
-            )
-            self._conn.commit()
-
-    def get_admin_principal(self, admin_id: str) -> Optional[Dict[str, Any]]:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT data FROM admin_principals WHERE admin_id=?", (admin_id,)
-            ).fetchone()
-        return json.loads(row["data"]) if row else None
-
-    def list_admin_principals(self) -> List[Dict[str, Any]]:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT data FROM admin_principals ORDER BY created_at"
-            ).fetchall()
-        return [json.loads(row["data"]) for row in rows]
 
     # -- 실시간 통제 승인 대기 -------------------------------------------
     def save_control_approval(self, approval: Dict[str, Any]) -> None:
@@ -1770,7 +1733,7 @@ class SQLiteStorage(Storage):
                 SELECT data FROM analysis_runs
                 WHERE fingerprint IN (
                     SELECT fingerprint FROM credential_nhi_bindings WHERE nhi_id=?
-                ) ORDER BY analyzed_at DESC LIMIT 10
+                ) ORDER BY analyzed_at DESC, rowid DESC LIMIT 10
                 """,
                 (nhi_id,),
             ).fetchall()

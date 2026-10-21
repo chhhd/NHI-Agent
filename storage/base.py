@@ -262,19 +262,6 @@ class Storage(abc.ABC):
         만료된 항목은 이 호출에서 정리한다. 확인과 저장은 원자적이어야 한다.
         """
 
-    # -- 관리자 계정 ----------------------------------------------------
-    @abc.abstractmethod
-    def save_admin_principal(self, principal: Dict[str, Any]) -> None:
-        """`admin_id` 기준 upsert. 키 원문은 저장하지 않고 digest 만 저장한다."""
-
-    @abc.abstractmethod
-    def get_admin_principal(self, admin_id: str) -> Optional[Dict[str, Any]]:
-        ...
-
-    @abc.abstractmethod
-    def list_admin_principals(self) -> List[Dict[str, Any]]:
-        ...
-
     # -- 실시간 통제 승인 대기 -------------------------------------------
     @abc.abstractmethod
     def save_control_approval(self, approval: Dict[str, Any]) -> None:

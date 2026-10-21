@@ -10,7 +10,6 @@ import pytest
 from backend.services.change_control_service import (
     ChangeControlService,
     ChangeNotAllowed,
-    SeparationOfDutiesError,
     StateConflict,
 )
 from backend.services.control_service import ControlService
@@ -110,7 +109,7 @@ def test_preview_shows_before_after_and_does_not_persist(store):
     assert load_nhi(store, "nhi-1")["permissions"] == ["READ", "WRITE"]
 
 
-def test_low_tier_is_auto_approved_and_applied(store):
+def test_low_tier_waits_for_single_admin_approval(store):
     make_nhi(
         store, environment="development", permissions=["READ"],
         blast_radius={}, linked_ai_agent=None,
@@ -121,12 +120,14 @@ def test_low_tier_is_auto_approved_and_applied(store):
         params={"grace_period_hours": 2},
     )
     assert change.tier.value == "LOW"
+    assert change.status is ChangeStatus.PENDING_APPROVAL
+    change = changes.approve(change.change_id, actor="alice")
     assert change.status is ChangeStatus.APPLIED
-    assert change.approved_by == "policy:auto-low"
+    assert change.approved_by == "alice"
     assert load_nhi(store, "nhi-1")["credential_version"] == 2
 
 
-def test_high_tier_waits_and_requires_a_different_approver(store):
+def test_high_tier_waits_and_allows_the_requesting_admin_to_approve(store):
     make_nhi(store)
     changes, _ = services(store)
     change = changes.propose(
@@ -135,25 +136,19 @@ def test_high_tier_waits_and_requires_a_different_approver(store):
     assert change.status is ChangeStatus.PENDING_APPROVAL
     assert change.tier.value == "HIGH"
     assert load_nhi(store, "nhi-1")["credential_state"] == "ACTIVE"  # 아직 적용 전
-    with pytest.raises(SeparationOfDutiesError):
-        changes.approve(change.change_id, actor="alice")
-    applied = changes.approve(change.change_id, actor="bob")
+    applied = changes.approve(change.change_id, actor="alice")
     nhi = load_nhi(store, "nhi-1")
     assert applied.status is ChangeStatus.APPLIED
     assert nhi["credential_state"] == "REVOKED"
     assert nhi["lifecycle_stage"] == "DEACTIVATED"
 
 
-def test_critical_requires_impact_acknowledgement(store):
+def test_critical_is_informational_and_does_not_require_acknowledgement(store):
     make_nhi(store, permissions=["READ", "WRITE", "DELETE"])
     changes, _ = services(store)
     change = changes.propose("nhi-1", ChangeType.TOKEN_REVOKE, requested_by="alice")
     assert change.tier.value == "CRITICAL"
-    with pytest.raises(ChangeNotAllowed):
-        changes.approve(change.change_id, actor="bob")
-    assert changes.approve(
-        change.change_id, actor="bob", acknowledge_impact=True
-    ).status is ChangeStatus.APPLIED
+    assert changes.approve(change.change_id, actor="alice").status is ChangeStatus.APPLIED
 
 
 def test_reject_leaves_state_untouched(store):
@@ -448,18 +443,11 @@ def test_api_demo_flow_preview_approve_rollback(client):
     target = next(c for c in pending if c["change_type"] == "SCOPE_CHANGE")
     assert target["tier"] == "CRITICAL"
 
-    same_person = client.post(
+    approved = client.post(
         f"/changes/{target['change_id']}/approve",
-        json={"actor": target["requested_by"], "acknowledge_impact": True},
+        json={"actor": target["requested_by"]},
     )
-    assert same_person.status_code == 403
-    no_ack = client.post(f"/changes/{target['change_id']}/approve", json={"actor": "dashboard-admin"})
-    assert no_ack.status_code == 422
-    ok = client.post(
-        f"/changes/{target['change_id']}/approve",
-        json={"actor": "dashboard-admin", "acknowledge_impact": True},
-    )
-    assert ok.status_code == 200 and ok.json()["status"] == "APPLIED"
+    assert approved.status_code == 200 and approved.json()["status"] == "APPLIED"
     rolled = client.post(
         f"/changes/{target['change_id']}/rollback", json={"actor": "dashboard-admin"}
     )

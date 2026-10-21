@@ -63,12 +63,16 @@ class SlackConnector(BaseConnector):
         *,
         api_base: Optional[str] = None,
         client: Optional[httpx.Client] = None,
+        fallback_to_default_token: bool = True,
         **kwargs: Any,
     ) -> None:
         settings = get_settings().slack
+        resolved_token = token
+        if fallback_to_default_token and not resolved_token:
+            resolved_token = settings.bot_token
         super().__init__(
             base_url=api_base or settings.api_base,
-            token=token or settings.bot_token,
+            token=resolved_token,
             client=client,
             **kwargs,
         )
@@ -95,6 +99,50 @@ class SlackConnector(BaseConnector):
         payload = response.json()
         self._check_slack_response(method, payload, response)
         return payload
+
+    def change_call(
+        self,
+        method: str,
+        *,
+        data: Optional[Dict[str, Any]] = None,
+        token: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """상태를 변경하는 Slack 메서드를 POST로 호출한다."""
+        headers = {"Authorization": f"Bearer {token}"} if token else None
+        response = self.post(
+            f"/{method}", data=data, headers=headers, raise_for_status=False
+        )
+        self._raise_for_status(response)
+        payload = response.json()
+        self._check_slack_response(method, payload, response)
+        return payload
+
+    def revoke_token(self, token: Optional[str] = None) -> Dict[str, Any]:
+        """`auth.revoke`로 bot/user token을 실제 폐기한다."""
+        target = token or self.token
+        if not target:
+            raise ConnectorError("폐기할 Slack token이 없습니다.")
+        return self.change_call("auth.revoke", token=target)
+
+    def rotate_oauth_token(
+        self,
+        refresh_token: str,
+        *,
+        client_id: str,
+        client_secret: str,
+    ) -> Dict[str, Any]:
+        """Slack token rotation이 활성화된 앱의 token을 교체한다."""
+        if not refresh_token or not client_id or not client_secret:
+            raise ConnectorError("Slack OAuth 교체에 client_id/client_secret/refresh_token이 필요합니다.")
+        return self.change_call(
+            "oauth.v2.access",
+            data={
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            },
+        )
 
     # ------------------------------------------------------------------
     # Token 유효성 / 폐기 여부

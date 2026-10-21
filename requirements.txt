@@ -13,6 +13,7 @@ pydantic>=2.7,<3.0
 
 # --- 외부 서비스 연동 (connectors / rescan) ---
 httpx>=0.27,<1.0
+boto3>=1.35,<2.0              # AWS IAM 실제 변경(Change Control)
 
 # --- 환경 설정 (.env) ---
 # 선택 의존성. 없으면 core/config.py 가 OS 환경변수만 읽는다.

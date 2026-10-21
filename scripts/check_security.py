@@ -101,13 +101,6 @@ def run_checks(root: Path) -> List[Finding]:
         elif len(admin) < 32 or admin.lower() in WEAK_VALUES:
             findings.append(Finding("HIGH", "ADMIN_KEY_WEAK", f"NHI_ADMIN_API_KEY 가 {len(admin)}자입니다. 32자 이상 무작위 값으로 바꾸세요."))
 
-        if env.get("NHI_REQUIRE_VERIFIED_ADMIN", "").strip().lower() not in {"1", "true", "yes", "on"}:
-            findings.append(Finding(
-                "INFO", "VERIFIED_ADMIN_NOT_ENFORCED",
-                "NHI_REQUIRE_VERIFIED_ADMIN 이 꺼져 있습니다. 개인 관리자 계정(/admin/principals)을 만들기 전에는 "
-                "승인자 이름이 본문 값이라 직무 분리가 이름만으로 우회됩니다.",
-            ))
-
         signing = env.get("NHI_RUNTIME_TOKEN_SIGNING_KEY", "")
         if signing and (len(signing) < 32 or signing == admin):
             findings.append(Finding("HIGH", "SIGNING_KEY_WEAK", "NHI_RUNTIME_TOKEN_SIGNING_KEY 는 32자 이상이고 관리자 키와 달라야 합니다."))

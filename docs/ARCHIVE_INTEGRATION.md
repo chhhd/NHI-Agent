@@ -28,10 +28,9 @@
 | SaaS 인벤토리 | Microsoft 365 서비스 주체와 Google Workspace OAuth 클라이언트 수집 및 공통 위험 분석 | `connectors/microsoft_graph_connector.py`, `connectors/google_workspace_connector.py`, `agents/saas_inventory_adapter.py` |
 | 실시간 통제 | Agent/NHI/Credential/권한/자원 기준선 비교, ALLOW·ALERT·DENY·QUARANTINE 판정 | `backend/services/agent_access_evaluator.py`, `backend/services/control_service.py` |
 | 승인 보류 | 판단 불완전 요청의 관리자 승인, 만료 및 1회용 허가 | `backend/services/control_approval.py` |
-| 변경 관리 | 변경 전후 영향도 미리보기, 중요도별 승인·직무 분리, 상태 충돌 방지, 가능한 변경의 롤백 | `backend/services/change_control_service.py` |
+| 변경 관리 | 변경 전후 영향도 미리보기, 관리자 1인 승인, 상태 충돌 방지, 내부 Inventory 단순 롤백 | `backend/services/change_control_service.py` |
 | 생명주기 | 생성→사용→권한 변경→종료→파기 전이, 노후화·만료·교체 지연, 파기 증적 | `backend/services/lifecycle_service.py`, `backend/services/nhi_aging.py`, `core/destruction_models.py` |
 | 런타임 인증 | DPoP 키 바인딩·proof 검증·재사용 방어·단기 토큰 발급 | `security/dpop.py`, `security/replay_store.py` |
-| 관리자 신원 | 개인 관리자 키, 역할 검증, 회전·비활성화, 검증된 승인자 기록 | `security/admin_identity.py` |
 | 개인정보 | 감사 로그의 가명처리·민감값 마스킹, 사용 이벤트 보존 기간 | `security/privacy.py`, `security/redaction.py` |
 | 대시보드 | Lifecycle·Change Control·Live Control 화면과 합성 데모 데이터 | `frontend/dashboard/governance.js` |
 | 데이터·설정 | SQLite 스키마 및 저장 인터페이스 확장, PostgreSQL DDL 보완, 새 설정의 `.env.example` 반영 | `storage/`, `backend/database/postgres_schema.sql`, `core/config.py` |

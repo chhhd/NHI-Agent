@@ -127,16 +127,16 @@ class ChangeStatus(str, Enum):
     APPLIED = "APPLIED"
     REJECTED = "REJECTED"
     ROLLED_BACK = "ROLLED_BACK"
-    FAILED = "FAILED"  # 실행기(Provider 연동)가 적용에 실패 — 상태는 변경되지 않았다
+    FAILED = "FAILED"  # 내부 Inventory 실행기가 적용에 실패 — 상태는 변경되지 않았다
 
 
 class ApprovalTier(str, Enum):
-    """권한 중요도에 따른 승인 등급."""
+    """권한 중요도에 따른 위험 표시 등급(승인 인원/역할은 모두 동일)."""
 
-    LOW = "LOW"            # 자동 승인(영향도 미리보기와 감사 기록은 남는다)
-    MEDIUM = "MEDIUM"      # 관리자 1인 승인
-    HIGH = "HIGH"          # 요청자와 다른 관리자 승인(직무 분리)
-    CRITICAL = "CRITICAL"  # 직무 분리 + 영향도 확인(acknowledge) 필수
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+    CRITICAL = "CRITICAL"
 
 
 @dataclass
@@ -157,9 +157,6 @@ class ChangeRequest:
     status: ChangeStatus = ChangeStatus.PENDING_APPROVAL
     approved_by: Optional[str] = None
     approved_at: Optional[str] = None
-    #: 요청자·승인자가 개인 키로 확정된 신원인가(false: 공유 키 + 본문 actor, 신뢰할 수 없음)
-    requested_by_verified: bool = False
-    approved_by_verified: bool = False
     decision_reason: str = ""
     impact_acknowledged: bool = False
     applied_at: Optional[str] = None

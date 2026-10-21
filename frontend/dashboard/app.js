@@ -15,23 +15,6 @@ const findingStatuses = [
   "SLA_OVERDUE", "ACCEPTED_RISK",
 ];
 
-// 개인 관리자 키(nhik.…)면 서버가 키에서 actor 를 정한다. 본문에 다른 이름을 적으면 403 이므로
-// whoami 로 확정 신원을 받아 그 ID 를 쓰고, 공유 키(초기 구성)면 null 을 돌려 기존 방식을 따른다.
-const adminIdentityCache = new Map();
-async function verifiedAdminId(key) {
-  if (!key) return null;
-  if (!adminIdentityCache.has(key)) {
-    try {
-      const who = await api("/admin/whoami", { headers: { "X-NHI-Admin-Key": key } });
-      adminIdentityCache.set(key, who.verified ? who.admin_id : null);
-    } catch (error) {
-      adminIdentityCache.delete(key);
-      throw error;
-    }
-  }
-  return adminIdentityCache.get(key);
-}
-
 async function api(path, options = {}) {
   const response = await fetch(path, {
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
@@ -326,7 +309,7 @@ async function decideReview(actionId, approve) {
   const reason = approve ? "Dashboard security review approved" : prompt("거부 사유를 입력하세요.") || "Rejected";
   try {
     const prefix = isDemo ? "/demo/reviews" : "/reviews";
-    const actor = (isDemo ? null : await verifiedAdminId(key)) || "dashboard-admin";
+    const actor = "dashboard-admin";
     await api(`${prefix}/${actionId}/${approve ? "approve" : "reject"}`, {
       method: "POST",
       headers: isDemo ? {} : { "X-NHI-Admin-Key": key },

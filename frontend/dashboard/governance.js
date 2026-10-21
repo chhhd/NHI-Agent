@@ -38,12 +38,7 @@ function adminHeaders(demo) {
 
 async function govPost(path, body, demo) {
   const headers = adminHeaders(demo);
-  const verified = demo ? null : await verifiedAdminId(headers["X-NHI-Admin-Key"]);
-  // 개인 키면 서버가 키의 관리자 ID 를 actor 로 쓰므로 화면에서 입력한 이름 대신 그 ID 를 보낸다.
-  const payload = verified
-    ? { ...body, ...("actor" in body ? { actor: verified } : {}), ...("requested_by" in body ? { requested_by: verified } : {}) }
-    : body;
-  return api(path, { method: "POST", headers, body: JSON.stringify(payload) });
+  return api(path, { method: "POST", headers, body: JSON.stringify(body) });
 }
 
 async function loadGovernance() {
@@ -181,7 +176,7 @@ function renderPlan(plan) {
       <span class="plan-summary">${escapeHtml(impact.summary)}</span>
     </div>
     <ul class="reasons">${approval.reasons.map((r) => `<li>${escapeHtml(r)}</li>`).join("")}
-      ${approval.required ? `<li>${approval.separation_of_duties ? "요청자와 다른 관리자의 승인이 필요합니다." : "관리자 승인이 필요합니다."}${approval.impact_acknowledgement_required ? " 영향도 확인 체크가 필수입니다." : ""}</li>` : ""}</ul>
+      ${approval.required ? `<li>관리자 한 명의 승인이 필요합니다.</li>` : ""}</ul>
     <table class="diff-table">
       <thead><tr><th></th><th>변경 전</th><th>변경 후</th></tr></thead>
       <tbody>
@@ -390,7 +385,7 @@ async function submitProposal() {
     renderChanges();
     setView("changes");
     showSuccess(change.status === "APPLIED"
-      ? "LOW 등급이라 자동 승인되어 적용되었습니다."
+      ? "변경이 적용되었습니다."
       : "변경이 제안되었습니다. 영향도를 검토하고 승인하세요.");
   } catch (error) {
     document.querySelector("#propose-preview").innerHTML = `<div class="error-banner">${escapeHtml(error.message)}</div>`;

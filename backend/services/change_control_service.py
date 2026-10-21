@@ -3,26 +3,20 @@
 Token 폐기/교체/권한 변경은 서비스 중단을 일으킬 수 있으므로 적용 전에
 
     1. 변경 전·후 형상(permissions, scopes, 상태, 버전)과 영향 범위를 계산해 보여 주고
-    2. 권한 중요도에 따라 승인 등급(LOW~CRITICAL)을 정하고
-    3. 관리자가 승인한 뒤에만 적용하며
+    2. 권한 중요도(LOW~CRITICAL)는 영향 정보로 계산하고
+    3. 등급과 무관하게 관리자 한 명이 승인한 뒤에만 적용하며
     4. 적용 후에도 서비스 연속성을 위해 변경 전 형상으로 롤백할 수 있게 한다.
 
-승인 등급별 규칙
-    LOW       자동 승인 (미리보기와 감사 기록은 남는다)
-    MEDIUM    관리자 승인
-    HIGH      요청자와 다른 관리자의 승인 (직무 분리)
-    CRITICAL  직무 분리 + 영향도 확인(acknowledge_impact) 필수
-
-실행기(`ChangeExecutor`)는 Provider 연동 지점이다. 기본 구현은 NHI 인벤토리 상태만
-바꾸고 외부 Provider 를 호출하지 않는다 — 실제 Token 폐기는 GitHub/Slack 어댑터를
-연결해야 일어난다.
+GitHub·Slack·AWS Provider 변경은 실제로 시도하지만 완료 판정은 내부 Inventory 상태
+반영만을 기준으로 한다. 외부 호출 실패는 감사 로그에 남기고 자동 재시도하지 않는다.
+롤백은 변경 전 내부 형상을 복원하는 단순 롤백이며 Provider 역호출은 하지 않는다.
 """
 
 from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional, Protocol
+from typing import Any, Dict, List, Optional, Protocol
 
 from backend.services.lifecycle_service import LifecycleError, LifecycleService
 from backend.services.nhi_state import (
@@ -53,14 +47,6 @@ logger = logging.getLogger(__name__)
 PERMISSION_RANK = {"READ": 1, "WRITE": 2, "DELETE": 3, "ADMIN": 4}
 _NON_PRODUCTION = {"development", "staging", "test"}
 _TIER_ORDER = [ApprovalTier.LOW, ApprovalTier.MEDIUM, ApprovalTier.HIGH, ApprovalTier.CRITICAL]
-
-#: 등급별로 승인할 수 있는 역할(개인 키로 신원이 확정된 승인자에만 적용된다).
-#: CRITICAL 은 보안 담당자(SECURITY)만 승인할 수 있다.
-_APPROVER_ROLES = {
-    ApprovalTier.MEDIUM: frozenset({"ADMIN", "SECURITY"}),
-    ApprovalTier.HIGH: frozenset({"ADMIN", "SECURITY"}),
-    ApprovalTier.CRITICAL: frozenset({"SECURITY"}),
-}
 
 #: 변경 유형별로 "충돌 여부"를 판단할 때 비교하는 형상 필드.
 _RELEVANT_FIELDS = {
@@ -102,20 +88,12 @@ class StateConflict(ChangeError):
     """대상 상태가 제안 시점과 달라졌거나 이미 처리되었다 (HTTP 409)."""
 
 
-class SeparationOfDutiesError(ChangeError):
-    """요청자와 승인자가 같다 (HTTP 403)."""
-
-
-class ApproverNotAuthorized(ChangeError):
-    """승인자의 역할이 이 변경 등급을 승인하기에 부족하다 (HTTP 403)."""
-
-
 class ChangeExecutionError(ChangeError):
-    """실행기(Provider 연동)가 변경을 적용하지 못했다 (HTTP 502)."""
+    """내부 Inventory 변경 실행기가 변경을 적용하지 못했다 (HTTP 502)."""
 
 
 class ChangeExecutor(Protocol):
-    """Provider 연동 지점 — 실제 Token 폐기/교체/권한 변경을 수행한다."""
+    """내부 또는 외부 변경 실행기 포트."""
 
     name: str
 
@@ -164,12 +142,18 @@ class ChangeControlService:
         storage: Storage,
         *,
         executor: Optional[ChangeExecutor] = None,
+        provider_executor: Optional[ChangeExecutor] = None,
         lifecycle: Optional[LifecycleService] = None,
         settings: Optional[GovernanceSettings] = None,
     ) -> None:
         self.storage = storage
         self.settings = settings or get_settings().governance
         self.executor = executor or InventoryStateExecutor(storage)
+        if provider_executor is None:
+            from backend.services.provider_change_executor import ProviderChangeExecutor
+
+            provider_executor = ProviderChangeExecutor(storage)
+        self.provider_executor = provider_executor
         self.lifecycle = lifecycle or LifecycleService(storage, self.settings)
 
     # ------------------------------------------------------------------
@@ -194,13 +178,12 @@ class ChangeControlService:
         reason: str = "",
         params: Optional[Dict[str, Any]] = None,
         source: str = "operator",
-        requested_verified: bool = False,
         force_approval: bool = False,
     ) -> ChangeRequest:
         """변경을 제안한다.
 
-        ``force_approval`` 은 LOW 등급이어도 자동 승인하지 않고 사람의 승인을 요구한다.
-        aging 정책처럼 시스템이 스스로 만든 종료·파기 제안이 사람 없이 적용되지 않게 한다.
+        ``force_approval`` 은 자동 적용 유형에도 사람의 승인을 강제하기 위한 호환 옵션이다.
+        현재 일반 변경은 위험 등급과 무관하게 모두 관리자 승인을 요구한다.
         """
         with GOVERNANCE_LOCK:
             nhi = load_nhi(self.storage, nhi_id)
@@ -227,7 +210,6 @@ class ChangeControlService:
                 nhi_name=nhi.get("nhi_name") or nhi_id,
                 change_type=change_type,
                 requested_by=requested_by,
-                requested_by_verified=requested_verified,
                 reason=reason,
                 tier=ApprovalTier(plan["tier"]),
                 approval=plan["approval"],
@@ -260,38 +242,13 @@ class ChangeControlService:
         actor: str,
         reason: str = "",
         acknowledge_impact: bool = False,
-        verified: bool = False,
-        roles: Optional[Iterable[str]] = None,
         destruction_evidence: Optional[Dict[str, Any]] = None,
     ) -> ChangeRequest:
-        """승인하고 적용한다.
-
-        ``verified``/``roles`` 는 개인 키로 신원이 확정된 승인자의 값이다. ``roles`` 가 주어지면
-        등급별 필요 역할(CRITICAL=SECURITY)을 강제한다. 주어지지 않으면(공유 키) 역할을 확인할
-        수 없으므로 검사를 건너뛰고 ``approved_by_verified=false`` 로 기록한다.
-        """
+        """공용 관리자 키로 인증된 관리자 한 명의 결정으로 승인하고 적용한다."""
         with GOVERNANCE_LOCK:
             change = self._required(change_id)
             if change.status is not ChangeStatus.PENDING_APPROVAL:
                 raise StateConflict(f"승인 대기 상태가 아닙니다: {change.status.value}")
-            if roles is not None:
-                needed = _APPROVER_ROLES.get(change.tier)
-                if needed and not (set(roles) & needed):
-                    raise ApproverNotAuthorized(
-                        f"{change.tier.value} 등급 변경은 {'/'.join(sorted(needed))} 역할의 "
-                        f"관리자만 승인할 수 있습니다 (승인자 역할: {', '.join(sorted(roles)) or '없음'})."
-                    )
-            approval = change.approval
-            if approval["separation_of_duties"] and actor == change.requested_by:
-                raise SeparationOfDutiesError(
-                    f"{change.tier.value} 등급 변경은 요청자({change.requested_by})와 "
-                    "다른 관리자가 승인해야 합니다."
-                )
-            if approval["impact_acknowledgement_required"] and not acknowledge_impact:
-                raise ChangeNotAllowed(
-                    "CRITICAL 등급 변경은 변경 전·후 형상과 영향도를 확인했음을 "
-                    "(acknowledge_impact=true) 명시해야 승인할 수 있습니다."
-                )
             if change.change_type is ChangeType.TOKEN_DISPOSE:
                 evidence = self._destruction_evidence(actor, destruction_evidence)
                 change.params = {**change.params, "destruction_evidence": evidence}
@@ -300,7 +257,6 @@ class ChangeControlService:
                 actor=actor,
                 reason=reason,
                 acknowledged=acknowledge_impact,
-                verified=verified,
             )
 
     def reject(self, change_id: str, *, actor: str, reason: str = "") -> ChangeRequest:
@@ -323,7 +279,6 @@ class ChangeControlService:
         actor: str,
         reason: str,
         acknowledged: bool,
-        verified: bool = False,
     ) -> ChangeRequest:
         nhi = load_nhi(self.storage, change.nhi_id)
         drift = self._drift(nhi, change.change_type, change.before)
@@ -333,7 +288,6 @@ class ChangeControlService:
                 f"({', '.join(drift)}). 요청을 거부하고 다시 제안하세요."
             )
         change.approved_by = actor
-        change.approved_by_verified = bool(verified)
         change.approved_at = utcnow()
         change.decision_reason = reason
         change.impact_acknowledged = bool(acknowledged)
@@ -358,8 +312,8 @@ class ChangeControlService:
             {
                 "tier": change.tier.value,
                 "change_type": change.change_type.value,
-                "approver_verified": change.approved_by_verified,
-                "requester_verified": change.requested_by_verified,
+                "approval_policy": "single_admin",
+                "completion_basis": "inventory_state",
             },
         )
         return change
@@ -441,10 +395,10 @@ class ChangeControlService:
                 actor, change.params.get("destruction_evidence")
             )
         try:
-            result = self.executor.apply(change, nhi)
+            inventory_result = self.executor.apply(change, nhi)
         except ChangeExecutionError:
             raise
-        except Exception as exc:  # 실행기 어댑터의 어떤 실패도 FAILED 로 수렴시킨다
+        except Exception as exc:  # 내부 실행기 실패만 ChangeRequest.FAILED 로 수렴시킨다.
             logger.exception("변경 실행기 오류 change=%s", change.change_id)
             raise ChangeExecutionError(f"실행기 오류: {exc}") from exc
 
@@ -459,7 +413,7 @@ class ChangeControlService:
                 extra={"credential_state": CredentialState.REVOKED.value},
             )
         elif kind is ChangeType.TOKEN_DISPOSE:
-            detail = {"reason": change.reason, **result}
+            detail = {"reason": change.reason, **inventory_result}
             evidence = change.params.get("destruction_evidence")
             if evidence:
                 previous = self.storage.list_lifecycle_events(nhi_id=nhi["nhi_id"], limit=1)
@@ -512,7 +466,23 @@ class ChangeControlService:
             self.lifecycle.record(
                 nhi, "QUARANTINED", actor, {"reason": change.reason}, change_id=change.change_id
             )
-        return {**common, **result}
+        try:
+            provider_result = self.provider_executor.apply(change, nhi)
+        except Exception as exc:  # 방어: Provider 실패는 내부 성공 판정을 바꾸지 않는다.
+            logger.exception("Provider 실행기 오류 change=%s", change.change_id)
+            provider_result = {
+                "executor": getattr(self.provider_executor, "name", "provider"),
+                "provider_call": "failed",
+                "affects_completion": False,
+                "error": f"{type(exc).__name__}: provider execution failed",
+            }
+        return {
+            **common,
+            "completion_basis": "inventory_state",
+            "inventory_applied": True,
+            "inventory": inventory_result,
+            "provider": provider_result,
+        }
 
     @staticmethod
     def _destruction_evidence(actor: str, raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -676,7 +646,7 @@ class ChangeControlService:
 
     @staticmethod
     def _approval(kind: ChangeType, tier: ApprovalTier, impact: Dict[str, Any]) -> Dict[str, Any]:
-        reasons = [f"현재 권한·환경 기준 승인 등급 {tier.value}"]
+        reasons = [f"현재 권한·환경 기준 위험 등급 {tier.value}"]
         if kind is ChangeType.QUARANTINE:
             return {
                 "required": False,
@@ -687,24 +657,14 @@ class ChangeControlService:
                 "auto_reason": "가역적 격리 — 승인 대기 중 피해가 커지지 않도록 즉시 적용",
                 "reasons": reasons + ["격리는 언제든 해제(롤백)할 수 있어 승인 없이 즉시 적용됩니다."],
             }
-        if tier is ApprovalTier.LOW:
-            return {
-                "required": False,
-                "tier": tier.value,
-                "separation_of_duties": False,
-                "impact_acknowledgement_required": False,
-                "auto_actor": "policy:auto-low",
-                "auto_reason": "LOW 등급 — 정책에 의한 자동 승인",
-                "reasons": reasons + ["읽기 전용·비운영·비민감 NHI 라 자동 승인됩니다."],
-            }
         if impact["service_continuity"]["will_interrupt"]:
             reasons.append("적용 즉시 서비스 호출이 실패할 수 있어 승인이 필요합니다.")
         return {
             "required": True,
             "tier": tier.value,
-            "separation_of_duties": tier in (ApprovalTier.HIGH, ApprovalTier.CRITICAL),
-            "impact_acknowledgement_required": tier is ApprovalTier.CRITICAL,
-            "reasons": reasons,
+            "separation_of_duties": False,
+            "impact_acknowledgement_required": False,
+            "reasons": reasons + ["위험 등급과 무관하게 관리자 한 명이 승인합니다."],
         }
 
     def _rollback_plan(
@@ -725,18 +685,16 @@ class ChangeControlService:
                 "supported": bool(grace),
                 "unsupported_reason": None if grace else "유예 시간이 0이라 이전 Token 이 즉시 무효화됩니다.",
                 "window_hours": grace,
-                "strategy": "유예 시간 안에 이전 Credential 버전으로 복귀",
+                "strategy": "내부 Inventory를 변경 전 Credential 버전으로 복원",
                 "steps": [
-                    "새 Token 을 쓰는 소비자에서 장애가 확인되면 롤백을 실행합니다.",
-                    "이전 버전 Credential 이 다시 현재 버전이 됩니다.",
-                    "유예 시간이 지나면 이전 Token 은 폐기되어 롤백할 수 없습니다.",
+                    "내부 Inventory의 Credential 버전을 변경 전 값으로 복원합니다.",
+                    "Provider에는 역호출하지 않으며 외부 상태는 운영자가 별도로 확인합니다.",
                 ],
             }
         steps = {
             ChangeType.TOKEN_REVOKE: [
                 "NHI 를 종료 단계에서 사용 단계로 되돌립니다.",
-                "인벤토리 상태가 복원됩니다. 실행기가 이미 Provider 에서 Token 을 폐기했다면 "
-                "재발급 어댑터가 새 Token 을 발급해야 합니다.",
+                "내부 Inventory 상태만 복원하며 Provider에서 폐기된 Token은 재활성화하지 않습니다.",
             ],
             ChangeType.SCOPE_CHANGE: [
                 "변경 전 permissions / raw_scopes 로 복원합니다.",
@@ -749,7 +707,7 @@ class ChangeControlService:
             "supported": True,
             "unsupported_reason": None,
             "window_hours": None,
-            "strategy": "변경 전 형상으로 복원 (파기 전까지 가능)",
+            "strategy": "내부 Inventory의 변경 전 형상으로 단순 복원",
             "steps": steps,
         }
 

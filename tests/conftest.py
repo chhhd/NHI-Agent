@@ -38,7 +38,6 @@ for _name in (
     "NHI_ADMIN_API_KEY",
     "NHI_MASTER_KEY",
     "NHI_RUNTIME_TOKEN_SIGNING_KEY",
-    "NHI_REQUIRE_VERIFIED_ADMIN",
     "NHI_PRIVACY_PSEUDONYMIZATION_KEY",
 ):
     os.environ[_name] = ""

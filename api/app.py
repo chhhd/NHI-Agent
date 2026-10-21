@@ -58,12 +58,6 @@ from rescan.credential_verifier import CredentialVerifier
 from rescan.revalidator import Revalidator
 from normalization.usage_ingestion import signals_from_usage_events as _signals_from_usage_events
 from scanner.scan_service import SecretScanService
-from security.admin_identity import (
-    OPERATOR_ROLES,
-    AdminDirectory,
-    AdminIdentity,
-    AdminIdentityError,
-)
 from security.dpop import RuntimeTokenService, TokenBindingError
 from security.redaction import sanitize_security_text
 from security.replay_store import StorageReplayCache
@@ -79,12 +73,10 @@ from backend.services.github_continuous_assessment import (
     GitHubContinuousAssessmentService,
 )
 from backend.services.change_control_service import (
-    ApproverNotAuthorized,
     ChangeControlService,
     ChangeError,
     ChangeExecutionError,
     ChangeNotAllowed,
-    SeparationOfDutiesError,
 )
 from backend.services.agent_access_evaluator import AgentAccessEvaluator
 from backend.services.control_approval import ApprovalError
@@ -295,7 +287,7 @@ class CredentialVerifyRequest(BaseModel):
 
 
 class ActionDecisionRequest(BaseModel):
-    #: 개인 관리자 키를 쓰면 생략한다(키의 관리자 ID 가 쓰인다). 다른 이름을 적으면 403.
+    #: 공용 관리자 키 사용 시 감사 로그에 남길 표시 이름.
     actor: Optional[str] = Field(default=None, min_length=1)
     reason: str = ""
 
@@ -338,79 +330,38 @@ def _secret_material_store():
     )
 
 
-def _directory() -> AdminDirectory:
-    settings = get_settings()
-    return AdminDirectory(
-        storage,
-        bootstrap_key=settings.secret_storage.admin_api_key,
-        require_verified=settings.governance.require_verified_admin,
-    )
-
-
-def _authenticate_admin(provided: Optional[str]) -> AdminIdentity:
-    try:
-        return _directory().authenticate(provided)
-    except AdminIdentityError as exc:
-        raise HTTPException(status_code=exc.status, detail=exc.message)
-
-
-def _require_admin_key(provided: Optional[str]) -> AdminIdentity:
-    """유효한 관리자 키(공유 키 또는 개인 키)인지만 확인한다. `actor` 가 필요 없는 작업용."""
-    return _authenticate_admin(provided)
+def _require_admin_key(provided: Optional[str]) -> None:
+    """공용 ``X-NHI-Admin-Key`` 한 종류만 검증한다."""
+    expected = get_settings().secret_storage.admin_api_key
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="NHI_ADMIN_API_KEY가 설정되지 않아 관리자 API가 비활성화되어 있습니다.",
+        )
+    if not provided or not hmac.compare_digest(provided, expected):
+        raise HTTPException(status_code=401, detail="올바른 관리자 API Key가 필요합니다.")
 
 
 def _acting_admin(
     provided: Optional[str],
     declared_actor: Optional[str],
-    *,
-    roles: Optional[Sequence[str]] = tuple(OPERATOR_ROLES),
-) -> Tuple[str, AdminIdentity]:
-    """`actor` 가 필요한 작업의 신원 확정.
-
-    - 개인 키: `actor` 는 키의 관리자 ID 로 정해진다. 본문에 다른 이름을 적으면 403.
-    - 공유 키(bootstrap): 개인 계정이 있거나 strict 설정이면 거부(403). 그렇지 않은 초기 구성에서만
-      본문 `actor` 를 쓰며, 이때 `identity.verified=false` 로 감사에 남는다.
-    """
-    identity = _authenticate_admin(provided)
-    if identity.verified:
-        if declared_actor and declared_actor.strip() != identity.admin_id:
-            raise HTTPException(
-                status_code=403,
-                detail=f"actor '{declared_actor}' 는 인증된 관리자 '{identity.admin_id}' 와 다릅니다.",
-            )
-        if roles and not identity.has_any(roles):
-            raise HTTPException(
-                status_code=403,
-                detail=f"이 작업은 {'/'.join(sorted(roles))} 역할이 필요합니다 (보유: {', '.join(sorted(identity.roles))}).",
-            )
-        return identity.admin_id, identity
-    if _directory().strict:
-        raise HTTPException(
-            status_code=403,
-            detail="개인 관리자 키(nhik.…)가 필요합니다. 공유 키는 관리자 계정 관리 전용입니다.",
-        )
+) -> str:
+    """공용 키를 확인하고 감사 기록에 사용할 관리자 표시 이름을 받는다."""
+    _require_admin_key(provided)
     if not declared_actor or not declared_actor.strip():
         raise HTTPException(status_code=422, detail="actor 가 필요합니다.")
-    return declared_actor.strip(), identity
+    return declared_actor.strip()
 
 
 def _acting_admin_unless_demo(
     nhi_id: str,
     provided: Optional[str],
     declared_actor: Optional[str],
-    *,
-    roles: Optional[Sequence[str]] = tuple(OPERATOR_ROLES),
-) -> Tuple[str, AdminIdentity]:
+) -> str:
     """합성 데모 NHI 는 관리자 키 없이 체험할 수 있다. 키를 보냈다면 그대로 검증한다."""
     if not provided and is_demo(_nhi_or_404(nhi_id)):
-        actor = (declared_actor or "demo-user").strip()
-        return actor, AdminIdentity(actor, frozenset(), False, "demo")
-    return _acting_admin(provided, declared_actor, roles=roles)
-
-
-def _roles_for(identity: AdminIdentity) -> Optional[List[str]]:
-    """개인 키로 확정된 신원만 역할을 서비스 계층에 전달한다(공유 키는 역할을 알 수 없다)."""
-    return sorted(identity.roles) if identity.verified else None
+        return (declared_actor or "demo-user").strip()
+    return _acting_admin(provided, declared_actor)
 
 
 #: 재전송·키 불일치로 보는 DPoP 거부 코드 (탈취된 Token/proof 재사용 의심)
@@ -437,18 +388,10 @@ def _runtime_token_service() -> RuntimeTokenService:
     )
 
 
-def _issuing_admin(provided: Optional[str]) -> AdminIdentity:
-    """Agent 에 token 을 발급할 수 있는 관리자. 개인 계정 모드에서는 공유 키로 발급할 수 없다."""
-    identity = _authenticate_admin(provided)
-    if identity.verified:
-        if not identity.has_any(OPERATOR_ROLES):
-            raise HTTPException(status_code=403, detail="Agent token 발급 권한이 없습니다.")
-    elif _directory().strict:
-        raise HTTPException(
-            status_code=403,
-            detail="개인 관리자 키(nhik.…)가 필요합니다. 공유 키는 관리자 계정 관리 전용입니다.",
-        )
-    return identity
+def _issuing_admin(provided: Optional[str]) -> str:
+    """공용 관리자 키로 Agent token 발급 경계를 보호한다."""
+    _require_admin_key(provided)
+    return "admin"
 
 
 def _runtime_htu(request: Request) -> str:
@@ -745,8 +688,8 @@ def issue_runtime_token(
             "binding_jkt": token["cnf"]["jkt"],
             "sender_constrained": True,
             "token_binding_method": "DPoP",
-            "issued_by": issuer.admin_id,
-            "issuer_verified": issuer.verified,
+            "issued_by": issuer,
+            "auth_mode": "shared_admin_key",
         },
     )
     response_body = {
@@ -1240,7 +1183,7 @@ def approve_action(
     body: ActionDecisionRequest,
     x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
 ) -> Dict[str, Any]:
-    actor, _ = _acting_admin(x_nhi_admin_key, body.actor)
+    actor = _acting_admin(x_nhi_admin_key, body.actor)
     try:
         action = ActionService(storage).approve(action_id, actor=actor)
     except KeyError:
@@ -1256,7 +1199,7 @@ def cancel_action(
     body: ActionDecisionRequest,
     x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
 ) -> Dict[str, Any]:
-    actor, _ = _acting_admin(x_nhi_admin_key, body.actor)
+    actor = _acting_admin(x_nhi_admin_key, body.actor)
     try:
         action = ActionService(storage).cancel(
             action_id, actor=actor, reason=body.reason
@@ -1652,7 +1595,7 @@ class ChangeProposeRequest(ChangePreviewRequest):
 class ChangeDecisionRequest(BaseModel):
     actor: Optional[str] = Field(default=None, min_length=1)
     reason: str = ""
-    #: CRITICAL 등급은 변경 전·후 형상과 영향도를 확인했음을 명시해야 승인된다.
+    #: 이전 클라이언트 요청을 수용해 기록만 남기는 선택 필드(승인 조건은 아님).
     acknowledge_impact: bool = False
     #: TOKEN_DISPOSE(파기) 승인에 필요하다: method, verified_by(수행자와 다른 사람), verification_check,
     #: verification_result(AUTH_REJECTED_401/403 · NOT_FOUND_404 · MATERIAL_ABSENT), performed_by(생략 시 승인자)
@@ -1711,8 +1654,6 @@ def _require_admin_unless_demo(nhi_id: str, provided: Optional[str]) -> None:
 def _governance_http(exc: Exception) -> HTTPException:
     if isinstance(exc, KeyError):
         return HTTPException(status_code=404, detail="NHI 또는 변경 요청을 찾을 수 없습니다.")
-    if isinstance(exc, (SeparationOfDutiesError, ApproverNotAuthorized)):
-        return HTTPException(status_code=403, detail=str(exc))
     if isinstance(exc, ChangeNotAllowed):
         return HTTPException(status_code=422, detail=str(exc))
     if isinstance(exc, ChangeExecutionError):
@@ -1730,21 +1671,12 @@ def _change_nhi_id(change_id: str) -> str:
 
 
 def _checked_evidence(evidence: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """개인 계정 모드에서는 검증자가 실제 등록된 관리자여야 한다(이름만 적은 검증을 막는다)."""
-    if not evidence or not _directory().strict:
-        return evidence
-    verifier = str(evidence.get("verified_by") or "").strip().lower()
-    principal = storage.get_admin_principal(verifier)
-    if principal is None or principal.get("disabled"):
-        raise HTTPException(
-            status_code=422,
-            detail="개인 관리자 모드에서는 verified_by 가 등록된 활성 관리자여야 합니다.",
-        )
-    return {**evidence, "verified_by": verifier}
+    """공용 관리자 모드에서는 파기 증적 자체의 필수값/상호 분리만 검증한다."""
+    return evidence
 
 
 class AgingRunRequest(BaseModel):
-    #: 개인 관리자 키를 쓰면 생략한다.
+    #: 변경 요청을 만들 때 감사 로그에 남길 관리자 표시 이름.
     actor: Optional[str] = Field(default=None, min_length=1)
     nhi_ids: Optional[List[str]] = None
     #: false 면 대상만 계산하고 변경 요청을 만들지 않는다.
@@ -1770,9 +1702,10 @@ def lifecycle_aging_run(
 ) -> Dict[str, Any]:
     """기준일을 넘긴 NHI 마다 종료·파기 승인 요청을 만든다. 자동으로 종료·파기하지 않는다."""
     if body.create_changes:
-        actor, _ = _acting_admin(x_nhi_admin_key, body.actor)
+        actor = _acting_admin(x_nhi_admin_key, body.actor)
     else:  # 대상 계산만 하는 실행은 변경을 만들지 않으므로 유효한 관리자 키면 충분하다
-        actor = _authenticate_admin(x_nhi_admin_key).admin_id
+        _require_admin_key(x_nhi_admin_key)
+        actor = body.actor or "admin"
     return _aging_service().run(
         triggered_by=actor, create_changes=body.create_changes, nhi_ids=body.nhi_ids
     )
@@ -1799,7 +1732,7 @@ def lifecycle_advance(
     x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
 ) -> Dict[str, Any]:
     """생성 → 사용 활성화, 권한 변경 관찰 종료 → 사용 복귀. 종료·파기는 /changes 로 진행한다."""
-    actor, _ = _acting_admin_unless_demo(nhi_id, x_nhi_admin_key, body.actor)
+    actor = _acting_admin_unless_demo(nhi_id, x_nhi_admin_key, body.actor)
     try:
         result = _lifecycle_service().advance(nhi_id, actor=actor, reason=body.reason)
     except (KeyError, LifecycleError) as exc:
@@ -1831,14 +1764,13 @@ def propose_change(
     body: ChangeProposeRequest,
     x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
 ) -> Dict[str, Any]:
-    """폐기·교체·권한 변경·파기를 제안한다. LOW 등급만 즉시 적용되고 나머지는 승인을 기다린다."""
-    actor, identity = _acting_admin_unless_demo(body.nhi_id, x_nhi_admin_key, body.requested_by)
+    """폐기·교체·권한 변경·파기를 제안한다. 일반 변경은 모두 관리자 승인을 기다린다."""
+    actor = _acting_admin_unless_demo(body.nhi_id, x_nhi_admin_key, body.requested_by)
     try:
         change = _change_service().propose(
             body.nhi_id,
             body.change_type,
             requested_by=actor,
-            requested_verified=identity.verified,
             reason=body.reason,
             params=body.params,
         )
@@ -1871,16 +1803,14 @@ def approve_change(
     body: ChangeDecisionRequest,
     x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
 ) -> Dict[str, Any]:
-    """승인 즉시 적용한다. HIGH 이상은 요청자와 다른 관리자만, CRITICAL 은 영향도 확인이 필요하다."""
-    actor, identity = _acting_admin_unless_demo(
+    """위험 등급과 무관하게 공용 키로 인증된 관리자 한 명의 승인 즉시 적용한다."""
+    actor = _acting_admin_unless_demo(
         _change_nhi_id(change_id), x_nhi_admin_key, body.actor
     )
     try:
         change = _change_service().approve(
             change_id,
             actor=actor,
-            verified=identity.verified,
-            roles=_roles_for(identity),
             destruction_evidence=_checked_evidence(body.destruction_evidence),
             reason=body.reason,
             acknowledge_impact=body.acknowledge_impact,
@@ -1896,7 +1826,7 @@ def reject_change(
     body: ChangeDecisionRequest,
     x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
 ) -> Dict[str, Any]:
-    actor, _ = _acting_admin_unless_demo(
+    actor = _acting_admin_unless_demo(
         _change_nhi_id(change_id), x_nhi_admin_key, body.actor
     )
     try:
@@ -1913,7 +1843,7 @@ def rollback_change(
     x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
 ) -> Dict[str, Any]:
     """적용된 변경을 변경 전 형상으로 되돌려 서비스 연속성을 확보한다."""
-    actor, _ = _acting_admin_unless_demo(
+    actor = _acting_admin_unless_demo(
         _change_nhi_id(change_id), x_nhi_admin_key, body.actor
     )
     try:
@@ -2081,109 +2011,6 @@ def control_agent_call(
         raise _governance_http(exc)
 
 
-class AdminPrincipalCreateRequest(BaseModel):
-    admin_id: str = Field(..., min_length=1, max_length=40, examples=["alice"])
-    roles: List[str] = Field(..., min_length=1, examples=[["ADMIN"]])
-    display_name: str = Field(default="", max_length=100)
-
-
-def _require_bootstrap(provided: Optional[str]) -> AdminIdentity:
-    """관리자 계정 관리는 공유 키(break-glass) 보유자만 한다. 계정이 스스로 권한을 올릴 수 없다."""
-    identity = _authenticate_admin(provided)
-    if identity.via != "bootstrap":
-        raise HTTPException(
-            status_code=403, detail="관리자 계정 관리는 공유 관리자 키(NHI_ADMIN_API_KEY)로만 할 수 있습니다."
-        )
-    return identity
-
-
-def _principal_call(action, *args, **kwargs):
-    try:
-        return action(*args, **kwargs)
-    except AdminIdentityError as exc:
-        raise HTTPException(status_code=exc.status, detail=exc.message)
-
-
-@app.get("/admin/whoami")
-def admin_whoami(
-    x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
-) -> Dict[str, Any]:
-    identity = _authenticate_admin(x_nhi_admin_key)
-    return {
-        "admin_id": identity.admin_id,
-        "roles": sorted(identity.roles),
-        "verified": identity.verified,
-        "via": identity.via,
-        "strict": _directory().strict,
-    }
-
-
-@app.get("/admin/principals")
-def list_admin_principals(
-    x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
-) -> Dict[str, Any]:
-    _require_bootstrap(x_nhi_admin_key)
-    directory = _directory()
-    items = directory.list()
-    return {"count": len(items), "strict": directory.strict, "principals": items}
-
-
-@app.post("/admin/principals", status_code=201)
-def create_admin_principal(
-    body: AdminPrincipalCreateRequest,
-    x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
-) -> Dict[str, Any]:
-    """관리자 계정을 만들고 개인 키를 **한 번만** 돌려준다. 이후 `strict` 로 전환된다."""
-    _require_bootstrap(x_nhi_admin_key)
-    principal, api_key = _principal_call(
-        _directory().create, body.admin_id, body.roles, display_name=body.display_name
-    )
-    storage.append_audit_event(
-        "ADMIN_PRINCIPAL_CREATED", actor="bootstrap", target=principal["admin_id"],
-        detail={"roles": principal["roles"]},
-    )
-    return {"principal": principal, "api_key": api_key, "strict": _directory().strict}
-
-
-@app.post("/admin/principals/{admin_id}/rotate-key")
-def rotate_admin_key(
-    admin_id: str,
-    x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
-) -> Dict[str, Any]:
-    _require_bootstrap(x_nhi_admin_key)
-    principal, api_key = _principal_call(_directory().rotate_key, admin_id)
-    storage.append_audit_event(
-        "ADMIN_KEY_ROTATED", actor="bootstrap", target=principal["admin_id"], detail={}
-    )
-    return {"principal": principal, "api_key": api_key}
-
-
-@app.post("/admin/principals/{admin_id}/disable")
-def disable_admin_principal(
-    admin_id: str,
-    x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
-) -> Dict[str, Any]:
-    _require_bootstrap(x_nhi_admin_key)
-    principal = _principal_call(_directory().set_disabled, admin_id, True)
-    storage.append_audit_event(
-        "ADMIN_PRINCIPAL_DISABLED", actor="bootstrap", target=principal["admin_id"], detail={}
-    )
-    return principal
-
-
-@app.post("/admin/principals/{admin_id}/enable")
-def enable_admin_principal(
-    admin_id: str,
-    x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
-) -> Dict[str, Any]:
-    _require_bootstrap(x_nhi_admin_key)
-    principal = _principal_call(_directory().set_disabled, admin_id, False)
-    storage.append_audit_event(
-        "ADMIN_PRINCIPAL_ENABLED", actor="bootstrap", target=principal["admin_id"], detail={}
-    )
-    return principal
-
-
 class ApprovalDecisionRequest(BaseModel):
     actor: Optional[str] = Field(default=None, min_length=1)
     reason: str = Field(..., min_length=1)
@@ -2210,10 +2037,10 @@ def approve_control_hold(
     x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
 ) -> Dict[str, Any]:
     """보류된 호출을 승인한다. 1회용 허가(`grant`)는 이 응답에서 한 번만 볼 수 있다."""
-    actor, identity = _acting_admin(x_nhi_admin_key, body.actor)
+    actor = _acting_admin(x_nhi_admin_key, body.actor)
     try:
         approval, grant = _control_service().approvals.approve(
-            decision_id, actor=actor, reason=body.reason, verified=identity.verified
+            decision_id, actor=actor, reason=body.reason
         )
     except (KeyError, ApprovalError) as exc:
         raise _approval_http(exc)
@@ -2226,10 +2053,10 @@ def reject_control_hold(
     body: ApprovalDecisionRequest,
     x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
 ) -> Dict[str, Any]:
-    actor, identity = _acting_admin(x_nhi_admin_key, body.actor)
+    actor = _acting_admin(x_nhi_admin_key, body.actor)
     try:
         return _control_service().approvals.reject(
-            decision_id, actor=actor, reason=body.reason, verified=identity.verified
+            decision_id, actor=actor, reason=body.reason
         )
     except (KeyError, ApprovalError) as exc:
         raise _approval_http(exc)
@@ -2278,13 +2105,12 @@ def quarantine_nhi(
     x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
 ) -> Dict[str, Any]:
     """수동 격리 — 승인 없이 즉시 적용되며 언제든 해제(롤백)할 수 있다."""
-    actor, identity = _acting_admin_unless_demo(nhi_id, x_nhi_admin_key, body.actor)
+    actor = _acting_admin_unless_demo(nhi_id, x_nhi_admin_key, body.actor)
     try:
         change = _change_service().propose(
             nhi_id,
             ChangeType.QUARANTINE,
             requested_by=actor,
-            requested_verified=identity.verified,
             reason=body.reason or "관리자 수동 격리",
         )
     except (KeyError, ChangeError, LifecycleError) as exc:
@@ -2298,7 +2124,7 @@ def release_nhi(
     body: QuarantineRequest,
     x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
 ) -> Dict[str, Any]:
-    actor, _ = _acting_admin_unless_demo(nhi_id, x_nhi_admin_key, body.actor)
+    actor = _acting_admin_unless_demo(nhi_id, x_nhi_admin_key, body.actor)
     try:
         change = _change_service().release_quarantine(
             nhi_id, actor=actor, reason=body.reason
@@ -2436,11 +2262,11 @@ def run_privacy_retention(
     x_nhi_admin_key: Optional[str] = Header(default=None, alias="X-NHI-Admin-Key"),
 ) -> Dict[str, Any]:
     """보존 기간이 지난 최소화 UsageEvent를 즉시 물리 삭제한다."""
-    identity = _require_admin_key(x_nhi_admin_key)
+    _require_admin_key(x_nhi_admin_key)
     deleted = storage.purge_expired_usage_events()
     audit_event_id = storage.append_audit_event(
         "PRIVACY_RETENTION_ENFORCED",
-        actor=identity.admin_id,
+        actor="admin",
         target="usage_events",
         detail={"deleted_count": deleted},
     )

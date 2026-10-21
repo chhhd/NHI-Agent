@@ -118,7 +118,7 @@ class ControlApprovalService:
 
     # -- 관리자 결정 ------------------------------------------------------
     def approve(
-        self, decision_id: str, *, actor: str, reason: str, verified: bool = False
+        self, decision_id: str, *, actor: str, reason: str
     ) -> Tuple[Dict[str, Any], str]:
         approval = self._pending(decision_id)
         now = self._clock()
@@ -127,7 +127,6 @@ class ControlApprovalService:
             **approval,
             "status": "APPROVED",
             "decided_by": actor,
-            "decided_by_verified": bool(verified),
             "decided_at": now.isoformat(),
             "reason": reason,
             "grant_digest": _digest(token),
@@ -143,7 +142,7 @@ class ControlApprovalService:
             target=decision_id,
             detail={
                 "reason": reason,
-                "actor_verified": bool(verified),
+                "auth_mode": "shared_admin_key",
                 "agent_id": approval.get("agent_id"),
                 "nhi_id": approval.get("nhi_id"),
                 "grant_expires_at": updated["grant_expires_at"],
@@ -152,14 +151,13 @@ class ControlApprovalService:
         return self._public(updated), token
 
     def reject(
-        self, decision_id: str, *, actor: str, reason: str, verified: bool = False
+        self, decision_id: str, *, actor: str, reason: str
     ) -> Dict[str, Any]:
         approval = self._pending(decision_id)
         updated = {
             **approval,
             "status": "REJECTED",
             "decided_by": actor,
-            "decided_by_verified": bool(verified),
             "decided_at": self._clock().isoformat(),
             "reason": reason,
         }
@@ -173,7 +171,7 @@ class ControlApprovalService:
             target=decision_id,
             detail={
                 "reason": reason,
-                "actor_verified": bool(verified),
+                "auth_mode": "shared_admin_key",
                 "agent_id": approval.get("agent_id"),
             },
         )

@@ -358,12 +358,6 @@
       "sha256": "35975e536cc11bc7ffc7cbf9c6fefa4d3fc2514503efa4a08b19965852c0a3dc"
     },
     {
-      "path": "security/admin_identity.py",
-      "kind": "added",
-      "source": "hanium/hanium/hanium/NHI-Agent/security/admin_identity.py",
-      "sha256": "2741440c183f73fccf6d69e19c56b6d23730cfb7bebdf69028d86be32909ccb5"
-    },
-    {
       "path": "security/dpop.py",
       "kind": "added",
       "source": "hanium/hanium/hanium/NHI-Agent/security/dpop.py",

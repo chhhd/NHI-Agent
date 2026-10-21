@@ -44,6 +44,12 @@ class GitHubSettings:
     )
     #: 조직 Audit Log 읽기 전용 토큰. 저장소 스캔·조치 토큰과 권한 경계를 분리한다.
     audit_token: str = field(default_factory=lambda: _env("GITHUB_AUDIT_TOKEN"))
+    #: Change Control 전용 조직 관리자 토큰. 수집/스캔 토큰과 권한 경계를 분리한다.
+    change_token: str = field(default_factory=lambda: _env("GITHUB_CHANGE_TOKEN"))
+    oauth_client_id: str = field(default_factory=lambda: _env("GITHUB_OAUTH_CLIENT_ID"))
+    oauth_client_secret: str = field(
+        default_factory=lambda: _env("GITHUB_OAUTH_CLIENT_SECRET")
+    )
     api_base: str = field(default_factory=lambda: _env("GITHUB_API_BASE", "https://api.github.com"))
     api_version: str = field(
         default_factory=lambda: _env("GITHUB_API_VERSION", "2022-11-28")
@@ -57,7 +63,21 @@ class GitHubSettings:
 @dataclass
 class SlackSettings:
     bot_token: str = field(default_factory=lambda: _env("SLACK_BOT_TOKEN"))
+    oauth_client_id: str = field(default_factory=lambda: _env("SLACK_OAUTH_CLIENT_ID"))
+    oauth_client_secret: str = field(
+        default_factory=lambda: _env("SLACK_OAUTH_CLIENT_SECRET")
+    )
     api_base: str = field(default_factory=lambda: _env("SLACK_API_BASE", "https://slack.com/api"))
+
+
+@dataclass
+class AWSSettings:
+    """Change Control 이 사용하는 AWS IAM 클라이언트 설정.
+
+    인증 정보는 코드나 NHI 레코드에 저장하지 않고 boto3 기본 credential chain을 쓴다.
+    """
+
+    region_name: str = field(default_factory=lambda: _env("AWS_REGION", _env("AWS_DEFAULT_REGION")))
 
 
 @dataclass
@@ -152,12 +172,6 @@ class GovernanceSettings:
     #: DENY는 모든 모드 차단. REVIEW는 enforce 차단 / monitor 허용 / human_in_the_loop 보류.
     #: human_in_the_loop: enforce + Agent 호출의 REVIEW 판정을 보류하고 관리자 승인 후 재시도.
     control_mode: str = field(default_factory=lambda: _env("NHI_CONTROL_MODE", "enforce"))
-    #: true 면 승인·변경 같은 `actor` 가 필요한 작업에 개인 관리자 키를 반드시 요구한다.
-    #: (설정과 무관하게 활성 개인 계정이 하나라도 있으면 자동으로 strict)
-    require_verified_admin: bool = field(
-        default_factory=lambda: _env("NHI_REQUIRE_VERIFIED_ADMIN", "false").strip().lower()
-        in {"1", "true", "yes", "on"}
-    )
     #: 승인 대기 요청이 결정 없이 이 시간이 지나면 자동 거부(EXPIRED)된다.
     approval_ttl_seconds: int = field(
         default_factory=lambda: _env_int("NHI_CONTROL_APPROVAL_TTL_SECONDS", 900)
@@ -213,6 +227,7 @@ class PrivacySettings:
 class Settings:
     github: GitHubSettings = field(default_factory=GitHubSettings)
     slack: SlackSettings = field(default_factory=SlackSettings)
+    aws: AWSSettings = field(default_factory=AWSSettings)
     microsoft: MicrosoftGraphSettings = field(default_factory=MicrosoftGraphSettings)
     runtime_security: RuntimeSecuritySettings = field(default_factory=RuntimeSecuritySettings)
     google_workspace: GoogleWorkspaceSettings = field(default_factory=GoogleWorkspaceSettings)

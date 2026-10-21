@@ -244,6 +244,86 @@ class GitHubConnector(BaseConnector):
         return status
 
     # ------------------------------------------------------------------
+    # Change Control (실제 Provider 변경)
+    # ------------------------------------------------------------------
+    def revoke_installation_token(self, token: Optional[str] = None) -> None:
+        """GitHub App installation access token을 즉시 폐기한다."""
+        target = token or self.token
+        if not target:
+            raise ConnectorError("폐기할 GitHub installation token이 없습니다.")
+        self.request(
+            "DELETE",
+            "/installation/token",
+            headers={"Authorization": f"Bearer {target}"},
+        )
+
+    def revoke_org_personal_access_token(
+        self, organization: str, credential_id: int
+    ) -> None:
+        """조직 소유 fine-grained PAT을 조직 관리자 권한으로 폐기한다."""
+        if not self.token:
+            raise ConnectorError("GITHUB_CHANGE_TOKEN이 설정되지 않았습니다.")
+        self.request(
+            "DELETE",
+            f"/orgs/{organization}/personal-access-tokens/{int(credential_id)}",
+        )
+
+    def update_installation_repositories(
+        self,
+        installation_id: int,
+        *,
+        add_repository_ids: List[int],
+        remove_repository_ids: List[int],
+        token: Optional[str] = None,
+    ) -> Dict[str, int]:
+        """GitHub App 설치가 접근할 repository 범위를 실제로 변경한다."""
+        target = token or self.token
+        if not target:
+            raise ConnectorError("GitHub repository 범위 변경용 token이 없습니다.")
+        headers = {"Authorization": f"Bearer {target}"}
+        for repository_id in add_repository_ids:
+            self.request(
+                "PUT",
+                f"/user/installations/{int(installation_id)}/repositories/{int(repository_id)}",
+                headers=headers,
+            )
+        for repository_id in remove_repository_ids:
+            self.request(
+                "DELETE",
+                f"/user/installations/{int(installation_id)}/repositories/{int(repository_id)}",
+                headers=headers,
+            )
+        return {"repositories_added": len(add_repository_ids), "repositories_removed": len(remove_repository_ids)}
+
+    def rotate_oauth_token(
+        self,
+        refresh_token: str,
+        *,
+        client_id: str,
+        client_secret: str,
+    ) -> Dict[str, Any]:
+        """GitHub App user access token을 refresh token으로 교체한다."""
+        if not refresh_token or not client_id or not client_secret:
+            raise ConnectorError("GitHub OAuth 교체에 client_id/client_secret/refresh_token이 필요합니다.")
+        response = self.request(
+            "POST",
+            "https://github.com/login/oauth/access_token",
+            data={
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            },
+            headers={"Accept": "application/json", "Authorization": ""},
+        )
+        payload = self._safe_json(response) or {}
+        if not payload.get("access_token"):
+            raise ConnectorError(
+                f"GitHub OAuth token 교체 응답에 access_token이 없습니다: {payload.get('error', 'unknown_error')}"
+            )
+        return payload
+
+    # ------------------------------------------------------------------
     # 조직 GitHub App installation 인벤토리
     # ------------------------------------------------------------------
     def discover_organization_apps(
