@@ -12,7 +12,10 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+if TYPE_CHECKING:  # 순환 import 방지 — scenario_evaluation_models 가 이 모듈을 쓰지 않는다
+    from core.scenario_evaluation_models import ScenarioEvaluationResult
 
 
 def _utcnow() -> str:
@@ -590,6 +593,10 @@ class NHIAnalysis:
     usage_analysis: UsageAnalysisResult = field(default_factory=UsageAnalysisResult)
     security_events: List[SecurityEvent] = field(default_factory=list)
     scenario_matches: List[ScenarioMatch] = field(default_factory=list)
+    #: 논문(JDCS 2020.21.3.617) ER·EC·PW·FR·UR 모델 평가 결과 — risk/scenario_matches와
+    #: 완전히 독립된 부가 산출물이다. risk.score에 가산되지 않는다. 입력이 없으면(예:
+    #: Slack/AWS처럼 이벤트 소스가 연결되지 않은 경우) 평가를 시도하지 않아 빈 리스트로 남는다.
+    paper_scenario_evaluations: List["ScenarioEvaluationResult"] = field(default_factory=list)
     recommendations: List[Recommendation] = field(default_factory=list)
     blast_radius: BlastRadiusReport = field(default_factory=BlastRadiusReport)
     analyzed_at: str = field(default_factory=_utcnow)
@@ -634,6 +641,10 @@ class NHIAnalysis:
             "recommendations": [r.to_dict() for r in self.recommendations],
             "blast_radius": self.blast_radius.to_dict(),
             "analyzed_at": self.analyzed_at,
+            # ---- 논문 기반 시나리오 평가 (부가 정보, risk_score 비가산) ----
+            "paper_scenario_evaluations": [
+                evaluation.to_dict() for evaluation in self.paper_scenario_evaluations
+            ],
         }
 
 

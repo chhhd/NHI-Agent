@@ -130,7 +130,13 @@ class GitHubContinuousAssessmentService:
             merged = adapter.merge_into_signals(
                 AnalysisSignals.from_dict(base_payload), derived
             )
-            analysis = self.pipeline.analyze_github_nhi(item, signals=merged)
+            # 이미 조회한 타임스탬프 있는 UsageEvent 목록을 그대로 논문 기반
+            # 시나리오 평가(ER·EC·PW·FR·UR)에도 넘긴다 — risk_score 계산에는
+            # 영향 없는 부가 평가다. ER 매핑표가 아직 비어 있어 1차 구현에서는
+            # UNCONFIGURED_WEIGHT 로 귀결되지만, GitHub 이벤트는 실제로 연결된다.
+            analysis = self.pipeline.analyze_github_nhi(
+                item, signals=merged, usage_events=events[:10000]
+            )
             payload = analysis.to_dict()
             try:
                 saved = persist_analysis(

@@ -61,8 +61,10 @@ from core.nhi_models import (
     NHIProfile,
     PermissionLevel,
 )
+from core.usage_models import UsageEvent
 from graph.blast_radius import BlastRadiusCalculator, summarize_blast_radius
 from graph.relationship_graph import RelationshipGraph
+from policy.paper_scenario_engine import PaperScenarioEvaluator
 from policy.rules import EvaluationContext, PolicyConfig, evaluate_security_scenarios
 
 logger = logging.getLogger(__name__)
@@ -119,6 +121,7 @@ class NHIAnalysisPipeline:
         recommendation: Optional[RecommendationAgent] = None,
         blast_radius: Optional[BlastRadiusCalculator] = None,
         usage_analysis: Optional[UsageAnalysisAgent] = None,
+        paper_scenario_evaluator: Optional[PaperScenarioEvaluator] = None,
     ) -> None:
         self.config = config or PolicyConfig()
         self.discovery = discovery or DiscoveryAgent()
@@ -129,6 +132,10 @@ class NHIAnalysisPipeline:
         self.policy_evidence = policy_evidence or PolicyEvidenceAgent()
         self.recommendation = recommendation or RecommendationAgent()
         self.blast_radius = blast_radius or BlastRadiusCalculator()
+        # 논문(JDCS 2020.21.3.617) ER·EC·PW·FR·UR 시나리오 평가 — risk_scoring과
+        # 완전히 독립된 부가 평가다. ER 매핑표/UR 리졸버를 주입하지 않으면(기본값)
+        # 항상 UNCONFIGURED_WEIGHT/INSUFFICIENT_DATA 를 반환한다(§ 설계안 참고).
+        self.paper_scenario_evaluator = paper_scenario_evaluator or PaperScenarioEvaluator()
 
     # ------------------------------------------------------------------
     # 단건 분석
@@ -139,6 +146,7 @@ class NHIAnalysisPipeline:
         *,
         signals: Optional[AnalysisSignals] = None,
         repository: str = "",
+        usage_events: Optional[Sequence[UsageEvent]] = None,
     ) -> NHIAnalysis:
         signals = signals or AnalysisSignals()
         if repository and not signals.repository:
@@ -153,6 +161,7 @@ class NHIAnalysisPipeline:
             signals,
             repository=signals.repository or repository,
             source=AnalysisSource.CODE_SCAN,
+            usage_events=usage_events,
         )
 
     # ------------------------------------------------------------------
@@ -163,12 +172,23 @@ class NHIAnalysisPipeline:
         nhi: GitHubNHIInput,
         *,
         signals: Optional[Any] = None,
+        usage_events: Optional[Sequence[UsageEvent]] = None,
     ) -> NHIAnalysis:
         """GitHub NHI 인벤토리 1건을 스캔 경로와 같은 기준으로 분석한다.
 
         `signals` 로 코드·인벤토리 어디에도 없는 외부 사실(감사 로그의 관측 행위,
         AI Agent 종료 여부, 예외 승인 등)을 주입할 수 있다.
         `AnalysisSignals` 또는 그 dict 표현을 모두 받는다.
+
+        `usage_events` 는 ``normalization/github_audit.py`` 가 만드는, 해당 NHI에
+        속한 타임스탬프 있는 `UsageEvent` 목록이다 — 논문 기반 시나리오 평가(ER·EC·
+        PW·FR·UR)의 입력이며, 위험 점수 계산에는 어떤 경우든 영향을 주지 않는다.
+
+        * ``None``(기본값): 이벤트 데이터 자체가 제공되지 않음 — 평가를 아예
+          시도하지 않는다. `NHIAnalysis.paper_scenario_evaluations` 는 빈 리스트.
+        * ``[]``: 조회는 했지만 이벤트가 0건 — 평가를 **시도**하고,
+          `PaperScenarioEvaluator` 가 ``INSUFFICIENT_DATA`` 와 그 사유를 명시한
+          결과 1건을 `paper_scenario_evaluations` 에 담는다.
         """
         overrides: Optional[Dict[str, Any]]
         if isinstance(signals, AnalysisSignals):
@@ -188,6 +208,7 @@ class NHIAnalysisPipeline:
             analysis_signals,
             repository=analysis_signals.repository,
             source=AnalysisSource.INVENTORY,
+            usage_events=usage_events,
         )
 
     def analyze_saas_nhi(
@@ -214,6 +235,9 @@ class NHIAnalysisPipeline:
             analysis_signals,
             repository="",
             source=AnalysisSource.INVENTORY,
+            # Slack 등 SaaS 감사로그 → UsageEvent 정규화 모듈이 아직 없어 이 경로는
+            # usage_events 를 받지 않는다(§ 설계안 "Slack/AWS 는 선행 작업 필요").
+            usage_events=None,
         )
 
     # ------------------------------------------------------------------
@@ -228,6 +252,7 @@ class NHIAnalysisPipeline:
         *,
         repository: str,
         source: AnalysisSource,
+        usage_events: Optional[Sequence[UsageEvent]] = None,
     ) -> NHIAnalysis:
         permissions = self.scope_translation.translate_finding(finding)
         usage, security_events = self.usage_analysis.analyze(
@@ -262,6 +287,19 @@ class NHIAnalysisPipeline:
         policy = self.policy_evidence.decide(ctx, risk, violations)
         recommendations = self.recommendation.recommend(ctx, risk, policy)
 
+        # 논문 기반 시나리오 평가 — risk/ctx 어디에도 주입하지 않는 순수 부가 산출물.
+        # usage_events=None("이벤트 데이터 자체가 제공되지 않음" — 예: Slack/AWS처럼
+        # 이벤트 소스가 아직 연결되지 않은 경로)과 usage_events=[]("조회를 시도했으나
+        # 이벤트가 0건" — 예: 신규/미사용 NHI)를 구분한다. None이면 평가를 아예
+        # 시도하지 않아 빈 리스트로 남기고, []이면 evaluator.evaluate()를 실제로
+        # 호출해 PaperScenarioEvaluator가 INSUFFICIENT_DATA와 사유를 명시적으로
+        # 반환하게 한다 — 빈 리스트에 사유 없이 묻히지 않도록 한다.
+        paper_scenario_evaluations = (
+            [self.paper_scenario_evaluator.evaluate(nhi_id=profile.nhi_id, events=usage_events)]
+            if usage_events is not None
+            else []
+        )
+
         return NHIAnalysis(
             fingerprint=finding.fingerprint,
             repository=repository,
@@ -276,6 +314,7 @@ class NHIAnalysisPipeline:
             usage_analysis=usage,
             security_events=security_events,
             scenario_matches=scenario_matches,
+            paper_scenario_evaluations=paper_scenario_evaluations,
             recommendations=recommendations,
             blast_radius=blast,
             source=source,

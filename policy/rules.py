@@ -9,9 +9,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence
 
 from core.models import SecretFinding
+from policy.paper_scenario_escalation import PAPER_SCENARIO_ESCALATION_RULES
+
+if TYPE_CHECKING:  # 순환 import 방지 — scenario_evaluation_models 는 이 모듈을 쓰지 않는다
+    from core.scenario_evaluation_models import ScenarioEvaluationResult
 from core.nhi_models import (
     AnalysisSignals,
     AnalysisSource,
@@ -71,6 +75,16 @@ class PolicyConfig:
     bulk_data_export_actions: Sequence[str] = (
         "export_csv", "bulk_export", "dump_table", "download_all", "select *",
     )
+    #: 논문(JDCS 2020.21.3.617) 기반 시나리오 평가 결과로 강제 CRITICAL 승격을
+    #: 허용할지. 기본 False — `policy/paper_scenario_escalation.py` 의
+    #: `PAPER_SCENARIO_ESCALATION_RULES` 가 비어 있는 동안에는 이 값을 True로
+    #: 바꿔도 아무 규칙도 평가되지 않는다. 팀이 특정 시나리오를 승인하고 그 규칙을
+    #: 등록한 뒤에만 의미가 생긴다.
+    #: ⚠️ 그렇게 하더라도 `policy.scoring.RiskScorer.score()` 는 여전히
+    #: `evaluate_forced_critical(ctx)` 를 인자 1개로만 호출하므로(§
+    #: `policy/paper_scenario_escalation.py` 모듈 docstring 참고) 100점 Risk
+    #: Score 경로에는 어떤 경우에도 아직 연결되어 있지 않다 — 별도 배선 작업 필요.
+    enable_paper_scenario_escalation: bool = False
 
 
 @dataclass
@@ -478,10 +492,19 @@ FORCED_CRITICAL_RULES: Dict[str, Callable[[EvaluationContext], Optional[str]]] =
 }
 
 
-def evaluate_forced_critical(ctx: EvaluationContext) -> List[Dict[str, str]]:
+def evaluate_forced_critical(
+    ctx: EvaluationContext,
+    paper_result: Optional["ScenarioEvaluationResult"] = None,
+) -> List[Dict[str, str]]:
     """강제 Critical 규칙 평가.
 
     예제/테스트 값이면서 자격 증명이 활성이 아닌 경우는 오탐이므로 평가하지 않는다.
+
+    `paper_result`(논문 ER·EC·PW·FR·UR 기반 평가 결과)는 기본 ``None`` 이며, 넘겨도
+    `ctx.config.enable_paper_scenario_escalation`(기본 False)과
+    `PAPER_SCENARIO_ESCALATION_RULES`(기본 공란)가 모두 채워져 있어야만 영향을 준다.
+    `RiskScorer.score()`(`policy/scoring.py`)는 이 인자를 넘기지 않으므로, 1차
+    구현에서는 100점 Risk Score·기존 8개 강제 규칙 결과가 전혀 달라지지 않는다.
     """
     if ctx.context.is_test_or_example and ctx.finding.credential_active is not True:
         return []
@@ -491,6 +514,14 @@ def evaluate_forced_critical(ctx: EvaluationContext) -> List[Dict[str, str]]:
         reason = rule(ctx)
         if reason:
             hits.append({"rule_id": rule_id, "reason": reason})
+
+    # 선택적 확장 — 기본 OFF. 플래그가 꺼져 있거나(기본값) 규칙 테이블이
+    # 비어 있으면(현재 상태) 이 블록은 아무 것도 추가하지 않는다.
+    if ctx.config.enable_paper_scenario_escalation and paper_result is not None:
+        for rule_id, rule in PAPER_SCENARIO_ESCALATION_RULES.items():
+            reason = rule(ctx, paper_result)
+            if reason:
+                hits.append({"rule_id": rule_id, "reason": reason})
     return hits
 
 
